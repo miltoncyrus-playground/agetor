@@ -373,3 +373,101 @@ test("pipeline: an ordinary (non-pipeline) task is completely unaffected", async
   expect(task.pipelineStage).toBeNull();
   expect(runs.listForTask(taskId).length).toBe(1); // no auto-chaining
 });
+
+test("pipeline: pausePipelineTask errors on a non-pipeline task", async () => {
+  const { createTask, pausePipelineTask } = await import("./orchestrator.ts");
+
+  const workdir = await makeWorkdir(false);
+  const created = await createTask({
+    title: "ordinary-pause", prompt: "x", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+
+  const result = pausePipelineTask(created.task.id);
+  expect("error" in result).toBe(true);
+});
+
+test("pipeline: pausePipelineTask sets pausedAt; resumePipelineTask clears it and spawns the current stage", async () => {
+  const { startTask, pausePipelineTask, resumePipelineTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p11", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    // "testing" (verdict-bearing, no verdict appended below) rather than
+    // "building" — building's fake run resolves and auto-cascades straight
+    // to testing within the settle window (no verdict gate to stop it),
+    // which would make "exactly 1 run after resume" a race. testing with
+    // no verdict deterministically blocks instead of cascading further.
+    pipelineStage: "testing", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+  });
+
+  const pauseResult = pausePipelineTask(taskId);
+  if ("error" in pauseResult) throw new Error(pauseResult.error);
+  expect(pauseResult.task.pausedAt).not.toBeNull();
+  expect(runs.listForTask(taskId).length).toBe(0); // pausing before any run started spawns nothing
+
+  // Pausing an already-paused task is a no-op, not an error.
+  const secondPause = pausePipelineTask(taskId);
+  expect("error" in secondPause).toBe(false);
+
+  const resumeResult = await resumePipelineTask(taskId);
+  if ("error" in resumeResult) throw new Error(resumeResult.error);
+  expect(resumeResult.task.pausedAt).toBeNull();
+  await settle();
+  // Resuming with no active run starts the current stage (testing) — no
+  // verdict was appended, so it deterministically blocks rather than
+  // cascading further, giving a stable single-run assertion point.
+  expect(runs.listForTask(taskId).length).toBe(1);
+  expect(tasks.get(taskId)!.column).toBe("blocked");
+});
+
+test("pipeline: pause skips the auto-spawn of the NEXT stage, resume continues it", async () => {
+  const { startTask, pausePipelineTask, resumePipelineTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p12", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "building", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+  });
+
+  // Start building's own run, then pause WHILE it's still in flight — the
+  // pause must not affect this run (it's already spawned), only the
+  // auto-advance decision once it resolves.
+  await startAndGetRunId(startTask, taskId);
+  const paused = pausePipelineTask(taskId);
+  if ("error" in paused) throw new Error(paused.error);
+  await settle(); // let building's fake run resolve
+
+  let task = tasks.get(taskId)!;
+  expect(task.pipelineStage).toBe("testing"); // still computed and landed
+  expect(task.column).toBe("testing");
+  expect(runs.listForTask(taskId).length).toBe(1); // testing's run did NOT spawn
+
+  const resumed = await resumePipelineTask(taskId);
+  if ("error" in resumed) throw new Error(resumed.error);
+  await settle();
+  task = tasks.get(taskId)!;
+  expect(runs.listForTask(taskId).length).toBe(2); // testing's run spawned on resume
+  expect(task.pausedAt).toBeNull();
+});

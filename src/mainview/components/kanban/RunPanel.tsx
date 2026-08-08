@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, RefreshCw, Search, Send, Slash, SquareSlash,
+  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Pause, Plug, Play, RefreshCw, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -1949,6 +1949,19 @@ function RunPanelBody({
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
   };
 
+  // Pause/resume a pipeline task's auto-advance. Doesn't touch anything
+  // locally — the board's own 2s poll picks up the new pausedAt/column via
+  // the same path every other task mutation already relies on (see `stop`
+  // above for the same fire-and-forget shape).
+  const togglePipelinePause = async () => {
+    try {
+      if (task.pausedAt != null) await api.resumePipelineTask(task.id);
+      else await api.pausePipelineTask(task.id);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   // Park the current composer content on the backlog instead of sending it —
   // "a message that came to mind but isn't ready to send yet." Consumes the
   // composer (text + refs) exactly like `send()` does, so the two actions feel
@@ -2349,6 +2362,22 @@ function RunPanelBody({
           {archived && (
             <Button size="sm" variant="outline" onClick={() => onUnarchive(task)} title="Unarchive task">
               <ArchiveRestore className="mr-1 size-3" /> Unarchive
+            </Button>
+          )}
+          {!archived && task.pipelineStage != null && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={togglePipelinePause}
+              title={
+                task.pausedAt != null
+                  ? "Resume auto-advance — starts the current stage's run if none is active"
+                  : "Pause auto-advance — the current stage's run still finishes; only the next stage won't auto-start"
+              }
+            >
+              {task.pausedAt != null
+                ? <><Play className="mr-1 size-3" /> Resume</>
+                : <><Pause className="mr-1 size-3" /> Pause</>}
             </Button>
           )}
           <Button

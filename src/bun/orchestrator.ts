@@ -2695,6 +2695,44 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
 }
 
 /**
+ * Pause a pipeline task's auto-advance: `advancePipelineStage` already
+ * checks `pausedAt` before spawning the *next* stage's run (see the
+ * `spawnStage` closure) — this just sets the flag. Never interrupts an
+ * in-flight stage's agent; that stage still runs to completion, it's only
+ * the one after it that doesn't auto-start. Errors rather than silently
+ * no-oping on a non-pipeline task, since pausing one has no meaning.
+ */
+export function pausePipelineTask(taskId: string): { task: Task } | { error: string } {
+  const task = tasks.get(taskId);
+  if (!task) return { error: "task not found" };
+  if (task.pipelineStage == null) return { error: "not a pipeline task" };
+  if (task.pausedAt != null) return { task }; // already paused — no-op
+  const updated = tasks.update(taskId, { pausedAt: Date.now() });
+  return updated ? { task: updated } : { error: "task not found" };
+}
+
+/**
+ * Resume a paused pipeline task. Clears `pausedAt` and, if there's no run
+ * currently active for it (the common case — pause's whole point was to
+ * skip spawning the next stage), starts one for whatever stage the task is
+ * currently sitting on. If a stage's run happened to still be in flight
+ * when pause was requested, that run's own resolution will now correctly
+ * auto-advance again since `pausedAt` is clear by the time it checks.
+ */
+export async function resumePipelineTask(taskId: string): Promise<{ task: Task } | { error: string }> {
+  const task = tasks.get(taskId);
+  if (!task) return { error: "task not found" };
+  if (task.pipelineStage == null) return { error: "not a pipeline task" };
+  const updated = tasks.update(taskId, { pausedAt: null });
+  if (!updated) return { error: "task not found" };
+  if (!updated.runId || !active.has(updated.runId)) {
+    const started = await startTask(taskId);
+    if ("error" in started) return { error: started.error };
+  }
+  return { task: tasks.get(taskId) ?? updated };
+}
+
+/**
  * Delete a task and best-effort tear down its worktree. Kills any active run
  * first so we don't leave a stale process around.
  */

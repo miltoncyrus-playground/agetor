@@ -1125,6 +1125,12 @@ export const api = {
         : {}),
     }, opts?.awaitTeardown ? { retry: false } : undefined),
   unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
+  /** Pause/resume a pipeline task's auto-advance — see
+   *  advancePipelineStage in orchestrator.ts. 400 on a non-pipeline task.
+   *  Neither interrupts an in-flight stage's agent, only whether the next
+   *  stage auto-spawns once the current one resolves. */
+  pausePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-pause`, { method: "POST" }),
+  resumePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-resume`, { method: "POST" }),
 
   /** Every git worktree materialized on disk under `dataDir/worktrees/`,
    *  cross-referenced against the tasks table. Drives the Worktrees page. */
