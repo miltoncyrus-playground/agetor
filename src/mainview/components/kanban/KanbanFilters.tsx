@@ -32,7 +32,9 @@ interface Props {
   taskAgentIds: string[];
 }
 
-const basename = (p: string) => {
+/** Last path segment of a project path, for display when no registered
+ *  `Project.name` exists — also reused by App.tsx for swimlane labels. */
+export const basename = (p: string) => {
   const trimmed = p.replace(/\/+$/, "");
   const idx = trimmed.lastIndexOf("/");
   return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;

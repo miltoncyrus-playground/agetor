@@ -7,6 +7,13 @@ import { TaskCard } from "./TaskCard";
 
 interface Props {
   id: ColumnId;
+  /** The dnd-kit droppable id — namespaced per-lane by the caller
+   *  (`` `${workdir}::${columnId}` ``) since a swimlane board has one
+   *  `Column` per (project, stage) pair and every `id: ColumnId` value
+   *  repeats once per lane; the bare `ColumnId` would collide across
+   *  lanes if used directly as the droppable id. `id` itself stays the
+   *  plain `ColumnId` for column-identity/label/comparator purposes. */
+  droppableId: string;
   label: string;
   tasks: Task[];
   /** taskId -> Task, over the FULL task list (not just this column) — lets
@@ -17,15 +24,10 @@ interface Props {
   /** parentTaskId -> { merged, total } sub-task counts, for the parent
    *  card's progress badge. Same stability guarantee as `tasksById`. */
   childCountsByParent: Map<string, { merged: number; total: number }>;
-  homeDir: string;
-  onStart: (t: Task) => void;
-  onCancel: (t: Task) => void;
-  onDelete: (t: Task) => void;
+  /** The only interaction a compact TaskCard offers directly — everything
+   *  else (Run/Stop/Archive/Diff/Delete/Mark-Done/Retry) lives in RunPanel,
+   *  reached by clicking the tile. See TaskCard.tsx's doc comment. */
   onOpen: (t: Task) => void;
-  onDiff: (t: Task) => void;
-  onMarkDone: (t: Task) => void;
-  onArchive: (t: Task) => void;
-  onUnarchive: (t: Task) => void;
 }
 
 /** Array is considered unchanged when same length and every element is the
@@ -40,38 +42,30 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, tasksById, childCountsByParent, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
-  const { setNodeRef, isOver } = useDroppable({ id });
+function ColumnImpl({ id, droppableId, label, tasks, tasksById, childCountsByParent, onOpen }: Props) {
+  const { setNodeRef, isOver } = useDroppable({ id: droppableId });
   return (
     <div
       ref={setNodeRef}
       className={cn(
-        "flex w-72 shrink-0 flex-col gap-3 rounded-lg border border-border/40 bg-muted/30 p-3",
+        "flex w-56 shrink-0 flex-col gap-2 rounded-lg border border-border/40 bg-muted/30 p-2",
         isOver && "border-primary/60 bg-muted/60",
       )}
     >
       <div className="flex items-center justify-between">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
           {label}
         </h2>
-        <Badge variant="outline">{tasks.length}</Badge>
+        <Badge variant="outline" className="h-4 px-1.5 text-[10px]">{tasks.length}</Badge>
       </div>
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-1">
         {tasks.map((t) => (
           <TaskCard
             key={t.id}
             task={t}
             tasksById={tasksById}
             childCountsByParent={childCountsByParent}
-            homeDir={homeDir}
-            onStart={onStart}
-            onCancel={onCancel}
-            onDelete={onDelete}
             onOpen={onOpen}
-            onDiff={onDiff}
-            onMarkDone={onMarkDone}
-            onArchive={onArchive}
-            onUnarchive={onUnarchive}
           />
         ))}
       </div>
@@ -90,16 +84,9 @@ function ColumnImpl({ id, label, tasks, tasksById, childCountsByParent, homeDir,
  *  contain the changed task. */
 export const Column = memo(ColumnImpl, (prev, next) => (
   prev.id === next.id &&
+  prev.droppableId === next.droppableId &&
   prev.label === next.label &&
-  prev.homeDir === next.homeDir &&
-  prev.onStart === next.onStart &&
-  prev.onCancel === next.onCancel &&
-  prev.onDelete === next.onDelete &&
   prev.onOpen === next.onOpen &&
-  prev.onDiff === next.onDiff &&
-  prev.onMarkDone === next.onMarkDone &&
-  prev.onArchive === next.onArchive &&
-  prev.onUnarchive === next.onUnarchive &&
   // Both are useMemo'd in App.tsx off `tasks` — reference-stable whenever
   // the underlying task list didn't actually change, same guarantee
   // `sameTasks` below relies on for the `tasks` prop itself.

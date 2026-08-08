@@ -5,10 +5,10 @@ import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { COLUMNS, isActiveColumn, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
-import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
-import { KanbanFilters } from "@/components/kanban/KanbanFilters";
+import { KanbanFilters, basename } from "@/components/kanban/KanbanFilters";
+import { SwimLane } from "@/components/kanban/SwimLane";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
@@ -539,6 +539,44 @@ export default function App() {
     return m;
   }, [tasks]);
 
+  // Groups `visibleTasks` into one swimlane per project (task.workdir),
+  // each further bucketed by column. Registered projects first (in
+  // `projects`'s own order, skipping any with zero currently-visible
+  // tasks — an empty lane is noise), then any workdir present in tasks but
+  // not a registered project (ad-hoc/typed-in workdirs), alphabetically.
+  // No stability trick needed for `tasksByColumn`'s per-cell arrays beyond
+  // what `visibleTasks.filter(...)` already relied on for the flat board —
+  // `Column`'s memo comparator (Column.tsx) compares elements, not the
+  // array reference, and elements stay stable via `reconcileById` above.
+  const lanes = useMemo(() => {
+    const byWorkdir = new Map<string, Task[]>();
+    for (const t of visibleTasks) {
+      const arr = byWorkdir.get(t.workdir);
+      if (arr) arr.push(t); else byWorkdir.set(t.workdir, [t]);
+    }
+    const ordered: string[] = [];
+    for (const p of projects) {
+      if (byWorkdir.has(p.path)) ordered.push(p.path);
+    }
+    const known = new Set(ordered);
+    const extra = Array.from(byWorkdir.keys()).filter((w) => !known.has(w)).sort();
+    return [...ordered, ...extra].map((workdir) => {
+      const laneTasks = byWorkdir.get(workdir)!;
+      const tasksByColumn = new Map<ColumnId, Task[]>();
+      for (const t of laneTasks) {
+        const arr = tasksByColumn.get(t.column);
+        if (arr) arr.push(t); else tasksByColumn.set(t.column, [t]);
+      }
+      const project = projects.find((p) => p.path === workdir);
+      return {
+        workdir,
+        label: project?.name || basename(workdir) || workdir,
+        taskCount: laneTasks.length,
+        tasksByColumn,
+      };
+    });
+  }, [visibleTasks, projects]);
+
   // Distinct harness ids referenced by any task — feeds the harness filter so
   // ids belonging to removed harnesses still show up as filter options.
   const taskAgentIds = useMemo(
@@ -563,10 +601,23 @@ export default function App() {
 
   const onDragEnd = useCallback(async (e: DragEndEvent) => {
     const id = String(e.active.id);
-    const col = e.over?.id as ColumnId | undefined;
-    if (!col) return;
+    // Droppable ids are namespaced per-lane (`${workdir}::${columnId}`,
+    // see SwimLane.tsx) since a swimlane board has one Column per (project,
+    // stage) pair and every ColumnId repeats once per lane. Split it back
+    // apart rather than trusting `over.id` as a bare ColumnId.
+    const overId = e.over?.id != null ? String(e.over.id) : undefined;
+    if (!overId) return;
+    const sep = overId.indexOf("::");
+    if (sep < 0) return;
+    const laneWorkdir = overId.slice(0, sep);
+    const col = overId.slice(sep + 2) as ColumnId;
     const t = tasksRef.current.find((x) => x.id === id);
-    if (!t || t.column === col) return;
+    if (!t) return;
+    // A drag must never silently move a task to a different project —
+    // there's no API support for that, and it shouldn't be a side effect
+    // of a column-to-column drag. Reject rather than guess.
+    if (t.workdir !== laneWorkdir) return;
+    if (t.column === col) return;
     setTasks((cur) => cur.map((x) => (x.id === id ? { ...x, column: col } : x)));
     try {
       setError(null);
@@ -855,31 +906,32 @@ export default function App() {
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />
-          {/* Kanban gets all remaining vertical space and scrolls horizontally
-              on its own — the bottom bar stays anchored regardless of column
-              count. */}
-          <div className="kanban-scroll flex-1 overflow-x-scroll">
+          {/* One swimlane per project, each independently horizontally
+              scrolling; the lane list itself scrolls vertically for the
+              remaining space — the bottom bar stays anchored regardless of
+              lane/column count. */}
+          <div className="flex-1 overflow-y-auto">
             <DndContext sensors={sensors} onDragEnd={onDragEnd}>
-              <div className="flex gap-3 p-4">
-                {visibleColumns.map((c) => (
-                  <Column
-                    key={c.id}
-                    id={c.id}
-                    label={c.label}
-                    tasks={visibleTasks.filter((t) => t.column === c.id)}
-                    tasksById={tasksById}
-                    childCountsByParent={childCountsByParent}
-                    homeDir={homeDir}
-                    onStart={start}
-                    onCancel={cancel}
-                    onDelete={del}
-                    onOpen={setSelected}
-                    onDiff={setDiffTask}
-                    onMarkDone={markDone}
-                    onArchive={archive}
-                    onUnarchive={unarchive}
-                  />
-                ))}
+              <div className="flex flex-col gap-4 p-4">
+                {lanes.length === 0 ? (
+                  <p className="px-1 text-xs text-muted-foreground">
+                    No tasks match the current filters.
+                  </p>
+                ) : (
+                  lanes.map((lane) => (
+                    <SwimLane
+                      key={lane.workdir}
+                      workdir={lane.workdir}
+                      label={lane.label}
+                      taskCount={lane.taskCount}
+                      visibleColumns={visibleColumns}
+                      tasksByColumn={lane.tasksByColumn}
+                      tasksById={tasksById}
+                      childCountsByParent={childCountsByParent}
+                      onOpen={setSelected}
+                    />
+                  ))
+                )}
               </div>
             </DndContext>
           </div>
@@ -895,6 +947,9 @@ export default function App() {
         onShowDiff={setDiffTask}
         onArchive={archive}
         onUnarchive={unarchive}
+        onStart={start}
+        onMarkDone={markDone}
+        onDelete={del}
         onOpenPullRequest={(prefill) => {
           setGithubPullPrefill(prefill);
           setGithubPullDetailPrefill(null);

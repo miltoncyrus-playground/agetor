@@ -1,35 +1,35 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, RotateCcw, Square, Terminal, Trash2 } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { abbreviateHome, cn } from "@/lib/utils";
+import { Card } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
-import { COLUMNS, isActiveColumn, PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { COLUMNS, PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
   task: Task;
   /** taskId -> Task over the full board — used to look up a child's parent
-   *  title. See Column.tsx's doc comment for the stability guarantee. */
+   *  title (folded into a tooltip, not shown as its own line — see the
+   *  compact-card design note below). Stable reference across renders
+   *  where the underlying task list didn't change (see Column.tsx). */
   tasksById: Map<string, Task>;
-  /** parentTaskId -> sub-task progress, for the "N/M sub-tasks" badge on a
+  /** parentTaskId -> sub-task progress, folded into the state badge for a
    *  parent card. */
   childCountsByParent: Map<string, { merged: number; total: number }>;
-  homeDir: string;
-  onStart: (t: Task) => void;
-  onCancel: (t: Task) => void;
-  onDelete: (t: Task) => void;
   onOpen: (t: Task) => void;
-  onDiff: (t: Task) => void;
-  onMarkDone: (t: Task) => void;
-  onArchive: (t: Task) => void;
-  onUnarchive: (t: Task) => void;
 }
 
-function TaskCardImpl({ task, tasksById, childCountsByParent, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
+/**
+ * Compact by design: shows exactly subject (title), harness (agent), and
+ * state (one badge) — everything else that used to live on the card face
+ * (workdir, branch/baseRef, model/mode, terminal/subagent counts, and
+ * every action button) now lives ONLY in `RunPanel`, opened by clicking
+ * the tile. `RunPanel` was extended (see its own file) with a real Run
+ * button, Mark Done, Delete, and Retry-stage so nothing is actually lost —
+ * see the swimlane-board plan for the full inventory of what moved where.
+ */
+function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
   const archived = task.archivedAt != null;
   const parentTask = task.parentTaskId ? tasksById.get(task.parentTaskId) : undefined;
   const childProgress = task.pipelineStage != null ? childCountsByParent.get(task.id) : undefined;
@@ -37,7 +37,7 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, homeDir, onStart, 
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
     // the user has to take the explicit unarchive action first. A pipeline
-    // task mid-flight (one of the 4 stage columns) is also undraggable — a
+    // task mid-flight (one of the 6 stage columns) is also undraggable — a
     // human yanking it to another column mid-auto-advance would desync
     // pipelineStage from column. Once it reaches blocked/ready/done it's a
     // normal draggable card again.
@@ -48,232 +48,71 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, homeDir, onStart, 
     ? { transform: CSS.Translate.toString(transform) }
     : undefined;
 
-  // Button precedence: Answer > Stop > Open > Run.
-  //  - Answer when at least one interaction (AskUserQuestion / ExitPlanMode /
-  //    tool-approval) is pending OR codex flipped the task to
-  //    `blocked` via the approval-prompt heuristic. Opens the run panel; Stop
-  //    moves to a trailing icon slot so the user can still cancel.
-  //  - Stop while the agent process is live (running OR blocked-awaiting-user).
-  //  - Open once any run has reached succeeded/running/orphaned — there's
-  //    something worth re-reading; Run stays reachable from inside the panel.
-  //  - Run otherwise (no openable history yet, or only failed/cancelled).
-  const active = isActiveColumn(task.column) || task.column === "blocked";
-  const openable = task.hasOpenableRun;
-  // Combine structured interactions with codex's narrative `blocked` signal.
-  // The latter has no answerable payload — the user resolves it from the run
-  // panel — but it represents the same "waiting on you" state to the user.
-  // When the only signal is `blocked` (no structured questions), we label the
-  // call-to-action "Review" instead of "Answer" to avoid promising a Q&A flow
-  // the panel can't deliver.
   const pendingCount = task.pendingInteractionCount;
   const blocked = task.column === "blocked";
   const awaiting = pendingCount > 0 || blocked;
-  const awaitingLabel =
-    pendingCount > 1 ? `Answer (${pendingCount})`
-    : pendingCount === 1 ? "Answer"
-    : "Review";
-
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
-  const runningSubagents = task.runningSubagents ?? 0;
+
+  // The single "state" string: pipeline stage (+ pulsing dot while actively
+  // mid-stage, + revision count, + sub-task progress) for a pipeline task,
+  // else just the plain column label. Collapses what used to be up to 4
+  // separate badges (pipeline-stage, revision suffix, terminal count,
+  // running-subagents) into one line — those secondary counts are still
+  // visible in RunPanel (terminal count) or were never load-bearing enough
+  // to justify face space (running-subagents has its own tabs in RunPanel).
+  const stageLabel = task.pipelineStage
+    ? (COLUMNS.find((c) => c.id === task.pipelineStage)?.label ?? task.pipelineStage)
+    : (COLUMNS.find((c) => c.id === task.column)?.label ?? task.column);
+  const stateSuffix = [
+    task.pipelineStage && task.revisionCount > 0 ? `rev ${task.revisionCount}` : null,
+    childProgress ? `${childProgress.merged}/${childProgress.total} sub-tasks` : null,
+  ].filter(Boolean).join(" · ");
+  const isActivelyMidStage = task.pipelineStage != null && PIPELINE_STAGE_COLUMNS.includes(task.column);
 
   return (
     <Card
       ref={setNodeRef}
       style={style}
       className={cn(
-        "cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
+        "flex cursor-grab select-none flex-col gap-0.5 border-border/60 border-l-4 px-2.5 py-1.5 hover:border-border transition-colors",
         // A pipeline sub-task gets a distinct border color instead of its
         // task-type color, so it reads as "part of a build" at a glance —
-        // no nested/grouped-card framework, just a flat card with a marker
-        // (see TaskCard.tsx's/Column.tsx's doc comments on why: the board
-        // has no @dnd-kit/sortable and doesn't need one for this).
+        // the "part of <parent>" text is folded into the title's tooltip
+        // instead of its own line, to keep the tile compact.
         parentTask ? "border-l-violet-500" : type.borderClass,
         isDragging && "opacity-50",
         awaiting && "ring-2 ring-amber-500/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
         archived && "cursor-default opacity-60",
       )}
       onClick={() => onOpen(task)}
+      title={parentTask ? `${task.title} — part of "${parentTask.title}"` : task.title}
       {...listeners}
       {...attributes}
     >
-      <CardHeader className="pb-2">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <div className="flex min-w-0 items-start gap-1.5">
-              <TypeIcon
-                className={cn("mt-0.5 size-3.5 shrink-0", type.iconClass)}
-                aria-label={type.label}
-              />
-              <CardTitle className="text-sm min-w-0 flex-1 break-words">{task.title}</CardTitle>
-            </div>
-            {parentTask && (
-              <p
-                className="truncate text-[10px] text-violet-400"
-                title={`Part of “${parentTask.title}” (pipeline sub-task)`}
-              >
-                part of “{parentTask.title}”
-              </p>
-            )}
-          </div>
-          <div className="flex shrink-0 flex-col items-end gap-1">
-            <Badge variant="secondary" className="gap-1">
-              <AgentIcon kind={task.agent} className="size-3" />
-              {task.agent}
-            </Badge>
-            {(task.model || task.mode) && (
-              <span className="text-[10px] font-mono text-muted-foreground">
-                {[task.model, task.mode].filter(Boolean).join(" · ")}
-              </span>
-            )}
-            {task.openTerminalCount > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px]"
-                title={`${task.openTerminalCount} open terminal${task.openTerminalCount > 1 ? "s" : ""}`}
-              >
-                <Terminal className="size-3" />
-                {task.openTerminalCount}
-              </Badge>
-            )}
-            {runningSubagents > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px]"
-                title={`${runningSubagents} background agent${runningSubagents > 1 ? "s" : ""} running`}
-              >
-                <Bot className="size-3" />
-                {runningSubagents}
-              </Badge>
-            )}
-            {task.pipelineStage && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px]"
-                title={
-                  task.revisionCount > 0
-                    ? `Pipeline stage: ${task.pipelineStage} (revision ${task.revisionCount}/${PIPELINE_STAGE_COLUMNS.length + 1})`
-                    : `Pipeline stage: ${task.pipelineStage}`
-                }
-              >
-                {PIPELINE_STAGE_COLUMNS.includes(task.column) && (
-                  // Same green-pulsing-dot pattern used elsewhere for "agent
-                  // actively working" (RunPanel's SubagentTab/RunningIndicator)
-                  // — deliberately NOT the amber awaiting-pulse this card's
-                  // outer ring already uses, which means "waiting on a human,"
-                  // the opposite state.
-                  <span className="relative inline-flex size-1.5 shrink-0">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
-                    <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
-                  </span>
-                )}
-                {COLUMNS.find((c) => c.id === task.pipelineStage)?.label ?? task.pipelineStage}
-                {task.revisionCount > 0 && ` · rev ${task.revisionCount}`}
-              </Badge>
-            )}
-            {childProgress && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px] border-violet-500/40 text-violet-400"
-                title={`${childProgress.merged} of ${childProgress.total} sub-tasks merged`}
-              >
-                {childProgress.merged}/{childProgress.total} sub-tasks
-              </Badge>
-            )}
-          </div>
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-2">
-        <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
-        <p
-          className="text-[10px] text-muted-foreground/70 font-mono truncate"
-          title={task.workdir}
-        >
-          {abbreviateHome(task.workdir, homeDir)}
-        </p>
-        {(task.branch || task.baseRef) && (
-          <div className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground">
-            <GitBranch className="size-3 shrink-0" />
-            <span className="truncate">
-              {task.branch ?? "(not yet created)"}
-              {task.baseRef && (
-                <span className="ml-1 opacity-70">· {task.baseRef.slice(0, 7)}</span>
-              )}
-            </span>
-          </div>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <TypeIcon className={cn("size-3 shrink-0", type.iconClass)} aria-label={type.label} />
+        <span className="min-w-0 flex-1 truncate text-xs font-medium leading-tight">{task.title}</span>
+      </div>
+      <div className="flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
+        <AgentIcon kind={task.agent} className="size-3 shrink-0" />
+        <span className="shrink-0">{task.agent}</span>
+        <span className="opacity-40">·</span>
+        {isActivelyMidStage && (
+          // Same green-pulsing-dot pattern used elsewhere for "agent
+          // actively working" — deliberately NOT the amber awaiting-pulse
+          // the card's outer ring already uses, which means the opposite
+          // state ("waiting on a human").
+          <span className="relative inline-flex size-1.5 shrink-0">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
+            <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
+          </span>
         )}
-        <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
-          {archived ? (
-            <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
-              <FolderOpen className="size-3" /> Open
-            </Button>
-          ) : awaiting ? (
-            <Button
-              size="sm"
-              className="gap-1 bg-amber-500 text-amber-950 hover:bg-amber-500/90 focus-visible:ring-amber-500"
-              onClick={() => onOpen(task)}
-              title={pendingCount > 0 ? "Open run panel to answer" : "Agent is waiting on you — open the run panel"}
-            >
-              <MessageCircleQuestion className="size-3" />
-              {awaitingLabel}
-              <ArrowRight className="size-3" />
-            </Button>
-          ) : active ? (
-            <Button size="sm" variant="destructive" onClick={() => onCancel(task)}>
-              <Square className="size-3" /> Stop
-            </Button>
-          ) : openable ? (
-            <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
-              <FolderOpen className="size-3" /> Open
-            </Button>
-          ) : (
-            <Button size="sm" onClick={() => onStart(task)}>
-              <Play className="size-3" /> Run
-            </Button>
-          )}
-          {!archived && awaiting && active && (
-            <Button size="icon" variant="ghost" onClick={() => onCancel(task)} title="Stop">
-              <Square className="size-3" />
-            </Button>
-          )}
-          {!archived && blocked && task.pipelineStage != null && (
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={() => onStart(task)}
-              title="Retry this pipeline stage — re-runs the agent turn that died here"
-            >
-              <RotateCcw className="size-3" />
-            </Button>
-          )}
-          {!archived && task.column === "review" && (
-            <Button size="sm" variant="outline" onClick={() => onMarkDone(task)} title="Mark this task as done">
-              <CheckCircle2 className="mr-1 size-3" /> Done
-            </Button>
-          )}
-          {!archived && (task.column === "done" || active) && (
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={() => onArchive(task)}
-              title={active ? "Stop the running agent and archive task" : "Archive task"}
-            >
-              <Archive className="size-3" />
-            </Button>
-          )}
-          {archived && (
-            <Button size="icon" variant="ghost" onClick={() => onUnarchive(task)} title="Unarchive task">
-              <ArchiveRestore className="size-3" />
-            </Button>
-          )}
-          <Button size="icon" variant="ghost" onClick={() => onDiff(task)} title="View changes (git diff)">
-            <GitCompare className="size-3" />
-          </Button>
-          <Button size="icon" variant="ghost" onClick={() => onDelete(task)} title="Delete task">
-            <Trash2 className="size-3" />
-          </Button>
-        </div>
-      </CardContent>
+        <span className="truncate">
+          {stageLabel}
+          {stateSuffix && ` · ${stateSuffix}`}
+        </span>
+      </div>
     </Card>
   );
 }
@@ -281,8 +120,9 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, homeDir, onStart, 
 // Default shallow-props comparator is correct here (unlike Column, which
 // needs a custom comparator for its array prop): `task` is a single object
 // whose identity App.tsx's `reconcileById` preserves across polls when
-// unchanged, and every other prop is either a primitive (`homeDir`) or a
-// `useCallback`-stabilized handler. dnd-kit's `useDraggable` lives inside
-// the component body, so memoizing the outer function doesn't interfere
-// with drag state — that's driven by dnd-kit's own context, not props.
+// unchanged, `tasksById`/`childCountsByParent` are useMemo'd in App.tsx
+// (reference-stable when unchanged), and `onOpen` is `useCallback`-
+// stabilized. dnd-kit's `useDraggable` lives inside the component body, so
+// memoizing the outer function doesn't interfere with drag state — that's
+// driven by dnd-kit's own context, not props.
 export const TaskCard = memo(TaskCardImpl);

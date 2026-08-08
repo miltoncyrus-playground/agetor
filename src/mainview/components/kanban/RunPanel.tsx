@@ -3,8 +3,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Pause, Plug, Play, RefreshCw, Search, Send, Slash, SquareSlash,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, CheckCircle2, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Pause, Plug, Play, RefreshCw, RotateCcw, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -25,6 +25,7 @@ import { abbreviateHome, cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
+  COLUMNS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
@@ -119,6 +120,17 @@ interface Props {
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  /** Start the task's first run — the compact `TaskCard` no longer has its
+   *  own Run button (see TaskCard.tsx's doc comment), so this is now the
+   *  only place a fresh task actually gets started from. */
+  onStart: (t: Task) => void;
+  /** Move the task to "done" — was TaskCard-only before the compact-card
+   *  redesign moved every action button into this panel. */
+  onMarkDone: (t: Task) => void;
+  /** Delete the task (confirms internally — see App.tsx's `del`). Also
+   *  TaskCard-only before the compact-card redesign; App.tsx's handler
+   *  already closes this panel if the deleted task was the open one. */
+  onDelete: (t: Task) => void;
   /** Open GitHubDialog's New-PR composer prefilled for this task — see the
    *  "Open PR" chip below. Owned by App so the dialog stays a single
    *  App-level singleton instead of one instance per task panel. */
@@ -179,7 +191,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onStart, onMarkDone, onDelete, onOpenPullRequest, onViewPullRequest }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -268,6 +280,9 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           onShowDiff={onShowDiff}
           onArchive={onArchive}
           onUnarchive={onUnarchive}
+          onStart={onStart}
+          onMarkDone={onMarkDone}
+          onDelete={onDelete}
           onOpenPullRequest={onOpenPullRequest}
           onViewPullRequest={onViewPullRequest}
         />
@@ -291,6 +306,9 @@ function RunPanelBody({
   onShowDiff,
   onArchive,
   onUnarchive,
+  onStart,
+  onMarkDone,
+  onDelete,
   onOpenPullRequest,
   onViewPullRequest,
 }: {
@@ -308,6 +326,9 @@ function RunPanelBody({
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  onStart: (t: Task) => void;
+  onMarkDone: (t: Task) => void;
+  onDelete: (t: Task) => void;
   onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
   onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
 }) {
@@ -2269,7 +2290,16 @@ function RunPanelBody({
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-semibold">{task.title}</div>
           <div className="truncate text-xs text-muted-foreground">
-            {task.agent} · {task.column}
+            {task.agent} · {
+              // Pipeline stage is the more specific, more useful "state"
+              // once a task has one — the compact TaskCard shows the same
+              // preference (stage label over raw column), see its own
+              // state-badge logic.
+              task.pipelineStage
+                ? (COLUMNS.find((c) => c.id === task.pipelineStage)?.label ?? task.pipelineStage)
+                : task.column
+            }
+            {task.pipelineStage && task.revisionCount > 0 && <> · rev {task.revisionCount}</>}
             {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
             {task.baseRef && (
               <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
@@ -2314,6 +2344,15 @@ function RunPanelBody({
               title={prStatusError ?? "Re-check PR mergeability"}
             >
               <RefreshCw className="size-3.5" />
+            </Button>
+          )}
+          {/* The compact TaskCard no longer has its own Run button (see
+              TaskCard.tsx) — this is now the ONLY way to start a fresh
+              task's first run. Gated on `runs.length === 0` so it
+              disappears once there's something to Stop/resume instead. */}
+          {!archived && runs.length === 0 && (
+            <Button size="sm" onClick={() => onStart(task)} title="Start the agent">
+              <Play className="mr-1 size-3" /> Run
             </Button>
           )}
           <Button
@@ -2364,6 +2403,11 @@ function RunPanelBody({
               <ArchiveRestore className="mr-1 size-3" /> Unarchive
             </Button>
           )}
+          {!archived && task.column === "review" && (
+            <Button size="sm" variant="outline" onClick={() => onMarkDone(task)} title="Mark this task as done">
+              <CheckCircle2 className="mr-1 size-3" /> Done
+            </Button>
+          )}
           {!archived && task.pipelineStage != null && (
             <Button
               size="sm"
@@ -2380,6 +2424,24 @@ function RunPanelBody({
                 : <><Pause className="mr-1 size-3" /> Pause</>}
             </Button>
           )}
+          {!archived && task.column === "blocked" && task.pipelineStage != null && (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => onStart(task)}
+              title="Retry this pipeline stage — re-runs the agent turn that died here"
+            >
+              <RotateCcw className="size-3" />
+            </Button>
+          )}
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={() => onDelete(task)}
+            title="Delete task"
+          >
+            <Trash2 className="size-3" />
+          </Button>
           <Button
             size="icon"
             variant="ghost"
