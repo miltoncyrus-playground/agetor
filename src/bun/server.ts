@@ -3047,8 +3047,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                   return [{ path: p, isDirectory: Boolean(r.isDirectory) }];
                 })
             : [];
+          // Server-managed child-linking fields — unlike `pipeline` (not a
+          // Task field at all), parentTaskId/planSubtaskId/childMergeStatus
+          // ARE real Task fields, so an external caller could otherwise
+          // fabricate a parent/child link through this public create route.
+          // Only build-scheduler.ts's tickBuild is allowed to set them.
+          const { parentTaskId, planSubtaskId, childMergeStatus, ...safeBody } = body;
           const result = await createTask({
-            ...body,
+            ...safeBody,
             title: body.title,
             prompt: body.prompt,
             references,

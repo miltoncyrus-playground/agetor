@@ -1,6 +1,6 @@
 export type ColumnId =
   | "backlog" | "ready" | "running" | "blocked" | "review" | "done"
-  | "planning" | "plan-review" | "building" | "testing";
+  | "planning" | "plan-review" | "pre-builder" | "building" | "code-review" | "testing";
 
 /**
  * The exact `HarnessStatus.reason` string the server emits when claude-code
@@ -38,7 +38,9 @@ export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "ready", label: "Ready" },
   { id: "planning", label: "Planning" },
   { id: "plan-review", label: "Plan Review" },
+  { id: "pre-builder", label: "Pre-Builder" },
   { id: "building", label: "Building" },
+  { id: "code-review", label: "Code Review" },
   { id: "testing", label: "Testing" },
   { id: "running", label: "Running" },
   { id: "blocked", label: "Blocked" },
@@ -46,12 +48,15 @@ export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "done", label: "Done" },
 ];
 
-/** The 4 columns a pipeline task's own agent occupies while auto-advancing
+/** The 6 columns a pipeline task's own agent occupies while auto-advancing
  *  (see src/bun/pipeline-prompts.ts and orchestrator.ts's advancePipelineStage).
  *  Never used by a non-pipeline task — `running`/`review` stay exactly as
- *  they are for those. */
+ *  they are for those. Also the set of columns a CHILD task (see
+ *  `Task.parentTaskId`) can sit in — a child spends its whole life in
+ *  `building` (or `blocked` on failure, outside this list), so it inherits
+ *  the same undraggable/isActiveColumn treatment for free. */
 export const PIPELINE_STAGE_COLUMNS: readonly ColumnId[] =
-  ["planning", "plan-review", "building", "testing"];
+  ["planning", "plan-review", "pre-builder", "building", "code-review", "testing"];
 
 /** Shared send-back budget for a pipeline task across BOTH loop edges
  *  (plan-review→planning and testing→building combined, not 4 each).
@@ -726,19 +731,29 @@ export interface Task {
    *  that don't join the subagents table. */
   runningSubagents?: number;
   /**
-   * Non-null marks this a "pipeline task": its 4 stages (planning →
-   * plan-review → building → testing → ready) run automatically with no
-   * human click between them, using the same harness/CLI as an ordinary
-   * task — just a different prompt template per stage (see
-   * src/bun/pipeline-prompts.ts). Null (the default, and every legacy row)
-   * is a completely ordinary task — every existing single-agent behavior is
-   * unaffected. Set once at creation from the "Run as pipeline" checkbox;
-   * never settable via PATCH — deliberately absent from
-   * `ALLOWED_PATCH_FIELDS` (server.ts), same treatment as `branch`/
-   * `worktreePath`/`prUrl`. Written exclusively by orchestrator.ts's
-   * `advancePipelineStage` from here on.
+   * Non-null marks this a "pipeline task": its 6 stages (planning →
+   * plan-review → pre-builder → building → code-review → testing → ready)
+   * run automatically with no human click between them, using the same
+   * harness/CLI as an ordinary task — just a different prompt template per
+   * stage (see src/bun/pipeline-prompts.ts). Null (the default, and every
+   * legacy row) is a completely ordinary task — every existing single-agent
+   * behavior is unaffected; this includes every CHILD task a "building"
+   * stage spawns (see `parentTaskId`) — a child is an ordinary task in its
+   * own right, never a pipeline task itself. Set once at creation from the
+   * "Run as pipeline" checkbox; never settable via PATCH — deliberately
+   * absent from `ALLOWED_PATCH_FIELDS` (server.ts), same treatment as
+   * `branch`/`worktreePath`/`prUrl`. Written exclusively by
+   * orchestrator.ts's `advancePipelineStage` (and, for the pre-builder →
+   * building fresh-entry transition, `spawnPipelineStage`) from here on.
+   *
+   * `building` has two distinct entries: FRESH (from pre-builder success —
+   * the parent spawns child tasks per BUILD_PLAN.json and runs no agent of
+   * its own; see build-scheduler.ts's `tickBuild`) and BOUNCE (from
+   * code-review "revise" or testing "fail" — a plain single-agent fixup
+   * turn, no children spawned, identical to how `building` always worked
+   * before this stage existed).
    */
-  pipelineStage: "planning" | "plan-review" | "building" | "testing" | null;
+  pipelineStage: "planning" | "plan-review" | "pre-builder" | "building" | "code-review" | "testing" | null;
   /**
    * Set true by the Critic's "approve" verdict on a plan-review run; reset
    * to false whenever a later plan-review run instead sends the task back
@@ -780,6 +795,42 @@ export interface Task {
    * clears this. Always null for a non-pipeline task.
    */
   pausedAt: number | null;
+  /**
+   * Links a CHILD task (spawned by a "building" stage's fresh entry, one
+   * per BUILD_PLAN.json subtask) back to the pipeline task that spawned it.
+   * Null for every ordinary/top-level task, including pipeline tasks
+   * themselves. A child is otherwise an entirely ordinary task — same
+   * isolation/worktree/agent machinery as any ad-hoc task, `pipelineStage`
+   * stays null on it — this field plus `planSubtaskId` are the only markers
+   * that distinguish it. Set once at creation (build-scheduler.ts's
+   * `tickBuild`), never settable via PATCH — stripped from the `POST
+   * /tasks` body server-side (server.ts) so an external caller can't
+   * fabricate a parent/child link through the public create route.
+   */
+  parentTaskId: string | null;
+  /**
+   * The local subtask id (from the parent's BUILD_PLAN.json `subtasks[].id`)
+   * this child corresponds to. Null for a non-child. Used by
+   * build-scheduler.ts's `tickBuild` to detect "has this subtask already
+   * been created" (matched against `parentTaskId`) and to resolve
+   * `dependsOn` edges (declared as plan-local ids in the JSON) to real
+   * sibling Task rows. Never settable via PATCH, same treatment as
+   * `parentTaskId`.
+   */
+  planSubtaskId: string | null;
+  /**
+   * Null for a non-child. `"pending"` from child creation until its
+   * merge-back into the parent's branch resolves; `"merged"` once
+   * `worktree.mergeBranch` succeeds (this, not the child's own `column`,
+   * is the source of truth build-scheduler.ts's barrier check and
+   * dependency-resolution read — a child's `column` stays `"building"`
+   * for its whole successful life so it renders grouped with its
+   * siblings); `"merge-failed"` on a conflict, which also moves the child
+   * to `"blocked"` and aborts the whole build (see orchestrator.ts's
+   * `blockPipelineTask`/`cancelSiblingChildren`). Never settable via
+   * PATCH, same treatment as `parentTaskId`.
+   */
+  childMergeStatus: "pending" | "merged" | "merge-failed" | null;
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can

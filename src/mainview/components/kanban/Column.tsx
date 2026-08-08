@@ -9,6 +9,14 @@ interface Props {
   id: ColumnId;
   label: string;
   tasks: Task[];
+  /** taskId -> Task, over the FULL task list (not just this column) — lets
+   *  a child card look up its parent's title regardless of which column
+   *  the parent is currently in. Stable reference across renders where the
+   *  underlying task list didn't change (see App.tsx). */
+  tasksById: Map<string, Task>;
+  /** parentTaskId -> { merged, total } sub-task counts, for the parent
+   *  card's progress badge. Same stability guarantee as `tasksById`. */
+  childCountsByParent: Map<string, { merged: number; total: number }>;
   homeDir: string;
   onStart: (t: Task) => void;
   onCancel: (t: Task) => void;
@@ -32,7 +40,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
+function ColumnImpl({ id, label, tasks, tasksById, childCountsByParent, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -53,6 +61,8 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
           <TaskCard
             key={t.id}
             task={t}
+            tasksById={tasksById}
+            childCountsByParent={childCountsByParent}
             homeDir={homeDir}
             onStart={onStart}
             onCancel={onCancel}
@@ -90,5 +100,10 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.onMarkDone === next.onMarkDone &&
   prev.onArchive === next.onArchive &&
   prev.onUnarchive === next.onUnarchive &&
+  // Both are useMemo'd in App.tsx off `tasks` — reference-stable whenever
+  // the underlying task list didn't actually change, same guarantee
+  // `sameTasks` below relies on for the `tasks` prop itself.
+  prev.tasksById === next.tasksById &&
+  prev.childCountsByParent === next.childCountsByParent &&
   sameTasks(prev.tasks, next.tasks)
 ));

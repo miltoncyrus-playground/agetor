@@ -81,6 +81,9 @@ type TaskRow = {
   revision_count: number;
   pipeline_feedback: string | null;
   paused_at: number | null;
+  parent_task_id: string | null;
+  plan_subtask_id: string | null;
+  child_merge_status: string | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
    *  a correlated subquery in `list` / `get` — see those for the full SQL. */
   has_openable_run?: number;
@@ -204,6 +207,9 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   revisionCount: r.revision_count,
   pipelineFeedback: r.pipeline_feedback,
   pausedAt: r.paused_at,
+  parentTaskId: r.parent_task_id,
+  planSubtaskId: r.plan_subtask_id,
+  childMergeStatus: r.child_merge_status as Task["childMergeStatus"],
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -244,8 +250,9 @@ export const tasks = {
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, refs, backlog, draft,
           run_id, created_at, updated_at, archived_at,
-          pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, paused_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, paused_at,
+          parent_task_id, plan_subtask_id, child_merge_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -256,6 +263,7 @@ export const tasks = {
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
         t.pipelineStage ?? null, t.planApproved ? 1 : 0, t.implementationApproved ? 1 : 0,
         t.revisionCount ?? 0, t.pipelineFeedback ?? null, t.pausedAt ?? null,
+        t.parentTaskId ?? null, t.planSubtaskId ?? null, t.childMergeStatus ?? null,
       ],
     );
     // Round-trip via `get` so the returned shape carries the computed
@@ -272,7 +280,8 @@ export const tasks = {
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
          branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, refs=?, backlog=?, draft=?,
          run_id=?, updated_at=?, archived_at=?,
-         pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, paused_at=?
+         pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, paused_at=?,
+         parent_task_id=?, plan_subtask_id=?, child_merge_status=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
@@ -283,7 +292,8 @@ export const tasks = {
         next.draft ? JSON.stringify(next.draft) : null,
         next.runId, next.updatedAt, next.archivedAt ?? null,
         next.pipelineStage ?? null, next.planApproved ? 1 : 0, next.implementationApproved ? 1 : 0,
-        next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pausedAt ?? null, id,
+        next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pausedAt ?? null,
+        next.parentTaskId ?? null, next.planSubtaskId ?? null, next.childMergeStatus ?? null, id,
       ],
     );
     // Re-fetch so hasOpenableRun reflects the row state immediately after

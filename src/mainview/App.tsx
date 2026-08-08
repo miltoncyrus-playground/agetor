@@ -518,6 +518,27 @@ export default function App() {
     [statusFilter],
   );
 
+  // Two lookups TaskCard needs for pipeline sub-tasks — computed once here
+  // (not per-card) and threaded down as stable-identity Map props via
+  // Column, so Column's/TaskCard's existing memoization only re-renders
+  // cards when `tasks` itself actually changed (reconcileById already
+  // guarantees `tasks` keeps its own reference when nothing changed at
+  // all). Built off the full `tasks`, not `visibleTasks` — a child
+  // temporarily filtered out of view (search/filter) shouldn't skew its
+  // parent's progress count.
+  const tasksById = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
+  const childCountsByParent = useMemo(() => {
+    const m = new Map<string, { merged: number; total: number }>();
+    for (const t of tasks) {
+      if (!t.parentTaskId) continue;
+      const cur = m.get(t.parentTaskId) ?? { merged: 0, total: 0 };
+      cur.total += 1;
+      if (t.childMergeStatus === "merged") cur.merged += 1;
+      m.set(t.parentTaskId, cur);
+    }
+    return m;
+  }, [tasks]);
+
   // Distinct harness ids referenced by any task — feeds the harness filter so
   // ids belonging to removed harnesses still show up as filter options.
   const taskAgentIds = useMemo(
@@ -846,6 +867,8 @@ export default function App() {
                     id={c.id}
                     label={c.label}
                     tasks={visibleTasks.filter((t) => t.column === c.id)}
+                    tasksById={tasksById}
+                    childCountsByParent={childCountsByParent}
                     homeDir={homeDir}
                     onStart={start}
                     onCancel={cancel}

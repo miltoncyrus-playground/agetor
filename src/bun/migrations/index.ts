@@ -41,6 +41,7 @@ import m032 from "./032_gemini_session_id.sql" with { type: "text" };
 import m033 from "./033_harness_kind_gemini.sql" with { type: "text" };
 import m034 from "./034_reseed_harness_builtins_2.sql" with { type: "text" };
 import m035 from "./035_pipeline_tasks.sql" with { type: "text" };
+import m036 from "./036_prebuilder_children.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -80,4 +81,5 @@ export const migrations: Migration[] = [
   { id: "033_harness_kind_gemini", sql: m033 },
   { id: "034_reseed_harness_builtins_2", sql: m034 },
   { id: "035_pipeline_tasks", sql: m035 },
+  { id: "036_prebuilder_children", sql: m036 },
 ];

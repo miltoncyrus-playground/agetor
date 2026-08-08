@@ -568,6 +568,51 @@ export async function gitPush(
   return { ok: true, remote };
 }
 
+/**
+ * Merge a completed child subtask's branch into its parent pipeline task's
+ * branch, run FROM the parent's own worktree — a real, local, deterministic
+ * git operation (per CLAUDE.md's "deterministic space" rule: this is code,
+ * not an agent turn). Every task's worktree is a linked worktree off the
+ * same source repo (see `prepareWorkdir`), so the parent's worktree can see
+ * and merge any branch in that repo, including a sibling worktree's branch
+ * — no fetch needed, they already share one object database.
+ *
+ * `--no-ff` always creates a merge commit (even when a fast-forward would
+ * do), so the history keeps a visible node per merged subtask rather than
+ * silently rewriting the parent branch's tip. `--no-edit` accepts git's
+ * default merge message non-interactively, since nothing here can respond
+ * to an editor prompt.
+ *
+ * On failure, `conflict` distinguishes a real merge conflict (caller should
+ * follow up with {@link abortMerge} to leave the worktree clean) from some
+ * other failure (bad branch name, dirty working tree refusing to merge,
+ * etc.) — either way build-scheduler.ts treats it as a failed merge-back
+ * and aborts the whole build, but only a genuine conflict needs the abort.
+ */
+export async function mergeBranch(
+  parentWorktreePath: string,
+  childBranch: string,
+): Promise<{ ok: true } | { ok: false; conflict: boolean; detail: string }> {
+  // Defense-in-depth against a "-"-leading value being read as a git flag,
+  // mirroring gitPull/gitPush's guard.
+  if (childBranch.startsWith("-")) {
+    return { ok: false, conflict: false, detail: `invalid branch name: ${childBranch}` };
+  }
+  const res = await git(["merge", "--no-ff", "--no-edit", childBranch], parentWorktreePath, 120_000);
+  if (res.ok) return { ok: true };
+  const conflict = /CONFLICT|Automatic merge failed/i.test(res.stdout + res.stderr);
+  return { ok: false, conflict, detail: res.stderr || res.stdout || `git merge failed (exit ${res.exitCode})` };
+}
+
+/** Abort an in-progress merge left behind by a {@link mergeBranch} conflict,
+ *  so the parent's worktree returns to a clean pre-merge state rather than
+ *  sitting with unresolved conflict markers. Best-effort — if there's no
+ *  merge in progress (or the abort itself fails), that's not surfaced;
+ *  the caller has already decided to block the build either way. */
+export async function abortMerge(parentWorktreePath: string): Promise<void> {
+  await git(["merge", "--abort"], parentWorktreePath, 30_000);
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()

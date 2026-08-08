@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
@@ -117,11 +117,14 @@ import { WORKTREE_STALE_AFTER_MS, PIPELINE_REVISION_CAP, PIPELINE_STAGE_COLUMNS,
 import { appendReferences } from "../shared/refs.ts";
 import {
   PIPELINE_PLAN_FILE,
+  PIPELINE_BUILD_PLAN_FILE,
   parsePipelineVerdict,
+  parseBuildPlan,
   stagePrompt,
   type PlanReviewVerdict,
   type TestingVerdict,
 } from "./pipeline-prompts.ts";
+import { tickBuild, completeChildBuild } from "./build-scheduler.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -814,6 +817,34 @@ export function reconcileOrphans(): number {
   return orphaned.length;
 }
 
+/**
+ * Boot-time companion to `reconcileOrphans`, for a gap that function can't
+ * cover: `reconcileOrphans` only finds tasks with an active *run*
+ * (`status='running'`), but a parent mid-build (fresh-entry/DAG mode) has
+ * no run of its own while its children work — nothing surfaces it there.
+ * Scans for exactly that shape and re-drives build-scheduler.ts's
+ * `tickBuild` on each, which is naturally idempotent: if the build was
+ * already complete or aborted before the crash, its own guards (parent no
+ * longer in an active "building" column) make this a no-op; if a child was
+ * mid-run when agetor restarted, that child's own row is picked up by the
+ * ordinary `reconcileOrphans` pass instead (it's a plain task with a plain
+ * run) — tickBuild just resumes deciding what (if anything) needs to
+ * happen next once that settles.
+ *
+ * Called once at boot from both `src/bun/index.ts` and `src/bun/headless.ts`
+ * — this feature has two boot entry points, and both need it.
+ */
+export function resumeInFlightBuilds(): number {
+  const parents = tasks.list().filter(
+    (t) => t.pipelineStage === "building" && t.parentTaskId == null && t.archivedAt == null,
+  );
+  for (const parent of parents) {
+    void tickBuild(parent.id).catch((err) => {
+      console.error(`[agetor] boot resume: tickBuild failed for task ${parent.id}:`, err);
+    });
+  }
+  return parents.length;
+}
 
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
   let task = tasks.get(taskId);
@@ -1131,6 +1162,14 @@ function attachDoneHandler(
             data: `background agents still running (${runningCount}) — holding in running`,
             ts: Date.now(),
           });
+        } else if (task.parentTaskId != null) {
+          const outcome: PipelineOutcome = wasCancelled
+            ? { kind: "cancelled" }
+            : wasApiError ? { kind: "hard-failure", reason: "api-error" }
+            : wasSessionDied ? { kind: "hard-failure", reason: "session-died" }
+            : wasUnknownCommand ? { kind: "hard-failure", reason: "unknown-command" }
+            : { kind: "success" };
+          settleChildRun(taskId, runId, outcome);
         } else if (task.pipelineStage != null) {
           const outcome: PipelineOutcome = wasCancelled
             ? { kind: "cancelled" }
@@ -1176,7 +1215,14 @@ function attachDoneHandler(
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
-        if (task.pipelineStage != null) {
+        if (task.parentTaskId != null) {
+          const outcome: PipelineOutcome = wasCancelled
+            ? { kind: "cancelled" }
+            : wasSessionDied ? { kind: "hard-failure", reason: "session-died" }
+            : wasUnknownCommand ? { kind: "hard-failure", reason: "unknown-command" }
+            : { kind: "hard-failure", reason: "pipeline-failed" };
+          settleChildRun(taskId, runId, outcome);
+        } else if (task.pipelineStage != null) {
           const outcome: PipelineOutcome = wasCancelled
             ? { kind: "cancelled" }
             : wasSessionDied ? { kind: "hard-failure", reason: "session-died" }
@@ -1225,20 +1271,143 @@ type PipelineOutcome =
  *  driver or a crash-before-first-token run could hit this). */
 function lastPipelineVerdict(runId: string, stage: "plan-review"): PlanReviewVerdict;
 function lastPipelineVerdict(runId: string, stage: "testing"): TestingVerdict;
+function lastPipelineVerdict(runId: string, stage: "code-review"): PlanReviewVerdict;
 function lastPipelineVerdict(
   runId: string,
-  stage: "plan-review" | "testing",
+  stage: "plan-review" | "testing" | "code-review",
 ): PlanReviewVerdict | TestingVerdict {
   const events = runs.events(runId);
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]!;
     if (e.stream === "assistant" && e.subagentId == null) {
-      return stage === "plan-review"
-        ? parsePipelineVerdict("plan-review", e.data)
-        : parsePipelineVerdict("testing", e.data);
+      if (stage === "testing") return parsePipelineVerdict("testing", e.data);
+      if (stage === "code-review") return parsePipelineVerdict("code-review", e.data);
+      return parsePipelineVerdict("plan-review", e.data);
     }
   }
   return { ok: false };
+}
+
+/**
+ * Move a pipeline task to `nextStage`, persisting `patch` first so
+ * `startTask` (which re-reads the task row) picks up the new stage's
+ * prompt and, on a resume, the new `pipelineFeedback`. If the task was
+ * paused, the column still lands on the target stage (so the card
+ * reflects where it's "at"), but no run is spawned — resuming (or, for a
+ * "building" fresh-entry, `tickBuild` continuing) fires it later.
+ *
+ * Hoisted out of `advancePipelineStage` (was a trapped closure there) so
+ * build-scheduler.ts's `tickBuild` can call it too, for the ONE transition
+ * `advancePipelineStage` itself never reaches: the "building" barrier
+ * completing (parent has no terminal run of its own to trigger
+ * `attachDoneHandler` in fresh-entry/DAG mode — see build-scheduler.ts).
+ * `runId` is nullable for exactly that caller (no run to attribute the
+ * column-change event to).
+ */
+export function spawnPipelineStage(
+  taskId: string,
+  runId: string | null,
+  nextStage: NonNullable<Task["pipelineStage"]>,
+  patch: Partial<Task> = {},
+): void {
+  tasks.update(taskId, { pipelineStage: nextStage, ...patch });
+  updateColumn(taskId, runId, nextStage, "stage-advance");
+  if (tasks.get(taskId)?.pausedAt != null) return;
+  void startTask(taskId).then(
+    (result) => {
+      // startTask signals failure by RESOLVING with { error }, not by
+      // rejecting — a bare .catch() alone would miss this (harness
+      // unavailable, bad workdir, etc. all resolve this way).
+      if ("error" in result && tasks.get(taskId)?.runId == null) {
+        console.error(`[agetor] pipeline auto-advance failed for task ${taskId} (stage ${nextStage}): ${result.error}`);
+        updateColumn(taskId, null, "blocked", "pipeline-failed");
+      }
+    },
+    (err) => {
+      console.error(`[agetor] pipeline auto-advance failed for task ${taskId} (stage ${nextStage}):`, err);
+      // Nothing else surfaces a startTask failure here — land it on
+      // blocked ourselves so the task doesn't silently stall.
+      if (tasks.get(taskId)?.runId == null) {
+        updateColumn(taskId, null, "blocked", "pipeline-failed");
+      }
+    },
+  );
+}
+
+/**
+ * Block a pipeline task (its own `updateColumn(..., "blocked", reason)`
+ * plus an optional `pipelineFeedback` patch naming why). Exported so
+ * build-scheduler.ts can call it on a merge conflict or a child hard
+ * failure without reaching into orchestrator-private state itself.
+ */
+export function blockPipelineTask(
+  taskId: string,
+  runId: string | null,
+  reason: "api-error" | "session-died" | "unknown-command" | "pipeline-failed" | "revision-cap",
+  feedback?: string,
+): void {
+  if (feedback != null) tasks.update(taskId, { pipelineFeedback: feedback });
+  updateColumn(taskId, runId, "blocked", reason);
+}
+
+/**
+ * Cancel every still-running child of `parentTaskId` — used when one child
+ * hard-fails or its merge conflicts, aborting the whole build rather than
+ * letting siblings keep working toward a result that's already moot.
+ * Exported so build-scheduler.ts can call it without reaching into the
+ * `active` map itself (that's `cancelRun`'s job, already exported).
+ */
+export function cancelSiblingChildren(parentTaskId: string): void {
+  for (const child of tasks.list()) {
+    if (child.parentTaskId === parentTaskId && child.runId && active.has(child.runId)) {
+      cancelRun(child.runId);
+    }
+  }
+}
+
+/**
+ * Settle a CHILD task's terminal run — the third branch `attachDoneHandler`
+ * checks, ahead of the `pipelineStage` check, since a child is an ordinary
+ * task (`pipelineStage: null`; the DAG lives in `parentTaskId`/
+ * `planSubtaskId`) that would otherwise fall into the plain `nextColumn`
+ * ternary and land a successful child on `review` — wrong, since a
+ * successful child still needs its merge-back before anything is truly
+ * "done".
+ *
+ * Success: hands off to build-scheduler.ts's `completeChildBuild`, which
+ * merges the child's branch into the parent's and continues the build.
+ * Anything else (cancelled or hard-failure): the child moves to `blocked`
+ * — never `ready`, which is what the ordinary cancelled-run treatment
+ * would do (looks like "nothing to see here, click Run") and would be
+ * actively misleading for a child cancelled because a SIBLING failed and
+ * the whole build is aborting. If the parent is still actively building
+ * (`column === "building"`), THIS is the failure that aborts the build:
+ * block the parent and cancel every other still-running sibling. If the
+ * parent is already blocked, this settle is itself one of those cascading
+ * cancellations — the abort already happened, so it's a no-op past
+ * landing this one child on `blocked`.
+ */
+function settleChildRun(taskId: string, runId: string, outcome: PipelineOutcome): void {
+  const task = tasks.get(taskId);
+  if (!task || task.runId !== runId) return;
+
+  if (outcome.kind === "success") {
+    void completeChildBuild(taskId).catch((err) => {
+      console.error(`[agetor] completeChildBuild failed for child ${taskId}:`, err);
+    });
+    return;
+  }
+
+  updateColumn(taskId, runId, "blocked", outcome.kind === "hard-failure" ? outcome.reason : undefined);
+
+  const parentTaskId = task.parentTaskId;
+  if (!parentTaskId) return;
+  const parent = tasks.get(parentTaskId);
+  if (parent && parent.column === "building") {
+    const why = outcome.kind === "cancelled" ? "was cancelled" : `failed (${outcome.reason})`;
+    blockPipelineTask(parentTaskId, null, "pipeline-failed", `subtask "${task.planSubtaskId}" ${why}`);
+    cancelSiblingChildren(parentTaskId);
+  }
 }
 
 /**
@@ -1257,12 +1426,31 @@ function lastPipelineVerdict(
  *   - planning success: requires PLAN.md to exist in the worktree (a cheap
  *     safety net, not a hard spec requirement) before advancing.
  *   - plan-review: parses the Critic's verdict off the run's last assistant
- *     message. approve → planApproved=true, advance to building (or
+ *     message. approve → planApproved=true, advance to pre-builder (or
  *     straight to ready if implementationApproved was already true from an
  *     earlier pass). revise → bump the shared revision counter; over cap →
  *     blocked; under cap → back to planning with the reason folded into
  *     pipelineFeedback.
- *   - building success: not verdict-bearing, straight to testing.
+ *   - pre-builder success: not verdict-bearing — requires BUILD_PLAN.json to
+ *     exist AND parse/validate (see pipeline-prompts.ts's parseBuildPlan:
+ *     schema, unique ids, resolvable dependsOn, acyclic) before advancing.
+ *     Fresh entry into building (spawns a DAG of child tasks via
+ *     build-scheduler.ts's tickBuild, no agent turn of its own) rather than
+ *     spawnStage/startTask, unlike every other transition here.
+ *   - building success: not verdict-bearing, straight to code-review. This
+ *     is the BOUNCE-entry path only (a plain single-agent fixup turn) —
+ *     the fresh-entry path is handled entirely in the "pre-builder" case
+ *     above and never reaches this function's "building" case, since the
+ *     parent has no terminal run of its own while its children work (the
+ *     barrier-complete → code-review transition is called directly by
+ *     build-scheduler.ts's tickBuild instead).
+ *   - code-review: parses the Code Reviewer's verdict (same approve/revise
+ *     shape plan-review uses, reviewing the merged diff instead of the
+ *     plan). approve → straight to testing (no flag to set — unlike
+ *     plan-review/testing, code-review doesn't gate the AND that unlocks
+ *     `ready`). revise → same cap arithmetic as the other two edges,
+ *     bounce target is building (a plain single-agent fixup, no
+ *     re-decomposition, no children re-spawned).
  *   - testing: same verdict shape. pass → implementationApproved=true,
  *     straight to ready (planApproved is true by construction — testing is
  *     only reachable after an approved plan). fail → same cap arithmetic,
@@ -1286,25 +1474,8 @@ function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOu
     return;
   }
 
-  // Move to `nextStage`, persisting `patch` first so `startTask` (which
-  // re-reads the task row) picks up the new stage's prompt and, on a
-  // resume, the new pipelineFeedback. If the task was paused, the column
-  // still lands on the target stage (so the card reflects where it's
-  // "at"), but no run is spawned — advancePipelineStage will fire again
-  // once POST /tasks/:id/pipeline-resume calls startTask directly.
-  const spawnStage = (nextStage: NonNullable<Task["pipelineStage"]>, patch: Partial<Task> = {}) => {
-    tasks.update(taskId, { pipelineStage: nextStage, ...patch });
-    updateColumn(taskId, runId, nextStage, "stage-advance");
-    if (tasks.get(taskId)?.pausedAt != null) return;
-    void startTask(taskId).catch((err) => {
-      console.error(`[agetor] pipeline auto-advance failed for task ${taskId} (stage ${nextStage}):`, err);
-      // Nothing else surfaces a startTask failure here — land it on
-      // blocked ourselves so the task doesn't silently stall.
-      if (tasks.get(taskId)?.runId == null) {
-        updateColumn(taskId, null, "blocked", "pipeline-failed");
-      }
-    });
-  };
+  const spawnStage = (nextStage: NonNullable<Task["pipelineStage"]>, patch: Partial<Task> = {}) =>
+    spawnPipelineStage(taskId, runId, nextStage, patch);
 
   const bounceOrBlock = (
     targetStage: NonNullable<Task["pipelineStage"]>,
@@ -1357,14 +1528,75 @@ function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOu
           updateColumn(taskId, runId, "ready", "stage-advance");
           return;
         }
-        spawnStage("building");
+        spawnStage("pre-builder");
         return;
       }
       bounceOrBlock("planning", verdict.reason, { planApproved: false });
       return;
     }
+    case "pre-builder": {
+      const planPath = join(task.worktreePath ?? task.workdir, PIPELINE_BUILD_PLAN_FILE);
+      if (!existsSync(planPath)) {
+        emit({
+          runId, taskId, stream: "status",
+          data: `${PIPELINE_BUILD_PLAN_FILE} was not found in the worktree — cannot advance to building`,
+          ts: Date.now(),
+        });
+        updateColumn(taskId, runId, "blocked", "pipeline-failed");
+        return;
+      }
+      const parsed = parseBuildPlan(readFileSync(planPath, "utf8"));
+      if (!parsed.ok) {
+        emit({
+          runId, taskId, stream: "status",
+          data: `${PIPELINE_BUILD_PLAN_FILE} is invalid — ${parsed.reason} — cannot advance to building`,
+          ts: Date.now(),
+        });
+        tasks.update(taskId, { pipelineFeedback: parsed.reason });
+        updateColumn(taskId, runId, "blocked", "pipeline-failed");
+        return;
+      }
+      // Fresh entry into building: unlike every other transition, this is
+      // NOT spawnStage/startTask — the parent runs no agent of its own
+      // while children do the work. Persist the stage/column exactly like
+      // spawnPipelineStage does, then hand off to the DAG scheduler instead
+      // of starting a single agent turn.
+      tasks.update(taskId, { pipelineStage: "building", pipelineFeedback: null });
+      updateColumn(taskId, runId, "building", "stage-advance");
+      if (tasks.get(taskId)?.pausedAt == null) {
+        void tickBuild(taskId).catch((err) => {
+          console.error(`[agetor] tickBuild failed for task ${taskId}:`, err);
+          if (tasks.get(taskId)?.column === "building") {
+            blockPipelineTask(taskId, null, "pipeline-failed", String(err));
+          }
+        });
+      }
+      return;
+    }
     case "building": {
-      spawnStage("testing", { pipelineFeedback: null });
+      spawnStage("code-review", { pipelineFeedback: null });
+      return;
+    }
+    case "code-review": {
+      const verdict = lastPipelineVerdict(runId, "code-review");
+      if (!verdict.ok) {
+        emit({
+          runId, taskId, stream: "status",
+          data: "no PIPELINE_VERDICT found in the Code Reviewer's response — cannot advance",
+          ts: Date.now(),
+        });
+        updateColumn(taskId, runId, "blocked", "pipeline-failed");
+        return;
+      }
+      if (verdict.kind === "approve") {
+        spawnStage("testing", { pipelineFeedback: null });
+        return;
+      }
+      // Revise bounces to "building" as a plain single-agent fixup (the
+      // BOUNCE-entry path building already has — no re-decomposition, no
+      // children spawned), consuming a slot from the SAME shared
+      // revision-cap counter as the other two edges.
+      bounceOrBlock("building", verdict.reason, {});
       return;
     }
     case "testing": {
@@ -2457,6 +2689,13 @@ export async function createTask(
     revisionCount: 0,
     pipelineFeedback: null,
     pausedAt: null,
+    // Child-linking fields — only ever passed by build-scheduler.ts's
+    // tickBuild (the public POST /tasks route strips them from the request
+    // body before calling createTask, see server.ts). null for every
+    // ordinary/top-level task, including pipeline tasks themselves.
+    parentTaskId: input.parentTaskId ?? null,
+    planSubtaskId: input.planSubtaskId ?? null,
+    childMergeStatus: input.parentTaskId ? "pending" : null,
   });
   return { task };
 }
@@ -2739,6 +2978,17 @@ export async function resumePipelineTask(taskId: string): Promise<{ task: Task }
 export async function deleteTask(taskId: string): Promise<void> {
   const task = tasks.get(taskId);
   if (!task) return;
+  // Cascade: a pipeline task's "building" stage may have live children
+  // (parentTaskId === taskId) with their own runs/worktrees. Tear each
+  // down the same way (recursive — children never have children of their
+  // own, so this can't recurse past one extra level) BEFORE the parent
+  // itself, so nothing is left stranded with a dangling parentTaskId once
+  // the parent row is gone. No existing cascade pattern to extend —
+  // archiveTask/deleteTask were both always single-task operations before
+  // pipeline sub-tasks existed.
+  for (const child of tasks.list().filter((t) => t.parentTaskId === taskId)) {
+    await deleteTask(child.id);
+  }
   if (task.runId && active.has(task.runId)) active.get(task.runId)?.kill();
   // Resolve any pending interactions for this task so hook scripts / MCP
   // children blocked on agetor unblock immediately. Done before dropSession

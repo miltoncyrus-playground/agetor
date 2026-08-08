@@ -1,8 +1,11 @@
 import { test, expect } from "bun:test";
 import {
   parsePipelineVerdict,
+  parseBuildPlan,
+  childBuildPrompt,
   stagePrompt,
   PIPELINE_PLAN_FILE,
+  PIPELINE_BUILD_PLAN_FILE,
   PIPELINE_VERDICT_PREFIX,
 } from "./pipeline-prompts.ts";
 import type { Task } from "../shared/types.ts";
@@ -18,7 +21,7 @@ function task(overrides: Partial<Task> = {}): Task {
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: 0, updatedAt: 0, archivedAt: null,
     pipelineStage: "planning", planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
     ...overrides,
   };
 }
@@ -99,6 +102,23 @@ test("testing: case-insensitive keyword match", () => {
   expect(parsePipelineVerdict("testing", "PIPELINE_VERDICT: PASS")).toEqual({ ok: true, kind: "pass" });
 });
 
+// --- parsePipelineVerdict: code-review --------------------------------------
+
+test("code-review: approve", () => {
+  expect(parsePipelineVerdict("code-review", "LGTM.\nPIPELINE_VERDICT: approve"))
+    .toEqual({ ok: true, kind: "approve" });
+});
+
+test("code-review: revise with reason", () => {
+  const v = parsePipelineVerdict("code-review", "PIPELINE_VERDICT: revise the error path swallows the exception");
+  expect(v).toEqual({ ok: true, kind: "revise", reason: "the error path swallows the exception" });
+});
+
+test("code-review: testing's keywords ('pass'/'fail') don't parse for code-review", () => {
+  expect(parsePipelineVerdict("code-review", "PIPELINE_VERDICT: pass")).toEqual({ ok: false });
+  expect(parsePipelineVerdict("code-review", "PIPELINE_VERDICT: fail something")).toEqual({ ok: false });
+});
+
 // --- stagePrompt -------------------------------------------------------------
 
 test("stagePrompt: planning embeds the ticket and PLAN.md filename, no verdict instruction", () => {
@@ -147,4 +167,124 @@ test("stagePrompt: testing falls back to task-type commit prefix when the branch
     "testing",
   );
   expect(p).toContain('"fix:');
+});
+
+test("stagePrompt: code-review instructs reviewing the actual diff against baseRef and the verdict sentinel format", () => {
+  const p = stagePrompt(task({ pipelineStage: "code-review", baseRef: "abc123" }), "code-review");
+  expect(p).toContain("git diff abc123");
+  expect(p).toContain(PIPELINE_PLAN_FILE);
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} approve`);
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} revise`);
+  // Reviews code, not behavior — doesn't run tests/linters (that's testing's job).
+  expect(p.toLowerCase()).toContain("do not run the test suite");
+});
+
+test("stagePrompt: pre-builder shows the BUILD_PLAN.json schema and instructs a commit, no verdict instruction", () => {
+  const p = stagePrompt(task({ pipelineStage: "pre-builder" }), "pre-builder");
+  expect(p).toContain(PIPELINE_PLAN_FILE);
+  expect(p).toContain(PIPELINE_BUILD_PLAN_FILE);
+  expect(p).toContain("\"subtasks\"");
+  expect(p).toContain("\"dependsOn\"");
+  expect(p.toLowerCase()).toContain("commit");
+  expect(p.toLowerCase()).toContain("do not push");
+  expect(p).not.toContain(PIPELINE_VERDICT_PREFIX);
+});
+
+// --- parseBuildPlan -----------------------------------------------------------
+
+test("parseBuildPlan: valid plan with independent and dependent subtasks", () => {
+  const result = parseBuildPlan(JSON.stringify({
+    subtasks: [
+      { id: "a", title: "A", prompt: "do a", dependsOn: [] },
+      { id: "b", title: "B", prompt: "do b", dependsOn: ["a"] },
+    ],
+  }));
+  expect(result.ok).toBe(true);
+  if (result.ok) {
+    expect(result.plan.subtasks.map((s) => s.id)).toEqual(["a", "b"]);
+    expect(result.plan.subtasks[1]!.dependsOn).toEqual(["a"]);
+  }
+});
+
+test("parseBuildPlan: dependsOn may be omitted, defaults to empty", () => {
+  const result = parseBuildPlan(JSON.stringify({ subtasks: [{ id: "a", title: "A", prompt: "do a" }] }));
+  expect(result.ok).toBe(true);
+  if (result.ok) expect(result.plan.subtasks[0]!.dependsOn).toEqual([]);
+});
+
+test("parseBuildPlan: invalid JSON", () => {
+  const result = parseBuildPlan("{not json");
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toContain("invalid JSON");
+});
+
+test("parseBuildPlan: empty subtasks array is rejected", () => {
+  const result = parseBuildPlan(JSON.stringify({ subtasks: [] }));
+  expect(result.ok).toBe(false);
+});
+
+test("parseBuildPlan: missing subtasks key is rejected", () => {
+  const result = parseBuildPlan(JSON.stringify({ foo: "bar" }));
+  expect(result.ok).toBe(false);
+});
+
+test("parseBuildPlan: dependsOn referencing an undeclared id is rejected", () => {
+  const result = parseBuildPlan(JSON.stringify({
+    subtasks: [{ id: "a", title: "A", prompt: "do a", dependsOn: ["ghost"] }],
+  }));
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toContain("undeclared subtask");
+});
+
+test("parseBuildPlan: a subtask depending on itself is rejected", () => {
+  const result = parseBuildPlan(JSON.stringify({
+    subtasks: [{ id: "a", title: "A", prompt: "do a", dependsOn: ["a"] }],
+  }));
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toContain("cannot depend on itself");
+});
+
+test("parseBuildPlan: duplicate ids are rejected", () => {
+  const result = parseBuildPlan(JSON.stringify({
+    subtasks: [
+      { id: "a", title: "A1", prompt: "1", dependsOn: [] },
+      { id: "a", title: "A2", prompt: "2", dependsOn: [] },
+    ],
+  }));
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toContain("duplicate");
+});
+
+test("parseBuildPlan: a 3-cycle (a->b->c->a) is rejected", () => {
+  const result = parseBuildPlan(JSON.stringify({
+    subtasks: [
+      { id: "a", title: "A", prompt: "1", dependsOn: ["c"] },
+      { id: "b", title: "B", prompt: "2", dependsOn: ["a"] },
+      { id: "c", title: "C", prompt: "3", dependsOn: ["b"] },
+    ],
+  }));
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toContain("cycle");
+});
+
+test("parseBuildPlan: a subtask missing a prompt is rejected", () => {
+  const result = parseBuildPlan(JSON.stringify({ subtasks: [{ id: "a", title: "A" }] }));
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toContain("prompt");
+});
+
+// --- childBuildPrompt ----------------------------------------------------------
+
+test("childBuildPrompt: folds in the subtask's own prompt, points at PLAN.md, requires a local commit, forbids push", () => {
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
+    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [] },
+  );
+  expect(p).toContain("Add a toggle component to settings.");
+  expect(p).toContain(PIPELINE_PLAN_FILE);
+  expect(p).toContain("Add dark mode"); // parent ticket folded in for context
+  expect(p.toLowerCase()).toContain("commit");
+  expect(p.toLowerCase()).toContain("do not push");
+  expect(p.toLowerCase()).toContain("do not open a pull request");
+  expect(p).toContain('"feature:');
 });

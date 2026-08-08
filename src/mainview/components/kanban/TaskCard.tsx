@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, RotateCcw, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -12,6 +12,12 @@ import { AgentIcon } from "./AgentIcon";
 
 interface Props {
   task: Task;
+  /** taskId -> Task over the full board — used to look up a child's parent
+   *  title. See Column.tsx's doc comment for the stability guarantee. */
+  tasksById: Map<string, Task>;
+  /** parentTaskId -> sub-task progress, for the "N/M sub-tasks" badge on a
+   *  parent card. */
+  childCountsByParent: Map<string, { merged: number; total: number }>;
   homeDir: string;
   onStart: (t: Task) => void;
   onCancel: (t: Task) => void;
@@ -23,8 +29,10 @@ interface Props {
   onUnarchive: (t: Task) => void;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
+function TaskCardImpl({ task, tasksById, childCountsByParent, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
   const archived = task.archivedAt != null;
+  const parentTask = task.parentTaskId ? tasksById.get(task.parentTaskId) : undefined;
+  const childProgress = task.pipelineStage != null ? childCountsByParent.get(task.id) : undefined;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
@@ -75,7 +83,12 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
       style={style}
       className={cn(
         "cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
-        type.borderClass,
+        // A pipeline sub-task gets a distinct border color instead of its
+        // task-type color, so it reads as "part of a build" at a glance —
+        // no nested/grouped-card framework, just a flat card with a marker
+        // (see TaskCard.tsx's/Column.tsx's doc comments on why: the board
+        // has no @dnd-kit/sortable and doesn't need one for this).
+        parentTask ? "border-l-violet-500" : type.borderClass,
         isDragging && "opacity-50",
         awaiting && "ring-2 ring-amber-500/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
         archived && "cursor-default opacity-60",
@@ -86,12 +99,22 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
     >
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
-          <div className="flex min-w-0 flex-1 items-start gap-1.5">
-            <TypeIcon
-              className={cn("mt-0.5 size-3.5 shrink-0", type.iconClass)}
-              aria-label={type.label}
-            />
-            <CardTitle className="text-sm min-w-0 flex-1 break-words">{task.title}</CardTitle>
+          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <div className="flex min-w-0 items-start gap-1.5">
+              <TypeIcon
+                className={cn("mt-0.5 size-3.5 shrink-0", type.iconClass)}
+                aria-label={type.label}
+              />
+              <CardTitle className="text-sm min-w-0 flex-1 break-words">{task.title}</CardTitle>
+            </div>
+            {parentTask && (
+              <p
+                className="truncate text-[10px] text-violet-400"
+                title={`Part of “${parentTask.title}” (pipeline sub-task)`}
+              >
+                part of “{parentTask.title}”
+              </p>
+            )}
           </div>
           <div className="flex shrink-0 flex-col items-end gap-1">
             <Badge variant="secondary" className="gap-1">
@@ -148,6 +171,15 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
                 {task.revisionCount > 0 && ` · rev ${task.revisionCount}`}
               </Badge>
             )}
+            {childProgress && (
+              <Badge
+                variant="outline"
+                className="gap-1 text-[10px] border-violet-500/40 text-violet-400"
+                title={`${childProgress.merged} of ${childProgress.total} sub-tasks merged`}
+              >
+                {childProgress.merged}/{childProgress.total} sub-tasks
+              </Badge>
+            )}
           </div>
         </div>
       </CardHeader>
@@ -202,6 +234,16 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           {!archived && awaiting && active && (
             <Button size="icon" variant="ghost" onClick={() => onCancel(task)} title="Stop">
               <Square className="size-3" />
+            </Button>
+          )}
+          {!archived && blocked && task.pipelineStage != null && (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => onStart(task)}
+              title="Retry this pipeline stage — re-runs the agent turn that died here"
+            >
+              <RotateCcw className="size-3" />
             </Button>
           )}
           {!archived && task.column === "review" && (

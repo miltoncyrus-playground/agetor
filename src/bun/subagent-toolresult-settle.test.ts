@@ -74,7 +74,7 @@ async function seed() {
     prUrl: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,
-    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
   runs.insert({
     id: runId, taskId, agent: "claude-code", status: "succeeded", startedAt: now,

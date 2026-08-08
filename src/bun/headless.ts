@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir } from "./db.ts";
-import { reconcileOrphans, reapIdleSessions } from "./orchestrator.ts";
+import { reconcileOrphans, resumeInFlightBuilds, reapIdleSessions } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -69,6 +69,11 @@ export async function runDaemon(): Promise<void> {
   // daemon can find claude/codex/tmux and doesn't leave stale "running" cards.
   rehydratePath();
   reconcileOrphans();
+  // Companion to the above for pipeline "building" fresh-entry — see
+  // index.ts's identical call for the full rationale. This is the daemon's
+  // own boot path (agetor CLI with no live core), so it needs the same
+  // resume, not just the desktop app's.
+  resumeInFlightBuilds();
   void refreshDiscoveredModels();
 
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):

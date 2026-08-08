@@ -27,6 +27,11 @@ async function makeWorkdir(withPlan: boolean): Promise<string> {
   return dir;
 }
 
+/** Writes a BUILD_PLAN.json into an existing worktree dir. */
+function writeBuildPlan(dir: string, plan: unknown) {
+  writeFileSync(path.join(dir, "BUILD_PLAN.json"), JSON.stringify(plan));
+}
+
 /** Start (or restart) a pipeline task's current stage and return the run id
  *  synchronously, before the fake's own resolve timers have had a chance to
  *  fire — matching the pattern orchestrator-gemini.test.ts already relies
@@ -35,6 +40,24 @@ async function startAndGetRunId(startTask: typeof import("./orchestrator.ts").st
   const started = await startTask(taskId);
   if ("error" in started) throw new Error(started.error);
   return started.runId;
+}
+
+/** Poll for a task's `runId` to change away from `priorRunId` — used to
+ *  capture an AUTO-spawned run's id (e.g. the next stage's run, fired by
+ *  the previous stage's own success handler) early enough to inject a
+ *  verdict before its fake-driver timer resolves it unverified. `runId` is
+ *  set synchronously in startTask's persist transaction, strictly before
+ *  the new run's timer is armed, so a tight poll interval reliably wins
+ *  the race. */
+async function waitForNewRun(taskId: string, priorRunId: string | null, timeoutMs = 500): Promise<string> {
+  const { tasks } = await import("./db.ts");
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const runId = tasks.get(taskId)?.runId ?? null;
+    if (runId && runId !== priorRunId) return runId;
+    await new Promise((r) => setTimeout(r, 2));
+  }
+  throw new Error(`timed out waiting for a new run on task ${taskId} (prior: ${priorRunId})`);
 }
 
 test("pipeline: planning success with PLAN.md present auto-advances to plan-review and spawns a new run", async () => {
@@ -80,7 +103,7 @@ test("pipeline: planning success WITHOUT PLAN.md blocks instead of advancing", a
   expect(task.pipelineStage).toBe("planning");
 });
 
-test("pipeline: plan-review approve advances to building and sets planApproved", async () => {
+test("pipeline: plan-review approve advances to pre-builder and sets planApproved", async () => {
   const { startTask } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");
 
@@ -96,7 +119,7 @@ test("pipeline: plan-review approve advances to building and sets planApproved",
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "plan-review", planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -104,10 +127,180 @@ test("pipeline: plan-review approve advances to building and sets planApproved",
   await settle();
 
   const task = tasks.get(taskId)!;
-  expect(task.pipelineStage).toBe("building");
-  expect(task.column).toBe("building");
+  expect(task.pipelineStage).toBe("pre-builder");
+  expect(task.column).toBe("pre-builder");
   expect(task.planApproved).toBe(true);
   expect(runs.listForTask(taskId).length).toBe(2);
+});
+
+test("pipeline: tickBuild starts an independent subtask immediately and holds a dependent one until its dependency is merged", async () => {
+  // Deterministic scheduling-logic test: calls tickBuild directly rather
+  // than going through a pre-builder run, and never settle()s long enough
+  // for the fake child runs it fires to actually resolve — so this checks
+  // ONLY the DAG decision logic (who gets created when), independent of
+  // real merge timing (covered end-to-end by the previous test). isolation
+  // stays "none" — no real git needed here, tickBuild's own logic never
+  // touches git; only the merge step (not reached in this test) does.
+  const { tickBuild } = await import("./build-scheduler.ts");
+  const { tasks } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(false);
+  writeBuildPlan(workdir, {
+    subtasks: [
+      { id: "a", title: "A", prompt: "do a", dependsOn: [] },
+      { id: "b", title: "B", prompt: "do b", dependsOn: ["a"] },
+    ],
+  });
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p3f", prompt: "x", column: "building", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "building", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  await tickBuild(taskId);
+
+  // Checked immediately (no settle) — tickBuild's own child-creation loop
+  // is fully awaited by the time it returns; only the fire-and-forget
+  // startTask call for each child is still pending, well before the fake
+  // driver's ~20ms timer. "b" depends on "a", which hasn't merged, so only
+  // "a" should exist yet.
+  let children = tasks.list().filter((t) => t.parentTaskId === taskId);
+  expect(children.length).toBe(1);
+  expect(children[0]!.planSubtaskId).toBe("a");
+  expect(children[0]!.childMergeStatus).toBe("pending");
+  expect(tasks.get(taskId)!.column).toBe("building"); // barrier not complete
+
+  // Flip "a" to merged directly (bypassing a real run/merge — this test is
+  // about the scheduler's dependency gating, not merge mechanics) and
+  // re-tick.
+  tasks.update(children[0]!.id, { childMergeStatus: "merged" });
+  await tickBuild(taskId);
+
+  children = tasks.list().filter((t) => t.parentTaskId === taskId);
+  expect(children.length).toBe(2);
+  const b = children.find((c) => c.planSubtaskId === "b")!;
+  expect(b).toBeDefined();
+  expect(b.childMergeStatus).toBe("pending");
+  // The barrier still isn't complete ("b" hasn't merged), so the parent
+  // stays in building, not code-review.
+  expect(tasks.get(taskId)!.column).toBe("building");
+
+  // Now merge "b" too and confirm the barrier completes and the parent
+  // advances to code-review.
+  tasks.update(b.id, { childMergeStatus: "merged" });
+  await tickBuild(taskId);
+  expect(tasks.get(taskId)!.pipelineStage).toBe("code-review");
+  expect(tasks.get(taskId)!.column).toBe("code-review");
+});
+
+test("pipeline: DAG scheduler is a no-op once the parent is blocked (doesn't resurrect an aborted build)", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tickBuild } = await import("./build-scheduler.ts");
+  const { tasks } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  writeBuildPlan(workdir, { subtasks: [{ id: "a", title: "A", prompt: "do a", dependsOn: [] }] });
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p3g", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "pre-builder", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  await startAndGetRunId(startTask, taskId);
+  await settle(300);
+  expect(tasks.list().filter((t) => t.parentTaskId === taskId).length).toBe(1);
+
+  // The child (isolation:"none", so no real worktree/branch) already
+  // organically blocked the parent via completeChildBuild's "nothing to
+  // merge" failure path by now — this just makes the "blocked" precondition
+  // explicit and deterministic regardless of that timing.
+  tasks.update(taskId, { column: "blocked" });
+
+  await tickBuild(taskId);
+  await settle(150);
+
+  // No new/second child should appear — doTick's guard bails out once
+  // column !== "building", even though pipelineStage is still "building".
+  expect(tasks.list().filter((t) => t.parentTaskId === taskId).length).toBe(1);
+  expect(tasks.get(taskId)!.column).toBe("blocked");
+});
+
+test("pipeline: pre-builder success WITHOUT BUILD_PLAN.json blocks instead of advancing", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p3d", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "pre-builder", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  await startAndGetRunId(startTask, taskId);
+  await settle();
+
+  const task = tasks.get(taskId)!;
+  expect(task.column).toBe("blocked");
+  // pipelineStage stays put so a human sees exactly where it died and can retry.
+  expect(task.pipelineStage).toBe("pre-builder");
+});
+
+test("pipeline: pre-builder success with an INVALID BUILD_PLAN.json (cycle) blocks with the reason in pipelineFeedback", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  writeBuildPlan(workdir, {
+    subtasks: [
+      { id: "a", title: "A", prompt: "1", dependsOn: ["b"] },
+      { id: "b", title: "B", prompt: "2", dependsOn: ["a"] },
+    ],
+  });
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p3e", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "pre-builder", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  await startAndGetRunId(startTask, taskId);
+  await settle();
+
+  const task = tasks.get(taskId)!;
+  expect(task.column).toBe("blocked");
+  expect(task.pipelineStage).toBe("pre-builder");
+  expect(task.pipelineFeedback).toContain("cycle");
 });
 
 test("pipeline: plan-review approve goes straight to ready when implementationApproved was already true", async () => {
@@ -127,7 +320,7 @@ test("pipeline: plan-review approve goes straight to ready when implementationAp
     createdAt: now, updatedAt: now, archivedAt: null,
     // Simulates a re-planning pass after testing had already passed once.
     pipelineStage: "plan-review", planApproved: false, implementationApproved: true,
-    revisionCount: 1, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 1, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -156,7 +349,7 @@ test("pipeline: plan-review revise under the cap bounces to planning with feedba
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "plan-review", planApproved: true, implementationApproved: false,
-    revisionCount: 1, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 1, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -188,7 +381,7 @@ test("pipeline: revise past the revision cap blocks instead of looping again", a
     createdAt: now, updatedAt: now, archivedAt: null,
     // Already at the cap — one more revise must block, not loop a 5th time.
     pipelineStage: "plan-review", planApproved: true, implementationApproved: false,
-    revisionCount: 4, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 4, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -202,7 +395,7 @@ test("pipeline: revise past the revision cap blocks instead of looping again", a
   expect(task.pipelineStage).toBe("plan-review");
 });
 
-test("pipeline: building success (not verdict-bearing) advances straight to testing", async () => {
+test("pipeline: building success (not verdict-bearing) advances straight to code-review", async () => {
   const { startTask } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");
 
@@ -218,16 +411,129 @@ test("pipeline: building success (not verdict-bearing) advances straight to test
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: "prior tester feedback", pausedAt: null,
+    revisionCount: 0, pipelineFeedback: "prior tester feedback", pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   await startAndGetRunId(startTask, taskId);
   await settle();
 
   const task = tasks.get(taskId)!;
+  // code-review's OWN run also starts (its prompt is real now) and, since
+  // no PIPELINE_VERDICT was injected for it, blocks — column reflects
+  // that, but pipelineStage having landed on "code-review" at all is the
+  // thing this test actually checks (building's completion target).
+  expect(task.pipelineStage).toBe("code-review");
+  expect(task.pipelineFeedback).toBeNull(); // consumed on the building->code-review hop
+  expect(runs.listForTask(taskId).length).toBe(2); // building's run + the auto-spawned code-review run
+});
+
+test("pipeline: code-review approve advances to testing", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p6b", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "code-review", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  const runId = await startAndGetRunId(startTask, taskId);
+  runs.appendEvent(runId, "assistant", "Looks correct.\n\nPIPELINE_VERDICT: approve");
+  await settle();
+
+  const task = tasks.get(taskId)!;
   expect(task.pipelineStage).toBe("testing");
   expect(task.column).toBe("testing");
-  expect(task.pipelineFeedback).toBeNull(); // consumed
+  expect(runs.listForTask(taskId).length).toBe(2);
+});
+
+test("pipeline: code-review revise under the cap bounces to building with feedback, consuming the SHARED revision-cap slot", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p6c", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "code-review", planApproved: true, implementationApproved: false,
+    // Already used 2 of the 4 shared slots via earlier plan-review/testing
+    // bounces in this task's (simulated) history — code-review's revise
+    // below must draw from the SAME counter, not a fresh one.
+    revisionCount: 2, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  const runId = await startAndGetRunId(startTask, taskId);
+  runs.appendEvent(runId, "assistant", "PIPELINE_VERDICT: revise the error handling swallows the exception silently");
+  await settle();
+
+  const task = tasks.get(taskId)!;
+  expect(task.pipelineStage).toBe("building");
+  expect(task.column).toBe("building");
+  expect(task.revisionCount).toBe(3); // shared counter incremented, not a separate code-review counter
+  expect(task.pipelineFeedback).toBe("the error handling swallows the exception silently");
+  // No children spawned — this is the BOUNCE-entry (plain single-agent
+  // fixup), not a fresh pre-builder-driven decomposition.
+  expect(tasks.list().filter((t) => t.parentTaskId === taskId).length).toBe(0);
+});
+
+test("pipeline: planning through pre-builder chains correctly across two real auto-advances (not directly-seeded stages)", async () => {
+  // Every other test in this file seeds its task DIRECTLY at the stage
+  // under test via tasks.insert (giving explicit control over exactly
+  // which run gets the injected verdict). This test instead starts at
+  // "planning" and rides two REAL auto-advances (planning->plan-review,
+  // plan-review->pre-builder) to catch wiring bugs individual per-stage
+  // tests can't — e.g. an outcome computed off the wrong run id, or a
+  // stage transition that silently targets the wrong next stage. Doesn't
+  // extend past pre-builder: crossing into "building" is a fresh DAG
+  // entry (a child's run, not the parent's), so from there the existing
+  // per-stage tests plus the real-git end-to-end coverage in
+  // orchestrator-pipeline-merge.test.ts are the right tool, not more
+  // auto-advance chaining here.
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  const created = await createTask({
+    title: "full-loop", prompt: "add dark mode", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task", pipeline: true,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  // Planning itself isn't verdict-bearing, so it's safe to just start it
+  // and let it run to completion — no injection needed for this hop.
+  const planningRunId = await startAndGetRunId(startTask, taskId);
+
+  // Plan-review's run is auto-spawned by planning's own success handler —
+  // poll for task.runId to change (set synchronously in startTask's
+  // persist transaction, strictly BEFORE that new run's own fake-driver
+  // timer is armed) so the verdict lands well within its ~20ms window,
+  // the same guarantee startAndGetRunId's own doc comment describes for
+  // an explicitly-started run, just applied to an auto-spawned one.
+  const planReviewRunId = await waitForNewRun(taskId, planningRunId);
+  expect(tasks.get(taskId)!.pipelineStage).toBe("plan-review");
+  runs.appendEvent(planReviewRunId, "assistant", "PIPELINE_VERDICT: approve");
+
+  const preBuilderRunId = await waitForNewRun(taskId, planReviewRunId);
+  expect(tasks.get(taskId)!.pipelineStage).toBe("pre-builder");
+  expect(tasks.get(taskId)!.planApproved).toBe(true);
+  void preBuilderRunId; // pre-builder isn't verdict-bearing; reaching it is the assertion
 });
 
 test("pipeline: testing pass reaches ready (planApproved already true by construction)", async () => {
@@ -246,7 +552,7 @@ test("pipeline: testing pass reaches ready (planApproved already true by constru
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "testing", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -274,7 +580,7 @@ test("pipeline: testing fail under the cap bounces to building (not planning)", 
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "testing", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -305,7 +611,7 @@ test("pipeline: no PIPELINE_VERDICT in the response blocks rather than guessing"
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "plan-review", planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -334,16 +640,17 @@ test("pipeline: pause lands the column on the next stage but does not spawn a ru
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
     revisionCount: 0, pipelineFeedback: null,
-    pausedAt: Date.now(), // paused before this stage's run even started
+    pausedAt: Date.now(), parentTaskId: null, planSubtaskId: null, childMergeStatus: null, // paused before this stage's run even started
   });
 
   await startAndGetRunId(startTask, taskId);
   await settle();
 
   const task = tasks.get(taskId)!;
-  // Lands where testing WOULD be, so the card reflects "next up: testing" —
-  expect(task.pipelineStage).toBe("testing");
-  expect(task.column).toBe("testing");
+  // Lands where code-review WOULD be, so the card reflects "next up:
+  // code-review" —
+  expect(task.pipelineStage).toBe("code-review");
+  expect(task.column).toBe("code-review");
   // — but no second run was spawned; only building's own run exists, and
   // task.runId still points at it (nothing clears it — there's no new run
   // to point to instead).
@@ -409,7 +716,7 @@ test("pipeline: pausePipelineTask sets pausedAt; resumePipelineTask clears it an
     // which would make "exactly 1 run after resume" a race. testing with
     // no verdict deterministically blocks instead of cascading further.
     pipelineStage: "testing", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const pauseResult = pausePipelineTask(taskId);
@@ -448,7 +755,7 @@ test("pipeline: pause skips the auto-spawn of the NEXT stage, resume continues i
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   // Start building's own run, then pause WHILE it's still in flight — the
@@ -460,14 +767,129 @@ test("pipeline: pause skips the auto-spawn of the NEXT stage, resume continues i
   await settle(); // let building's fake run resolve
 
   let task = tasks.get(taskId)!;
-  expect(task.pipelineStage).toBe("testing"); // still computed and landed
-  expect(task.column).toBe("testing");
-  expect(runs.listForTask(taskId).length).toBe(1); // testing's run did NOT spawn
+  expect(task.pipelineStage).toBe("code-review"); // still computed and landed
+  expect(task.column).toBe("code-review");
+  expect(runs.listForTask(taskId).length).toBe(1); // code-review's run did NOT spawn
 
   const resumed = await resumePipelineTask(taskId);
   if ("error" in resumed) throw new Error(resumed.error);
   await settle();
   task = tasks.get(taskId)!;
-  expect(runs.listForTask(taskId).length).toBe(2); // testing's run spawned on resume
+  expect(runs.listForTask(taskId).length).toBe(2); // code-review's run spawned on resume
   expect(task.pausedAt).toBeNull();
+});
+
+test("pipeline: resumeInFlightBuilds picks up a parent mid-build after a restart and continues the DAG", async () => {
+  // Simulates the boot-time gap resumeInFlightBuilds closes: reconcileOrphans
+  // only finds tasks with an active RUN, but a parent mid-build (fresh-entry)
+  // has none of its own — its BUILD_PLAN.json on disk plus its children's
+  // rows are the only record of where the build was. Here: "a" already
+  // succeeded+merged before the (simulated) crash, "b" was never created —
+  // a fresh resumeInFlightBuilds() call should create it.
+  const { resumeInFlightBuilds } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(false);
+  writeBuildPlan(workdir, {
+    subtasks: [
+      { id: "a", title: "A", prompt: "do a", dependsOn: [] },
+      { id: "b", title: "B", prompt: "do b", dependsOn: [] },
+    ],
+  });
+  const now = Date.now();
+  const parentId = crypto.randomUUID();
+  tasks.insert({
+    id: parentId, title: "p6", prompt: "x", column: "building", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "building", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+  const childAId = crypto.randomUUID();
+  tasks.insert({
+    id: childAId, title: "p6 — A", prompt: "do a", column: "building", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    parentTaskId: parentId, planSubtaskId: "a", childMergeStatus: "merged",
+  });
+
+  // Not asserting the exact return value here: this file shares one
+  // AGETOR_DATA_DIR across every test, and resumeInFlightBuilds() counts
+  // every pipelineStage:"building" row in the whole db (including
+  // already-blocked ones from earlier tests — pipelineStage deliberately
+  // stays "building" on those too, for retry-ability; doTick's own guard
+  // is what makes resuming them a safe no-op). The real assertion is the
+  // concrete effect below: "b" actually gets created.
+  resumeInFlightBuilds();
+  await settle(150);
+
+  const children = tasks.list().filter((t) => t.parentTaskId === parentId);
+  expect(children.length).toBe(2);
+  const b = children.find((c) => c.planSubtaskId === "b");
+  expect(b).toBeDefined();
+  // "a" (pre-existing, already merged) is untouched.
+  expect(tasks.get(childAId)!.childMergeStatus).toBe("merged");
+});
+
+test("pipeline: resumeInFlightBuilds ignores archived and non-building tasks", async () => {
+  // NOTE: this file shares one AGETOR_DATA_DIR across every test, so
+  // resumeInFlightBuilds()'s return value reflects the WHOLE db's matching
+  // rows, not just this test's own fixtures (earlier tests may have left
+  // "building"-stage rows behind) — assert on this test's OWN rows staying
+  // untouched, not on a global count.
+  const { resumeInFlightBuilds } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(false);
+  const now = Date.now();
+  // An archived parent (should be ignored even though pipelineStage is
+  // still "building" — same "archived means don't touch it" convention
+  // used elsewhere).
+  const archivedParentId = crypto.randomUUID();
+  tasks.insert({
+    id: archivedParentId, title: "archived-build", prompt: "x", column: "building", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: now,
+    pipelineStage: "building", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+  // A child task (parentTaskId set) sitting in "building" — must not be
+  // mistaken for a top-level parent mid-build.
+  const someChildId = crypto.randomUUID();
+  tasks.insert({
+    id: someChildId, title: "some-child", prompt: "x", column: "building", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    parentTaskId: crypto.randomUUID(), planSubtaskId: "x", childMergeStatus: "pending",
+  });
+
+  resumeInFlightBuilds();
+  await settle(150);
+
+  // Neither fixture should have triggered any tickBuild side effect: the
+  // archived parent gets no children, and the "child" row (which has no
+  // BUILD_PLAN.json / isn't a real building parent) is untouched.
+  expect(tasks.list().filter((t) => t.parentTaskId === archivedParentId).length).toBe(0);
+  expect(tasks.get(someChildId)!.column).toBe("building");
+  expect(tasks.get(someChildId)!.childMergeStatus).toBe("pending");
 });

@@ -3,7 +3,7 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
+import { reconcileOrphans, resumeInFlightBuilds, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
 import { SESSION_REAP_SWEEP_MS } from "../shared/types.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -119,6 +119,12 @@ rehydratePath();
 // Mark any runs that were "running" when we last shut down as orphaned, so the
 // kanban doesn't show stuck cards.
 reconcileOrphans();
+
+// Companion to the above for pipeline "building" fresh-entry: a parent
+// mid-build has no run of its own for reconcileOrphans to find (its
+// children do the work) — resume the DAG scheduler for each one so an
+// in-flight build doesn't silently stall after a restart.
+resumeInFlightBuilds();
 
 // Heal any archive/delete teardown (tmux kill, terminal shells, worktree
 // detach) that was deferred to the in-memory teardown queue but never ran
