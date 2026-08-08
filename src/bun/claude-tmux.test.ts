@@ -1670,6 +1670,60 @@ test("readPaneMode: null when a mode phrase lacks the cycle-hint banner (e.g. mo
   }
 });
 
+test("readPaneMode: still finds the bar when a trailing chrome line sits below it (Claude Code 2.1.226 '/rc' hint)", async () => {
+  // Regression for a real deferred-large-prompt hang: Claude Code 2.1.226
+  // renders a persistent "/rc" hint on its own line under the mode bar once
+  // a "Now using usage credits" notice is showing. A last-line-only read
+  // picked up "/rc" instead of the bar and returned null for the entire
+  // session — so spawnClaudeViaTmux's deferred-paste readiness wait (any
+  // prompt too large for launch argv, e.g. the Pre-Builder stage's prompt)
+  // never confirmed ready and burned its full 30s window every time, racing
+  // and usually losing against the independent JSONL-boot timeout.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-trailing-chrome";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const prevPane = __forTest.setCaptureModePane(() =>
+    [
+      "❯ Try \"write a test for App.tsx\"",
+      "────────────────────────────────────────",
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents  Now using usage credits",
+      "                                                                     /rc",
+    ].join("\n"),
+  );
+  try {
+    expect(__forTest.readPaneMode(state)).toBe(CLAUDE_MODE_AUTO);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("readPaneMode: still null when trailing chrome runs deeper than the scan window", async () => {
+  // The bounded backward scan (MODE_BAR_SCAN_LINES) exists precisely so a
+  // decoy mode phrase far above the bar in scrollback (assistant/user
+  // output) can't be mistaken for the live bar — confirm it still can't,
+  // even when several blank/chrome lines separate it from the trailing edge.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-deep-chrome";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const prevPane = __forTest.setCaptureModePane(() =>
+    [
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+      "chrome-1",
+      "chrome-2",
+      "chrome-3",
+      "chrome-4",
+      "chrome-5",
+    ].join("\n"),
+  );
+  try {
+    expect(__forTest.readPaneMode(state)).toBeNull();
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
 test("resolveAskCard resolves the card AND clears the session askCardId (so a failed drive can re-collect)", async () => {
   const { __forTest, resolveAskCard } = await import("./claude-tmux.ts");
   const { __testing, registerScrapedAskQuestions, activeAskQuestionsForTask } =

@@ -5021,29 +5021,41 @@ let captureModePane: (state: SessionState) => string = captureTail;
  * `permission-mode` event, the bar reflects an *idle* Shift+Tab immediately;
  * claude doesn't journal an idle mode switch until the next turn starts.
  *
- * We only read the *trailing* non-empty line of the captured tail and, for
- * the four explicit modes, require the banner's `(shift+tab to cycle)` hint.
+ * We scan the last few trailing non-empty lines of the captured tail (not
+ * just the very last one — see `MODE_BAR_SCAN_LINES`) and, for the four
+ * explicit modes, require the banner's `(shift+tab to cycle)` hint.
  * `captureModePane` returns the whole visible-pane tail, so a bare phrase like
  * "auto mode on" sitting in assistant/user output above the bar would
- * otherwise be mis-read as the live mode.
+ * otherwise be mis-read as the live mode — the bounded backward scan keeps
+ * that guard while tolerating a line or two of chrome claude renders below
+ * its own bar (e.g. Claude Code 2.1.226 added a persistent "/rc" hint line
+ * under the bar once a "Now using usage credits" notice is showing, which
+ * silently broke a last-line-only read: `readPaneMode` returned null for
+ * the entire session, so nothing waiting on a confirmed-idle composer —
+ * most consequentially the deferred large-prompt paste in
+ * `spawnClaudeViaTmux` — could ever fire).
  */
+const MODE_BAR_SCAN_LINES = 4;
+
 function readPaneMode(state: SessionState): string | null {
   const lines = captureModePane(state).split("\n");
-  let bar = "";
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i]!.trim() !== "") { bar = lines[i]!; break; }
+  let scanned = 0;
+  for (let i = lines.length - 1; i >= 0 && scanned < MODE_BAR_SCAN_LINES; i--) {
+    const bar = lines[i]!;
+    if (bar.trim() === "") continue;
+    scanned++;
+    if (/shift\+tab to cycle/i.test(bar)) {
+      if (/accept edits on/i.test(bar)) return CLAUDE_MODE_ACCEPT_EDITS;
+      if (/plan mode on/i.test(bar)) return CLAUDE_MODE_PLAN;
+      if (/auto mode on/i.test(bar)) return CLAUDE_MODE_AUTO;
+      if (/bypass permissions on/i.test(bar)) return CLAUDE_MODE_BYPASS;
+    }
+    // No mode banner on this line. Default mode shows the "? for shortcuts"
+    // hint instead; require that positive marker rather than inferring
+    // default from mere absence, so a half-painted frame doesn't read as a
+    // spurious switch.
+    if (/\? for shortcuts/i.test(bar)) return CLAUDE_MODE_DEFAULT;
   }
-  if (/shift\+tab to cycle/i.test(bar)) {
-    if (/accept edits on/i.test(bar)) return CLAUDE_MODE_ACCEPT_EDITS;
-    if (/plan mode on/i.test(bar)) return CLAUDE_MODE_PLAN;
-    if (/auto mode on/i.test(bar)) return CLAUDE_MODE_AUTO;
-    if (/bypass permissions on/i.test(bar)) return CLAUDE_MODE_BYPASS;
-  }
-  // No mode banner. Default mode shows the "? for shortcuts" hint on the
-  // trailing line instead; require that positive marker rather than inferring
-  // default from mere absence, so a half-painted frame doesn't read as a
-  // spurious switch.
-  if (/\? for shortcuts/i.test(bar)) return CLAUDE_MODE_DEFAULT;
   return null;
 }
 
