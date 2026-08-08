@@ -105,6 +105,7 @@ async function seed() {
     prUrl: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
   });
   // Insert the run as already-terminal — see claude-subagents.test.ts's
   // identical comment: reconcileOrphans() scans every `running` run globally.

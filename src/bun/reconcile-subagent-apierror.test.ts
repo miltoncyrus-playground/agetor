@@ -77,6 +77,7 @@ test("priorApiError query ignores a subagent-tagged api-error row (subagent_id s
     pendingInteractionCount: 0,
     openTerminalCount: 0,
     archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
     createdAt: now,
     updatedAt: now,
   });
@@ -138,6 +139,7 @@ test("priorApiError query matches a main-tailer api-error row (subagent_id NULL)
     pendingInteractionCount: 0,
     openTerminalCount: 0,
     archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
     createdAt: now,
     updatedAt: now,
   });

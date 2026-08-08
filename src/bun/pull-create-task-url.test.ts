@@ -73,6 +73,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     pendingInteractionCount: 0,
     openTerminalCount: 0,
     archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     ...overrides,

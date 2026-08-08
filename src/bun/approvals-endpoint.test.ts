@@ -40,6 +40,7 @@ async function seedScrapedAskQuestions(args: {
     model: "opus-4.7", effort: null, references: [], backlog: [], draft: null, runId: "run-askq",
     createdAt: Date.now(), updatedAt: Date.now(), hasOpenableRun: false,
     pendingInteractionCount: 0, openTerminalCount: 0, archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
   });
   const { registerScrapedAskQuestions } = await import("./interactions.ts");
   const req = registerScrapedAskQuestions({

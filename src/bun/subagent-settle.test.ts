@@ -84,6 +84,7 @@ async function seedTask(opts: {
     prUrl: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
   });
   runs.insert({
     id: runId, taskId, agent: "claude-code", status: opts.runStatus, startedAt: now,
@@ -330,6 +331,7 @@ test("runs.origin round-trips through insert/get/listForTask", async () => {
     prUrl: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
   });
 
   const contRunId = `run-origin-cont-${randomUUID()}`;

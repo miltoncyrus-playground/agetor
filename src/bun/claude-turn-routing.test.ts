@@ -197,6 +197,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       pendingInteractionCount: 0,
       openTerminalCount: 0,
       archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -304,6 +305,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       pendingInteractionCount: 0,
       openTerminalCount: 0,
       archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -414,6 +416,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
       pendingInteractionCount: 0,
       openTerminalCount: 0,
       archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -546,6 +549,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
       pendingInteractionCount: 0,
       openTerminalCount: 0,
       archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -706,6 +710,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
       pendingInteractionCount: 0,
       openTerminalCount: 0,
       archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -804,6 +809,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
       pendingInteractionCount: 0,
       openTerminalCount: 0,
       archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
       createdAt: now,
       updatedAt: now,
     });

@@ -2019,6 +2019,13 @@ export interface CreateTaskInput extends Partial<Task> {
    * from a template.
    */
   existingBranch?: string;
+  /**
+   * Opt-in: create this task as a pipeline task (`pipelineStage: "planning"`,
+   * the 4 auto-advancing stages — see pipeline-prompts.ts and
+   * advancePipelineStage below). Never inferred from any other field —
+   * always explicit. Absent/false is a completely ordinary task.
+   */
+  pipeline?: boolean;
 }
 
 /**
@@ -2197,6 +2204,16 @@ export async function createTask(
     createdAt: now,
     updatedAt: now,
     archivedAt: null,
+    // Pipeline opt-in (input.pipeline): the task's whole subsequent
+    // lifecycle — column choices in startTask, prompt selection, stage
+    // transitions — is driven off pipelineStage from here on, never off
+    // input.pipeline again. An ordinary task gets all-zero/null defaults.
+    pipelineStage: input.pipeline ? "planning" : null,
+    planApproved: false,
+    implementationApproved: false,
+    revisionCount: 0,
+    pipelineFeedback: null,
+    pausedAt: null,
   });
   return { task };
 }

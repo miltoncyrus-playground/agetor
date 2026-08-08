@@ -1,4 +1,6 @@
-export type ColumnId = "backlog" | "ready" | "running" | "blocked" | "review" | "done";
+export type ColumnId =
+  | "backlog" | "ready" | "running" | "blocked" | "review" | "done"
+  | "planning" | "plan-review" | "building" | "testing";
 
 /**
  * The exact `HarnessStatus.reason` string the server emits when claude-code
@@ -34,11 +36,40 @@ export const GIT_HOST_TOKENS_SECTION = "Git host tokens";
 export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "backlog", label: "Backlog" },
   { id: "ready", label: "Ready" },
+  { id: "planning", label: "Planning" },
+  { id: "plan-review", label: "Plan Review" },
+  { id: "building", label: "Building" },
+  { id: "testing", label: "Testing" },
   { id: "running", label: "Running" },
   { id: "blocked", label: "Blocked" },
   { id: "review", label: "Review" },
   { id: "done", label: "Done" },
 ];
+
+/** The 4 columns a pipeline task's own agent occupies while auto-advancing
+ *  (see src/bun/pipeline-prompts.ts and orchestrator.ts's advancePipelineStage).
+ *  Never used by a non-pipeline task — `running`/`review` stay exactly as
+ *  they are for those. */
+export const PIPELINE_STAGE_COLUMNS: readonly ColumnId[] =
+  ["planning", "plan-review", "building", "testing"];
+
+/** Shared send-back budget for a pipeline task across BOTH loop edges
+ *  (plan-review→planning and testing→building combined, not 4 each).
+ *  Hitting the cap routes the task to `blocked` (reason "revision-cap")
+ *  instead of looping again. */
+export const PIPELINE_REVISION_CAP = 4;
+
+/** True when a task's column means "an agent is actively occupying this row
+ *  right now" — the plain `running` column for an ordinary task, or any of
+ *  the 4 pipeline stage columns for a pipeline one. Central predicate so
+ *  every "is this task busy" check (Stop button, archive guard, composer
+ *  editability, subagent-hold bookkeeping, boot reconciliation) agrees;
+ *  swap any bare `column === "running"` check for this instead. Note this
+ *  does NOT include "blocked" — callers that also want to treat a blocked
+ *  task as busy add `|| column === "blocked"` explicitly, same as before. */
+export function isActiveColumn(column: ColumnId): boolean {
+  return column === "running" || PIPELINE_STAGE_COLUMNS.includes(column);
+}
 
 /**
  * Heuristic patterns we use to detect "the agent is waiting on the user" from
@@ -694,6 +725,61 @@ export interface Task {
    *  request by the server (never persisted, never patchable). Absent on payloads
    *  that don't join the subagents table. */
   runningSubagents?: number;
+  /**
+   * Non-null marks this a "pipeline task": its 4 stages (planning →
+   * plan-review → building → testing → ready) run automatically with no
+   * human click between them, using the same harness/CLI as an ordinary
+   * task — just a different prompt template per stage (see
+   * src/bun/pipeline-prompts.ts). Null (the default, and every legacy row)
+   * is a completely ordinary task — every existing single-agent behavior is
+   * unaffected. Set once at creation from the "Run as pipeline" checkbox;
+   * never settable via PATCH — deliberately absent from
+   * `ALLOWED_PATCH_FIELDS` (server.ts), same treatment as `branch`/
+   * `worktreePath`/`prUrl`. Written exclusively by orchestrator.ts's
+   * `advancePipelineStage` from here on.
+   */
+  pipelineStage: "planning" | "plan-review" | "building" | "testing" | null;
+  /**
+   * Set true by the Critic's "approve" verdict on a plan-review run; reset
+   * to false whenever a later plan-review run instead sends the task back
+   * to planning (a revision invalidates the prior approval). Always false
+   * for a non-pipeline task.
+   */
+  planApproved: boolean;
+  /**
+   * Set true by the Tester's "pass" verdict on a testing run; reset to
+   * false whenever a later testing run instead sends the task back to
+   * building. A pipeline task only reaches `column: "ready"` once BOTH this
+   * and `planApproved` are true — an explicit AND-gate, not merely "the
+   * last stage exited 0." Always false for a non-pipeline task.
+   */
+  implementationApproved: boolean;
+  /**
+   * Shared send-back counter for a pipeline task: incremented on EVERY
+   * plan-review→planning or testing→building bounce (both edges share one
+   * budget, not one each). Capped at `PIPELINE_REVISION_CAP` (4) — hitting
+   * the cap routes the task to `blocked` (reason "revision-cap") instead of
+   * looping again, so a human can see why. Always 0 for a non-pipeline task.
+   */
+  revisionCount: number;
+  /**
+   * Free-text feedback from the most recent send-back verdict (a
+   * plan-review "revise" reason or a testing "fail" reason), folded into
+   * the next planning/building stage's prompt so the retry has context.
+   * Null when there's no pending feedback (fresh pipeline task, or the last
+   * verdict was a pass/approve). Cleared once consumed by the stage it fed.
+   * Always null for a non-pipeline task.
+   */
+  pipelineFeedback: string | null;
+  /**
+   * Unix ms when auto-advance was paused for this pipeline task via
+   * `POST /tasks/:id/pipeline-pause`, or null when running normally. While
+   * paused, a stage's run still starts and finishes normally — pause never
+   * kills an in-flight agent process — but `advancePipelineStage` skips
+   * spawning the *next* stage's run until `POST /tasks/:id/pipeline-resume`
+   * clears this. Always null for a non-pipeline task.
+   */
+  pausedAt: number | null;
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can

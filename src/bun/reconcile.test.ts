@@ -81,6 +81,7 @@ function heldTaskRow(overrides: Partial<Task> & { id: string; runId: string | nu
     pendingInteractionCount: 0,
     openTerminalCount: 0,
     archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -189,6 +190,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     pendingInteractionCount: 0,
     openTerminalCount: 0,
     archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
     createdAt: now,
     updatedAt: now,
   });
@@ -256,6 +258,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
     pendingInteractionCount: 0,
     openTerminalCount: 0,
     archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null,
     createdAt: now,
     updatedAt: now,
   });

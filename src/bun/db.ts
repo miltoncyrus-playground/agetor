@@ -75,6 +75,12 @@ type TaskRow = {
   draft: string | null;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
+  pipeline_stage: string | null;
+  plan_approved: number;
+  implementation_approved: number;
+  revision_count: number;
+  pipeline_feedback: string | null;
+  paused_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
    *  a correlated subquery in `list` / `get` — see those for the full SQL. */
   has_openable_run?: number;
@@ -192,6 +198,12 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
+  pipelineStage: r.pipeline_stage as Task["pipelineStage"],
+  planApproved: r.plan_approved === 1,
+  implementationApproved: r.implementation_approved === 1,
+  revisionCount: r.revision_count,
+  pipelineFeedback: r.pipeline_feedback,
+  pausedAt: r.paused_at,
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -231,8 +243,9 @@ export const tasks = {
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, refs, backlog, draft,
-          run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          run_id, created_at, updated_at, archived_at,
+          pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, paused_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -241,6 +254,8 @@ export const tasks = {
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
+        t.pipelineStage ?? null, t.planApproved ? 1 : 0, t.implementationApproved ? 1 : 0,
+        t.revisionCount ?? 0, t.pipelineFeedback ?? null, t.pausedAt ?? null,
       ],
     );
     // Round-trip via `get` so the returned shape carries the computed
@@ -256,7 +271,8 @@ export const tasks = {
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
          branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, refs=?, backlog=?, draft=?,
-         run_id=?, updated_at=?, archived_at=?
+         run_id=?, updated_at=?, archived_at=?,
+         pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, paused_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
@@ -265,7 +281,9 @@ export const tasks = {
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,
-        next.runId, next.updatedAt, next.archivedAt ?? null, id,
+        next.runId, next.updatedAt, next.archivedAt ?? null,
+        next.pipelineStage ?? null, next.planApproved ? 1 : 0, next.implementationApproved ? 1 : 0,
+        next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pausedAt ?? null, id,
       ],
     );
     // Re-fetch so hasOpenableRun reflects the row state immediately after
