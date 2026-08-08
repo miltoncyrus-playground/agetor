@@ -119,7 +119,7 @@ test("pipeline: plan-review approve advances to pre-builder and sets planApprove
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "plan-review", planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -162,7 +162,7 @@ test("pipeline: tickBuild starts an independent subtask immediately and holds a 
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   await tickBuild(taskId);
@@ -219,7 +219,7 @@ test("pipeline: DAG scheduler is a no-op once the parent is blocked (doesn't res
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "pre-builder", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   await startAndGetRunId(startTask, taskId);
@@ -257,7 +257,7 @@ test("pipeline: pre-builder success WITHOUT BUILD_PLAN.json blocks instead of ad
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "pre-builder", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   await startAndGetRunId(startTask, taskId);
@@ -291,7 +291,7 @@ test("pipeline: pre-builder success with an INVALID BUILD_PLAN.json (cycle) bloc
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "pre-builder", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   await startAndGetRunId(startTask, taskId);
@@ -301,6 +301,11 @@ test("pipeline: pre-builder success with an INVALID BUILD_PLAN.json (cycle) bloc
   expect(task.column).toBe("blocked");
   expect(task.pipelineStage).toBe("pre-builder");
   expect(task.pipelineFeedback).toContain("cycle");
+  // A verdict-bearing/output-producing stage that fails to produce the
+  // expected file blocks with "pipeline-failed" — this is what selects the
+  // "Stage didn't produce the expected output" copy (and the Retry-stage /
+  // Archive actions) in the RunPanel's blocked-task recovery banner.
+  expect(task.blockReason).toBe("pipeline-failed");
 });
 
 test("pipeline: plan-review approve goes straight to ready when implementationApproved was already true", async () => {
@@ -320,7 +325,7 @@ test("pipeline: plan-review approve goes straight to ready when implementationAp
     createdAt: now, updatedAt: now, archivedAt: null,
     // Simulates a re-planning pass after testing had already passed once.
     pipelineStage: "plan-review", planApproved: false, implementationApproved: true,
-    revisionCount: 1, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 1, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -349,7 +354,7 @@ test("pipeline: plan-review revise under the cap bounces to planning with feedba
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "plan-review", planApproved: true, implementationApproved: false,
-    revisionCount: 1, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 1, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -381,7 +386,7 @@ test("pipeline: revise past the revision cap blocks instead of looping again", a
     createdAt: now, updatedAt: now, archivedAt: null,
     // Already at the cap — one more revise must block, not loop a 5th time.
     pipelineStage: "plan-review", planApproved: true, implementationApproved: false,
-    revisionCount: 4, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 4, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -393,6 +398,9 @@ test("pipeline: revise past the revision cap blocks instead of looping again", a
   expect(task.revisionCount).toBe(5);
   // Stays at plan-review — the cap block doesn't fabricate a stage change.
   expect(task.pipelineStage).toBe("plan-review");
+  // Selects the "Revision limit reached" copy + Retry-stage/Archive actions
+  // in the RunPanel's blocked-task recovery banner.
+  expect(task.blockReason).toBe("revision-cap");
 });
 
 test("pipeline: building success (not verdict-bearing) advances straight to code-review", async () => {
@@ -411,7 +419,7 @@ test("pipeline: building success (not verdict-bearing) advances straight to code
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: "prior tester feedback", pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: "prior tester feedback", pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   await startAndGetRunId(startTask, taskId);
@@ -443,7 +451,7 @@ test("pipeline: code-review approve advances to testing", async () => {
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "code-review", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -475,7 +483,7 @@ test("pipeline: code-review revise under the cap bounces to building with feedba
     // Already used 2 of the 4 shared slots via earlier plan-review/testing
     // bounces in this task's (simulated) history — code-review's revise
     // below must draw from the SAME counter, not a fresh one.
-    revisionCount: 2, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 2, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -552,7 +560,7 @@ test("pipeline: testing pass reaches ready (planApproved already true by constru
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "testing", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -580,7 +588,7 @@ test("pipeline: testing fail under the cap bounces to building (not planning)", 
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "testing", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -611,7 +619,7 @@ test("pipeline: no PIPELINE_VERDICT in the response blocks rather than guessing"
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "plan-review", planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const runId = await startAndGetRunId(startTask, taskId);
@@ -640,7 +648,7 @@ test("pipeline: pause lands the column on the next stage but does not spawn a ru
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
     revisionCount: 0, pipelineFeedback: null,
-    pausedAt: Date.now(), parentTaskId: null, planSubtaskId: null, childMergeStatus: null, // paused before this stage's run even started
+    pausedAt: Date.now(), blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, // paused before this stage's run even started
   });
 
   await startAndGetRunId(startTask, taskId);
@@ -716,7 +724,7 @@ test("pipeline: pausePipelineTask sets pausedAt; resumePipelineTask clears it an
     // which would make "exactly 1 run after resume" a race. testing with
     // no verdict deterministically blocks instead of cascading further.
     pipelineStage: "testing", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   const pauseResult = pausePipelineTask(taskId);
@@ -755,7 +763,7 @@ test("pipeline: pause skips the auto-spawn of the NEXT stage, resume continues i
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
 
   // Start building's own run, then pause WHILE it's still in flight — the
@@ -807,7 +815,7 @@ test("pipeline: resumeInFlightBuilds picks up a parent mid-build after a restart
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
   const childAId = crypto.randomUUID();
   tasks.insert({
@@ -819,7 +827,7 @@ test("pipeline: resumeInFlightBuilds picks up a parent mid-build after a restart
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: null, planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
     parentTaskId: parentId, planSubtaskId: "a", childMergeStatus: "merged",
   });
 
@@ -865,7 +873,7 @@ test("pipeline: resumeInFlightBuilds ignores archived and non-building tasks", a
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: now,
     pipelineStage: "building", planApproved: true, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
   // A child task (parentTaskId set) sitting in "building" — must not be
   // mistaken for a top-level parent mid-build.
@@ -879,7 +887,7 @@ test("pipeline: resumeInFlightBuilds ignores archived and non-building tasks", a
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: null, planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
     parentTaskId: crypto.randomUUID(), planSubtaskId: "x", childMergeStatus: "pending",
   });
 

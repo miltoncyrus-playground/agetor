@@ -21,7 +21,7 @@ function task(overrides: Partial<Task> = {}): Task {
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: 0, updatedAt: 0, archivedAt: null,
     pipelineStage: "planning", planApproved: false, implementationApproved: false,
-    revisionCount: 0, pipelineFeedback: null, pausedAt: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
     ...overrides,
   };
 }

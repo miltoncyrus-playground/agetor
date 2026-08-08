@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { GlobalEvent } from "../shared/types.ts";
+import type { BlockReason, GlobalEvent } from "../shared/types.ts";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-blk-"));
@@ -18,6 +18,67 @@ process.env.AGETOR_TMUX_BIN = "/bin/echo";
 // read-only under `ask`), so it emits no interactive approval prompt to match.
 // The `blocked` column is now exclusively the claude API-error signal, covered
 // by the tests below.
+
+test("orchestrator persists blockReason on every real block path, and clears it on retry", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  // One task per real block reason, each driven through the same fake-driver
+  // sentinel the dedicated tests below use — this test only checks the
+  // persisted `Task.blockReason` field itself (the durable counterpart to
+  // the one-shot GlobalEvent the other tests assert), not the full
+  // column/run-status contract those already cover.
+  const cases: { env: string; reason: BlockReason }[] = [
+    { env: "AGETOR_FAKE_CLAUDE_API_ERROR", reason: "api-error" },
+    { env: "AGETOR_FAKE_CLAUDE_SESSION_DIED", reason: "session-died" },
+    { env: "AGETOR_FAKE_CLAUDE_UNKNOWN_COMMAND", reason: "unknown-command" },
+  ];
+
+  process.env.AGETOR_CLAUDE_DRIVER = "fake";
+  try {
+    for (const c of cases) {
+      process.env[c.env] = "1";
+      try {
+        const created = await createTask({
+          title: `blockReason ${c.reason}`,
+          prompt: "anything",
+          agent: "claude-code",
+          workdir: process.cwd(),
+          isolation: "none",
+        });
+        if ("error" in created) throw new Error(created.error);
+        const task = created.task;
+
+        const res = await startTask(task.id);
+        if ("error" in res) throw new Error(`startTask failed: ${res.error}`);
+        await new Promise((r) => setTimeout(r, 200));
+
+        const blocked = tasks.get(task.id);
+        expect(blocked?.column).toBe("blocked");
+        expect(blocked?.blockReason).toBe(c.reason);
+
+        // Retry (a fresh run, same mechanic the RunPanel's blocked-task
+        // banner's "Retry" action uses) must clear blockReason once the
+        // task leaves `blocked` — a stale reason on a task that's since
+        // recovered would show the wrong banner if it fails differently
+        // next time, or a stale one if `startTask` never got the chance to
+        // clear the field on the way to `running`.
+        delete process.env[c.env];
+        const retryRes = await startTask(task.id);
+        if ("error" in retryRes) throw new Error(`retry startTask failed: ${retryRes.error}`);
+        // startTask flips the column synchronously before returning — no
+        // need to wait for the fake driver's resolve timer to assert this.
+        const retried = tasks.get(task.id);
+        expect(retried?.column).toBe("running");
+        expect(retried?.blockReason).toBeNull();
+      } finally {
+        delete process.env[c.env];
+      }
+    }
+  } finally {
+    delete process.env.AGETOR_CLAUDE_DRIVER;
+  }
+});
 
 test("orchestrator leaves claude task in 'blocked' column when the run hits an API error", async () => {
   const { createTask, startTask, subscribeGlobal } = await import("./orchestrator.ts");

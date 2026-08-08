@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, CheckCircle2, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, AlertTriangle, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, CheckCircle2, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Pause, Plug, Play, RefreshCw, RotateCcw, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
@@ -25,6 +25,7 @@ import { abbreviateHome, cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
+  BLOCK_REASON_COPY,
   COLUMNS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
@@ -34,6 +35,7 @@ import {
   supportedModes,
   type AgentKind,
   type AgentStatus,
+  type BlockReason,
   type Harness,
   type BacklogMessage,
   type GitHubPullMergeability,
@@ -1899,8 +1901,17 @@ function RunPanelBody({
     fetchPrStatus(task.workdir, parsedPrUrl.number);
   };
 
-  const send = async () => {
-    const line = input.trim();
+  // `override` lets a caller other than the composer (the blocked-task
+  // recovery banner's "Retry"/"Retry as-is" actions) send a specific message
+  // without going through `input` state — `setInput(text)` followed
+  // immediately by `send()` would read the STALE pre-update `input` value,
+  // since React state updates aren't synchronous. When `override` is given,
+  // it's sent verbatim (no `sendRefs` folded in — those belong to whatever
+  // the user was independently drafting in the composer, not to a synthetic
+  // retry nudge) and the composer/draft state is left completely untouched,
+  // since the user never typed anything for this send.
+  const send = async (override?: string) => {
+    const line = override ?? input.trim();
     if (!line && !sendRefs.length) return;
     if (!resumableRunId) return;
     // Never deliver while a native modal is up: claude is blocked on it inside
@@ -1916,27 +1927,29 @@ function RunPanelBody({
     if (sending || backlogBusy) return;
     setSending(true);
     setSendHint(null);
-    const body = appendReferences(line, sendRefs);
+    const body = override !== undefined ? override : appendReferences(line, sendRefs);
     try {
       const res = await api.sendRunInput(resumableRunId, body);
       if (!res.delivered) {
         setSendHint(res.reason);
       } else {
-        setInput("");
-        setSendRefs([]);
-        // The composer is now empty — clear the persisted draft so it can't
-        // resurrect on next open. Cancel any pending autosave first, then
-        // bump the write generation *before* firing the clear so an
-        // in-flight autosave PUT that resolves afterward can't win the race
-        // and clobber `lastSavedDraftRef` back to the just-sent text (code
-        // review finding #4). Also drop pristine: the composer was just
-        // consumed, so nothing should reseed it from a stale poll that still
-        // shows the pre-clear draft (finding #2's adopt effects check this).
-        cancelDraftSaveTimer();
-        draftGenRef.current++;
-        lastSavedDraftRef.current = null;
-        draftPristineRef.current = false;
-        void api.clearTaskDraft(task.id).catch(() => {});
+        if (override === undefined) {
+          setInput("");
+          setSendRefs([]);
+          // The composer is now empty — clear the persisted draft so it can't
+          // resurrect on next open. Cancel any pending autosave first, then
+          // bump the write generation *before* firing the clear so an
+          // in-flight autosave PUT that resolves afterward can't win the race
+          // and clobber `lastSavedDraftRef` back to the just-sent text (code
+          // review finding #4). Also drop pristine: the composer was just
+          // consumed, so nothing should reseed it from a stale poll that still
+          // shows the pre-clear draft (finding #2's adopt effects check this).
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+          void api.clearTaskDraft(task.id).catch(() => {});
+        }
         // Drop the frozen JSONL snapshot — the auto-rebuild effect set
         // it from the last finished run, and the live SSE stream now
         // carries the new turn's events. Without this, the display
@@ -1963,6 +1976,30 @@ function RunPanelBody({
     } finally {
       setSending(false);
     }
+  };
+
+  // Last `stream: "user"` event's raw text — `e.data` is the plain text
+  // straight off the wire for this stream (see `renderEvent`'s `"user"`
+  // case a few thousand lines down, which passes it to `UserMessageBlock`
+  // unmodified), so no unwrapping is needed. Feeds the blocked-task
+  // recovery banner's "Edit & Retry" action (an `unknown-command` block
+  // means THIS exact text is what claude's TUI rejected — surfacing it
+  // for the user to fix beats making them retype from memory).
+  const lastUserMessageText = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]!.stream === "user") return events[i]!.data;
+    }
+    return "";
+  }, [events]);
+
+  // Populates the composer from the last outgoing message and focuses it,
+  // for the "Edit & Retry" action — no auto-send, the user reviews/fixes
+  // first. `input`/`sendRefs` diverging from `resumableRunId`'s draft (the
+  // ordinary autosave path) is fine here: this IS a deliberate user-visible
+  // edit, exactly like typing over an existing draft by hand.
+  const editAndRetry = () => {
+    setInput(lastUserMessageText);
+    requestAnimationFrame(() => sendRef.current?.focus());
   };
 
   const stop = async () => {
@@ -2518,6 +2555,17 @@ function RunPanelBody({
         </div>
       )}
 
+      {!archived && task.column === "blocked" && (
+        <BlockedBanner
+          task={task}
+          onRetryStage={() => onStart(task)}
+          onRetryNudge={() => void send("Please continue from where you left off.")}
+          onEditAndRetry={editAndRetry}
+          onRetryAsIs={() => void send(lastUserMessageText)}
+          onArchive={() => onArchive(task)}
+        />
+      )}
+
       <FileMentions task={task} events={events} />
 
       {/* Task details. Editable inline when the task is idle — agent / mode /
@@ -2945,6 +2993,107 @@ function RunPanelBody({
         </div>
       )}
     </>
+  );
+}
+
+/** Copy for a `blocked` task whose `blockReason` is null — a pre-migration
+ *  row, or (defensively) any future block path that hasn't been taught to
+ *  set the field. Falls back to the universally-safe "start it again"
+ *  action rather than assuming a specific recovery mechanic. */
+const UNKNOWN_BLOCK_COPY = {
+  heading: "Stopped",
+  detail: "This task stopped and needs your input to continue.",
+};
+
+/**
+ * Durable, reason-specific recovery banner for a task sitting in `blocked`.
+ * Replaces "go dig in the transcript to figure out what happened" with a
+ * one-line explanation and 2-3 labeled actions. Reads `task.blockReason`
+ * (persisted by orchestrator.ts's `updateColumn`, survives reload/restart)
+ * rather than reacting only to the one-shot toast fired at the moment of
+ * transition — see the shared `BlockReason`/`BLOCK_REASON_COPY` for the
+ * closed set of reasons this ever actually renders for.
+ *
+ * Action mapping is genuinely different for a pipeline task vs. an ordinary
+ * conversational one, not just a label swap:
+ *   - Pipeline task (any reason): "Retry stage" re-runs the CURRENT stage
+ *     fresh from its fixed prompt template (`onRetryStage`, the same
+ *     mechanic the header's icon-only retry button already uses) — a stage
+ *     prompt is self-contained, not an ongoing conversation to resume.
+ *   - Non-pipeline, api-error/session-died: the agent just needs a nudge to
+ *     continue — `onRetryNudge` resumes the existing session (works for
+ *     every agent kind: task.runId is never cleared on a block, so the
+ *     panel's `resumableRunId` already resolves to it regardless of harness).
+ *   - Non-pipeline, unknown-command: resending the identical text would
+ *     likely fail the same way (that's why it failed) — `onEditAndRetry`
+ *     prefills+focuses the composer with the exact rejected text instead of
+ *     auto-sending, `onRetryAsIs` is offered as a secondary in case it was
+ *     just a transient TUI hiccup.
+ */
+function BlockedBanner({
+  task,
+  onRetryStage,
+  onRetryNudge,
+  onEditAndRetry,
+  onRetryAsIs,
+  onArchive,
+}: {
+  task: Task;
+  onRetryStage: () => void;
+  onRetryNudge: () => void;
+  onEditAndRetry: () => void;
+  onRetryAsIs: () => void;
+  onArchive: () => void;
+}) {
+  const copy = task.blockReason ? BLOCK_REASON_COPY[task.blockReason] : UNKNOWN_BLOCK_COPY;
+  const isPipeline = task.pipelineStage != null;
+
+  const actions: React.ReactNode = (() => {
+    if (isPipeline) {
+      return (
+        <>
+          <Button size="sm" onClick={onRetryStage}>Retry stage</Button>
+          <Button size="sm" variant="outline" onClick={onArchive}>Archive</Button>
+        </>
+      );
+    }
+    if (task.blockReason === "unknown-command") {
+      return (
+        <>
+          <Button size="sm" onClick={onEditAndRetry}>Edit &amp; Retry</Button>
+          <Button size="sm" variant="outline" onClick={onRetryAsIs}>Retry as-is</Button>
+          <Button size="sm" variant="ghost" onClick={onArchive}>Archive</Button>
+        </>
+      );
+    }
+    if (task.blockReason === "api-error" || task.blockReason === "session-died") {
+      return (
+        <>
+          <Button size="sm" onClick={onRetryNudge}>Retry</Button>
+          <Button size="sm" variant="outline" onClick={onArchive}>Archive</Button>
+        </>
+      );
+    }
+    // Fallback (blockReason null, or a pipeline-only reason surfacing on a
+    // task that's somehow not pipeline-shaped — shouldn't happen, but the
+    // universal-safest action is always "start it again").
+    return (
+      <>
+        <Button size="sm" onClick={onRetryStage}>Retry</Button>
+        <Button size="sm" variant="outline" onClick={onArchive}>Archive</Button>
+      </>
+    );
+  })();
+
+  return (
+    <div className="flex items-start gap-2.5 border-b border-amber-500/30 bg-amber-500/[0.06] px-3 py-2.5">
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-foreground">{copy.heading}</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">{copy.detail}</p>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">{actions}</div>
+      </div>
+    </div>
   );
 }
 

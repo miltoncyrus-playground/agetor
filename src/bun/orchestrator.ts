@@ -19,6 +19,7 @@ import {
   renderBranchTemplate,
   validateBranchName,
   type AgentKind,
+  type BlockReason,
   type Harness,
   type TaskType,
 } from "../shared/types.ts";
@@ -353,6 +354,25 @@ function normalizeUserText(s: string): string {
  * from keeping its own diff state. Pass `null` for `runId` when the change
  * isn't tied to a specific run (e.g. orphan reconciliation).
  */
+/** Narrows `updateColumn`'s wider `reason` parameter (which also carries
+ *  `"approval"` — declared but never actually emitted — and
+ *  `"stage-advance"`, a normal pipeline move rather than a block) down to
+ *  the real, closed set of reasons a task is ever actually blocked for. */
+function toBlockReason(
+  reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "stage-advance" | "revision-cap" | "pipeline-failed",
+): BlockReason | null {
+  switch (reason) {
+    case "api-error":
+    case "session-died":
+    case "unknown-command":
+    case "revision-cap":
+    case "pipeline-failed":
+      return reason;
+    default:
+      return null;
+  }
+}
+
 function updateColumn(
   taskId: string,
   runId: string | null,
@@ -361,7 +381,20 @@ function updateColumn(
 ): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
-  tasks.update(taskId, { column: next });
+  // Persist WHY a task is blocked so the UI can render a durable recovery
+  // banner (survives reload/restart) instead of only reacting to the
+  // one-shot GlobalEvent emitted below. Cleared the moment the task leaves
+  // `blocked`, regardless of what it's transitioning to. Landing on
+  // `blocked` with NO reason (a bare re-affirm of an already-blocked
+  // column, or a future call site that doesn't know why) leaves whatever
+  // reason is already there untouched rather than nulling it out — a call
+  // site missing its reason must never be able to silently corrupt a real
+  // one a moment-earlier call already set.
+  const blockReason: BlockReason | null | undefined =
+    next === "blocked"
+      ? (reason !== undefined ? toBlockReason(reason) : undefined)
+      : prev === "blocked" ? null : undefined;
+  tasks.update(taskId, blockReason !== undefined ? { column: next, blockReason } : { column: next });
   if (prev !== next) {
     emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now(), reason });
   }
@@ -914,6 +947,12 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   const persist = db.transaction(() => {
     tasks.update(taskId, {
       column: startColumn,
+      // A fresh run always supersedes whatever `blocked` reason applied to
+      // the PREVIOUS run — this is the retry path the RunPanel's
+      // blocked-task recovery banner's "Retry stage"/"Retry" actions use
+      // (`onStart`), and `updateColumn` (which owns clearing this field on
+      // every OTHER blocked→non-blocked transition) is never called here.
+      blockReason: null,
       branch: prepared.branch,
       worktreePath: prepared.worktreePath,
       runId,
@@ -1186,7 +1225,14 @@ function attachDoneHandler(
             ? "ready"
             : (wasApiError || wasSessionDied || wasUnknownCommand) ? "blocked"
             : newStatus === "succeeded" ? "review" : "ready";
-          updateColumn(taskId, runId, nextColumn);
+          // This re-affirms the SAME `blocked` column the chunk-handler
+          // already flipped to (with its own reason) a moment earlier — pass
+          // the reason again here too, or `updateColumn` would clear it back
+          // to null (its own reason param defaults to undefined, and it has
+          // no way to know the write below is a no-op-on-column but
+          // shouldn't be a no-op-on-reason).
+          const nextReason = wasApiError ? "api-error" : wasSessionDied ? "session-died" : wasUnknownCommand ? "unknown-command" : undefined;
+          updateColumn(taskId, runId, nextColumn, nextReason);
         }
       }
       emit({
@@ -1236,8 +1282,13 @@ function attachDoneHandler(
           // A session-death / unknown-command that reaches the reject path (not
           // the case today — both drivers resolve on these — but keep the
           // column consistent with the resolve path if a future refactor ever
-          // rejects instead).
-          updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
+          // rejects instead). Pass the reason too — see the matching comment
+          // on the resolve-path's `updateColumn` call above.
+          updateColumn(
+            taskId, runId,
+            (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready",
+            wasSessionDied ? "session-died" : wasUnknownCommand ? "unknown-command" : undefined,
+          );
         }
       }
       emit({
@@ -1981,7 +2032,13 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     geminiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
-  tasks.update(taskId, { column: "running", runId: newRunId });
+  // blockReason: null — this (and the 4 other direct `column: "running"`
+  // writes in this file) bypasses `updateColumn`, which is what normally
+  // clears the field on a blocked→non-blocked move. A fresh turn always
+  // supersedes whatever `blocked` reason applied to the PREVIOUS one — this
+  // is exactly the path the RunPanel's blocked-task recovery banner's
+  // "Retry"/"Edit & Retry" actions use to resume a dead session.
+  tasks.update(taskId, { column: "running", runId: newRunId, blockReason: null });
   if (prevColumn !== "running") {
     emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
@@ -2123,7 +2180,7 @@ function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
     geminiSessionId: priorSessionId,
   });
   const prevColumn: ColumnId = task.column;
-  tasks.update(taskId, { column: "running", runId: newRunId });
+  tasks.update(taskId, { column: "running", runId: newRunId, blockReason: null });
   if (prevColumn !== "running") {
     emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
@@ -2294,7 +2351,7 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
     geminiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
-  tasks.update(taskId, { column: "running", runId: newRunId });
+  tasks.update(taskId, { column: "running", runId: newRunId, blockReason: null });
   if (prevColumn !== "running") {
     emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
@@ -2367,7 +2424,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
   // prior column (mirrors the idle branch above, and matches the owner
   // decision in the plan: the session genuinely resumed talking, so the
   // card must reflect that live activity).
-  tasks.update(taskId, { column: "running", runId: newRunId });
+  tasks.update(taskId, { column: "running", runId: newRunId, blockReason: null });
   if (prevColumn !== "running") {
     emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
@@ -2420,7 +2477,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     geminiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
-  tasks.update(taskId, { column: "running", runId: newRunId });
+  tasks.update(taskId, { column: "running", runId: newRunId, blockReason: null });
   if (prevColumn !== "running") {
     emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
@@ -2689,6 +2746,8 @@ export async function createTask(
     revisionCount: 0,
     pipelineFeedback: null,
     pausedAt: null,
+    // A brand-new task has never been blocked.
+    blockReason: null,
     // Child-linking fields — only ever passed by build-scheduler.ts's
     // tickBuild (the public POST /tasks route strips them from the request
     // body before calling createTask, see server.ts). null for every

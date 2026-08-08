@@ -76,6 +76,42 @@ export function isActiveColumn(column: ColumnId): boolean {
   return column === "running" || PIPELINE_STAGE_COLUMNS.includes(column);
 }
 
+/** The real, closed set of reasons a task actually lands in `blocked` for
+ *  (see orchestrator.ts's `updateColumn` call sites). Narrower than
+ *  `updateColumn`'s own `reason` parameter type, which also carries
+ *  `"approval"` (declared but never emitted) and `"stage-advance"` (a
+ *  normal forward/back pipeline move, not a block) — those two map to
+ *  `null` when persisted onto `Task.blockReason`. */
+export type BlockReason =
+  | "api-error" | "session-died" | "unknown-command" | "revision-cap" | "pipeline-failed";
+
+/** Human-readable heading + one-line explanation per `BlockReason`, shown in
+ *  the RunPanel's blocked-task recovery banner. Kept here (not in the
+ *  mainview) so a future non-webview surface — or a test — can reuse the
+ *  same copy without importing UI code. */
+export const BLOCK_REASON_COPY: Record<BlockReason, { heading: string; detail: string }> = {
+  "api-error": {
+    heading: "API error",
+    detail: "The agent hit an API error (rate limit, server error, or similar) and the turn stopped.",
+  },
+  "session-died": {
+    heading: "Session ended unexpectedly",
+    detail: "The agent's session ended unexpectedly (crash, restart, or external kill) mid-run.",
+  },
+  "unknown-command": {
+    heading: "Message not delivered",
+    detail: "Claude's terminal treated your message as an unrecognized command, so it was never sent.",
+  },
+  "revision-cap": {
+    heading: "Revision limit reached",
+    detail: "This task went back and forth between stages too many times without resolving.",
+  },
+  "pipeline-failed": {
+    heading: "Stage didn't produce the expected output",
+    detail: "The agent finished but didn't write the file this stage needs, so it can't be evaluated.",
+  },
+};
+
 /**
  * Heuristic patterns we use to detect "the agent is waiting on the user" from
  * its stdout/stderr stream. Match is case-insensitive. Currently only run
@@ -795,6 +831,17 @@ export interface Task {
    * clears this. Always null for a non-pipeline task.
    */
   pausedAt: number | null;
+  /**
+   * Why this task is in the `blocked` column right now — set by
+   * orchestrator.ts's `updateColumn` on every transition INTO `blocked`,
+   * cleared on every transition OUT of it. Null for a task that's never
+   * been blocked (or was blocked before migration 037). Durable
+   * counterpart to the one-shot `GlobalEvent`/toast fired at the moment of
+   * transition — this is what lets the UI show a recovery banner even
+   * after a reload or app restart, not just live at the instant it happens.
+   * See `BLOCK_REASON_COPY` for the human-readable explanation per value.
+   */
+  blockReason: BlockReason | null;
   /**
    * Links a CHILD task (spawned by a "building" stage's fresh entry, one
    * per BUILD_PLAN.json subtask) back to the pipeline task that spawned it.
