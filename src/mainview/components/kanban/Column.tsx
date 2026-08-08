@@ -2,19 +2,26 @@ import { memo } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import type { ColumnId, Task } from "../../../shared/types.ts";
+import type { Task } from "../../../shared/types.ts";
+import type { DisplayColumnId } from "@/lib/display-columns";
 import { TaskCard } from "./TaskCard";
 
 interface Props {
-  id: ColumnId;
+  id: DisplayColumnId;
   /** The dnd-kit droppable id — namespaced per-lane by the caller
    *  (`` `${workdir}::${columnId}` ``) since a swimlane board has one
-   *  `Column` per (project, stage) pair and every `id: ColumnId` value
-   *  repeats once per lane; the bare `ColumnId` would collide across
+   *  `Column` per (project, stage) pair and every `id: DisplayColumnId`
+   *  value repeats once per lane; the bare id would collide across
    *  lanes if used directly as the droppable id. `id` itself stays the
-   *  plain `ColumnId` for column-identity/label/comparator purposes. */
+   *  plain display-column id for column-identity/label/comparator
+   *  purposes. */
   droppableId: string;
   label: string;
+  /** Whether this column accepts drops. Defaults to true; the caller
+   *  (SwimLane.tsx) passes false for the merged "in-progress" bucket,
+   *  which maps to 6 different real columns with no single unambiguous
+   *  drop destination. */
+  droppable?: boolean;
   tasks: Task[];
   /** taskId -> Task, over the FULL task list (not just this column) — lets
    *  a child card look up its parent's title regardless of which column
@@ -42,8 +49,8 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, droppableId, label, tasks, tasksById, childCountsByParent, onOpen }: Props) {
-  const { setNodeRef, isOver } = useDroppable({ id: droppableId });
+function ColumnImpl({ id, droppableId, label, droppable = true, tasks, tasksById, childCountsByParent, onOpen }: Props) {
+  const { setNodeRef, isOver } = useDroppable({ id: droppableId, disabled: !droppable });
   return (
     <div
       ref={setNodeRef}
@@ -86,6 +93,7 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.id === next.id &&
   prev.droppableId === next.droppableId &&
   prev.label === next.label &&
+  prev.droppable === next.droppable &&
   prev.onOpen === next.onOpen &&
   // Both are useMemo'd in App.tsx off `tasks` — reference-stable whenever
   // the underlying task list didn't actually change, same guarantee

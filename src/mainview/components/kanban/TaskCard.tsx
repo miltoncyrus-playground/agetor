@@ -5,6 +5,7 @@ import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { COLUMNS, PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { displayColumnMeta, toDisplayColumn } from "@/lib/display-columns";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
@@ -69,6 +70,12 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
     childProgress ? `${childProgress.merged}/${childProgress.total} sub-tasks` : null,
   ].filter(Boolean).join(" · ");
   const isActivelyMidStage = task.pipelineStage != null && PIPELINE_STAGE_COLUMNS.includes(task.column);
+  // Static state-color dot, shown for every card so a task's place in the
+  // (now-merged) display-column taxonomy reads without opening it. Skipped
+  // only when the pulsing dot below already covers the exact same signal
+  // (an actively-mid-stage pipeline task) — showing both would be a
+  // redundant double-dot for the same "in-progress" state.
+  const stateDotClass = displayColumnMeta(toDisplayColumn(task.column)).dotClass;
 
   return (
     <Card
@@ -98,7 +105,7 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
         <AgentIcon kind={task.agent} className="size-3 shrink-0" />
         <span className="shrink-0">{task.agent}</span>
         <span className="opacity-40">·</span>
-        {isActivelyMidStage && (
+        {isActivelyMidStage ? (
           // Same green-pulsing-dot pattern used elsewhere for "agent
           // actively working" — deliberately NOT the amber awaiting-pulse
           // the card's outer ring already uses, which means the opposite
@@ -107,6 +114,8 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
             <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
           </span>
+        ) : (
+          <span className={cn("size-1.5 shrink-0 rounded-full", stateDotClass)} />
         )}
         <span className="truncate">
           {stageLabel}

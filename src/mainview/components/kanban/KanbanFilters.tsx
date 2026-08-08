@@ -6,7 +6,8 @@ import { MultiSearchSelect } from "@/components/ui/multi-search-select";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
-import { COLUMNS, TASK_TYPES, type ColumnId, type Harness, type Project, type TaskType } from "../../../shared/types.ts";
+import { TASK_TYPES, type Harness, type Project, type TaskType } from "../../../shared/types.ts";
+import { DISPLAY_COLUMNS, type DisplayColumnId } from "@/lib/display-columns";
 
 export type ArchivedView = "active" | "all" | "archived";
 
@@ -15,8 +16,8 @@ interface Props {
   onTextQueryChange: (v: string) => void;
   repoFilter: string[];
   onRepoFilterChange: (v: string[]) => void;
-  statusFilter: ColumnId[];
-  onStatusFilterChange: (v: ColumnId[]) => void;
+  statusFilter: DisplayColumnId[];
+  onStatusFilterChange: (v: DisplayColumnId[]) => void;
   archivedView: ArchivedView;
   onArchivedViewChange: (v: ArchivedView) => void;
   harnessFilter: string[];
@@ -62,7 +63,7 @@ export function KanbanFilters({
     label: p.name || basename(p.path) || p.path,
     hint: p.path,
   }));
-  const statusItems = COLUMNS.map((c) => ({ value: c.id, label: c.label } as const));
+  const statusItems = DISPLAY_COLUMNS.map((c) => ({ value: c.id, label: c.label } as const));
   // Order: enabled harnesses first, then disabled (marked with a hint), then
   // orphan ids referenced by tasks but no longer registered as a harness — so
   // historical runs of a removed harness stay filterable.

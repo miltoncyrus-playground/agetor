@@ -3,7 +3,8 @@ import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } f
 import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { COLUMNS, isActiveColumn, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { isActiveColumn, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { DISPLAY_COLUMNS, toDisplayColumn, type DisplayColumnId } from "./lib/display-columns.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
@@ -146,7 +147,7 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [textQuery, setTextQuery] = useState("");
   const [repoFilter, setRepoFilter] = useState<string[]>([]);
-  const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
+  const [statusFilter, setStatusFilter] = useState<DisplayColumnId[]>([]);
   const [archivedView, setArchivedView] = useState<"active" | "all" | "archived">("active");
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
@@ -513,8 +514,8 @@ export default function App() {
     });
   }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView]);
 
-  const visibleColumns = useMemo(
-    () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
+  const visibleDisplayColumns = useMemo(
+    () => (statusFilter.length === 0 ? DISPLAY_COLUMNS : DISPLAY_COLUMNS.filter((c) => statusFilter.includes(c.id))),
     [statusFilter],
   );
 
@@ -540,14 +541,21 @@ export default function App() {
   }, [tasks]);
 
   // Groups `visibleTasks` into one swimlane per project (task.workdir),
-  // each further bucketed by column. Registered projects first (in
-  // `projects`'s own order, skipping any with zero currently-visible
-  // tasks — an empty lane is noise), then any workdir present in tasks but
-  // not a registered project (ad-hoc/typed-in workdirs), alphabetically.
-  // No stability trick needed for `tasksByColumn`'s per-cell arrays beyond
-  // what `visibleTasks.filter(...)` already relied on for the flat board —
-  // `Column`'s memo comparator (Column.tsx) compares elements, not the
-  // array reference, and elements stay stable via `reconcileById` above.
+  // each further bucketed by DISPLAY column (task.column collapsed via
+  // `toDisplayColumn` — the 6 pipeline-stage columns + plain "running" all
+  // land in one "in-progress" bucket; task.column itself is untouched).
+  // Registered projects first (in `projects`'s own order, skipping any with
+  // zero currently-visible tasks — an empty lane is noise), then any workdir
+  // present in tasks but not a registered project (ad-hoc/typed-in
+  // workdirs), alphabetically. Each lane also gets its OWN visible-column
+  // list: `visibleDisplayColumns` filtered down to buckets that actually
+  // have a task in THIS lane — a column with zero tasks in a given project
+  // simply doesn't render in that project's row, even if another project's
+  // row does show it (the confirmed "auto-hide, per lane" behavior).
+  // No stability trick needed for `tasksByDisplayColumn`'s per-cell arrays
+  // beyond what `visibleTasks.filter(...)` already relied on for the flat
+  // board — `Column`'s memo comparator (Column.tsx) compares elements, not
+  // the array reference, and elements stay stable via `reconcileById` above.
   const lanes = useMemo(() => {
     const byWorkdir = new Map<string, Task[]>();
     for (const t of visibleTasks) {
@@ -562,20 +570,25 @@ export default function App() {
     const extra = Array.from(byWorkdir.keys()).filter((w) => !known.has(w)).sort();
     return [...ordered, ...extra].map((workdir) => {
       const laneTasks = byWorkdir.get(workdir)!;
-      const tasksByColumn = new Map<ColumnId, Task[]>();
+      const tasksByDisplayColumn = new Map<DisplayColumnId, Task[]>();
       for (const t of laneTasks) {
-        const arr = tasksByColumn.get(t.column);
-        if (arr) arr.push(t); else tasksByColumn.set(t.column, [t]);
+        const dc = toDisplayColumn(t.column);
+        const arr = tasksByDisplayColumn.get(dc);
+        if (arr) arr.push(t); else tasksByDisplayColumn.set(dc, [t]);
       }
       const project = projects.find((p) => p.path === workdir);
+      const laneVisibleColumns = visibleDisplayColumns.filter(
+        (c) => (tasksByDisplayColumn.get(c.id)?.length ?? 0) > 0,
+      );
       return {
         workdir,
         label: project?.name || basename(workdir) || workdir,
         taskCount: laneTasks.length,
-        tasksByColumn,
+        tasksByDisplayColumn,
+        visibleColumns: laneVisibleColumns,
       };
     });
-  }, [visibleTasks, projects]);
+  }, [visibleTasks, projects, visibleDisplayColumns]);
 
   // Distinct harness ids referenced by any task — feeds the harness filter so
   // ids belonging to removed harnesses still show up as filter options.
@@ -924,8 +937,8 @@ export default function App() {
                       workdir={lane.workdir}
                       label={lane.label}
                       taskCount={lane.taskCount}
-                      visibleColumns={visibleColumns}
-                      tasksByColumn={lane.tasksByColumn}
+                      visibleColumns={lane.visibleColumns}
+                      tasksByColumn={lane.tasksByDisplayColumn}
                       tasksById={tasksById}
                       childCountsByParent={childCountsByParent}
                       onOpen={setSelected}

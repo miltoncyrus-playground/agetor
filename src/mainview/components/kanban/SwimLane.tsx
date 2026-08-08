@@ -3,18 +3,20 @@ import { ChevronDown, ChevronRight, FolderGit2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { readCollapsed, writeCollapsed } from "@/lib/panel-collapse";
-import type { ColumnId, Task } from "../../../shared/types.ts";
+import { displayColumnMeta, type DisplayColumnId } from "@/lib/display-columns";
+import type { Task } from "../../../shared/types.ts";
 import { Column } from "./Column";
 
 interface Props {
   workdir: string;
   label: string;
-  /** The columns to render, in board order — already filtered to the
-   *  board's `statusFilter` selection by the caller, same list every lane
-   *  gets (the "which columns are visible" control governs every
-   *  swimlane uniformly, not per-lane). */
-  visibleColumns: { id: ColumnId; label: string }[];
-  tasksByColumn: Map<ColumnId, Task[]>;
+  /** The columns to render, in board order — already filtered down to this
+   *  lane's OWN non-empty display columns by the caller (App.tsx's `lanes`
+   *  useMemo): a column with zero tasks in THIS project doesn't appear in
+   *  its row, even if another project's row still shows it (auto-hide is
+   *  per-lane, not board-wide). */
+  visibleColumns: { id: DisplayColumnId; label: string }[];
+  tasksByColumn: Map<DisplayColumnId, Task[]>;
   taskCount: number;
   tasksById: Map<string, Task>;
   childCountsByParent: Map<string, { merged: number; total: number }>;
@@ -60,6 +62,26 @@ export function SwimLane({
           {label}
         </h2>
         <Badge variant="outline">{taskCount}</Badge>
+        {/* Per-state breakdown, one chip per non-empty display column in
+            THIS lane — replaces what used to be just the flat total above,
+            so "where are we in the process" reads without expanding the
+            lane. Same dot-color language as TaskCard's state dot. */}
+        <div className="flex items-center gap-1.5">
+          {visibleColumns.map((c) => {
+            const count = tasksByColumn.get(c.id)?.length ?? 0;
+            if (count === 0) return null;
+            return (
+              <span
+                key={c.id}
+                className="flex items-center gap-1 text-[10px] text-muted-foreground"
+                title={`${count} ${c.label}`}
+              >
+                <span className={cn("size-1.5 shrink-0 rounded-full", displayColumnMeta(c.id).dotClass)} />
+                {count}
+              </span>
+            );
+          })}
+        </div>
       </button>
       {!collapsed && (
         <div className={cn("kanban-scroll overflow-x-auto")}>
@@ -70,6 +92,7 @@ export function SwimLane({
                 id={c.id}
                 droppableId={`${workdir}::${c.id}`}
                 label={c.label}
+                droppable={c.id !== "in-progress"}
                 tasks={tasksByColumn.get(c.id) ?? EMPTY_TASKS}
                 tasksById={tasksById}
                 childCountsByParent={childCountsByParent}
