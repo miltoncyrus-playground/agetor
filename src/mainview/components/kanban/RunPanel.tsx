@@ -28,6 +28,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
+  isActiveColumn,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -1458,12 +1459,12 @@ function RunPanelBody({
   const liveRun = liveRunId ? runs.find((r) => r.id === liveRunId) ?? null : null;
   const liveRunTerminal = !!liveRun && liveRun.status !== "running";
   const canControl = !!liveRunId
-    && (task.column === "running" || task.column === "blocked")
+    && (isActiveColumn(task.column) || task.column === "blocked")
     && !liveRunTerminal;
   // Archive gate mirrors TaskCard's `active` — running/blocked, regardless of
   // whether a live run row has been polled in yet, so Archive shows up as
   // soon as the board would call this task "active" too.
-  const active = task.column === "running" || task.column === "blocked";
+  const active = isActiveColumn(task.column) || task.column === "blocked";
   // codex/gemini excluded from the fallback — see the matching comment in
   // DiffDialog.tsx for why (both technically support taskId-scoped resume,
   // but this ad-hoc affordance stays claude-only pending a product call).
@@ -1860,11 +1861,11 @@ function RunPanelBody({
   // completion (only the orphan-reconciliation/error paths null it — see
   // the comment at `liveRunTerminal` above), so a non-null → null transition
   // never fires in the common case. `task.column` is authoritative instead.
-  const wasRunningForPrStatusRef = useRef(task.column === "running");
+  const wasRunningForPrStatusRef = useRef(isActiveColumn(task.column));
   useEffect(() => {
     const wasRunning = wasRunningForPrStatusRef.current;
-    wasRunningForPrStatusRef.current = task.column === "running";
-    if (!wasRunning || task.column === "running") return;
+    wasRunningForPrStatusRef.current = isActiveColumn(task.column);
+    if (!wasRunning || isActiveColumn(task.column)) return;
     const parsed = parsePrUrl(task.prUrl);
     if (!parsed) return;
     prStatusRetriesRef.current = 0;
@@ -2794,7 +2795,7 @@ function RunPanelBody({
                   modalPending
                     ? "Answer the prompt above — or type a message and Save it for later."
                     : canSend
-                    ? task.column === "running"
+                    ? isActiveColumn(task.column)
                       ? "Agent is working — your message will be added to the current turn. Type / for commands."
                       : task.column === "blocked"
                         ? "Answer the question, or send any follow-up. Type / for commands."

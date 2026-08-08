@@ -3,7 +3,7 @@ import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } f
 import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { COLUMNS, isActiveColumn, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
@@ -609,7 +609,7 @@ export default function App() {
     }
   }, [refresh, surfaceError]);
   const archive = useCallback(async (t: Task) => {
-    const active = t.column === "running" || t.column === "blocked";
+    const active = isActiveColumn(t.column) || t.column === "blocked";
     if (active) {
       const ok = await confirm({
         title: `Archive "${t.title}"?`,
@@ -781,10 +781,13 @@ export default function App() {
               // "Run task" creates the row in `ready` (so it's briefly visible in
               // that column even when the agent starts immediately afterward),
               // then asks the orchestrator to start it — which moves the card to
-              // `running`. "To backlog" just queues with no auto-start.
+              // `running`. "To backlog" just queues with no auto-start. A
+              // pipeline task's "ready" equivalent is "planning" — startTask
+              // already knows to read task.pipelineStage for the real column
+              // and stage prompt, so this is the only place that needs to know.
               const created = await api.createTask({
                 ...input,
-                column: start ? "ready" : "backlog",
+                column: start ? (input.pipeline ? "planning" : "ready") : "backlog",
               });
               // The server makes the branch unique within the repo, so the
               // pinned name can differ from what the sidebar showed (a

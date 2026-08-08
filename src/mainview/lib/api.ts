@@ -1065,6 +1065,10 @@ export const api = {
     column?: ColumnId;
     references?: TaskReference[];
     taskType?: TaskType;
+    /** Opt-in: create as a pipeline task (planning -> plan-review ->
+     *  building -> testing -> ready, auto-advancing). See CreateTaskInput
+     *  in orchestrator.ts. */
+    pipeline?: boolean;
   }) =>
     // retry: false — a replay would create a duplicate task + branch.
     j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),

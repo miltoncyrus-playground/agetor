@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
-import { taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { COLUMNS, isActiveColumn, PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
@@ -28,8 +28,12 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
-    // the user has to take the explicit unarchive action first.
-    disabled: archived,
+    // the user has to take the explicit unarchive action first. A pipeline
+    // task mid-flight (one of the 4 stage columns) is also undraggable — a
+    // human yanking it to another column mid-auto-advance would desync
+    // pipelineStage from column. Once it reaches blocked/ready/done it's a
+    // normal draggable card again.
+    disabled: archived || PIPELINE_STAGE_COLUMNS.includes(task.column),
   });
 
   const style = transform
@@ -45,7 +49,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   //  - Open once any run has reached succeeded/running/orphaned — there's
   //    something worth re-reading; Run stays reachable from inside the panel.
   //  - Run otherwise (no openable history yet, or only failed/cancelled).
-  const active = task.column === "running" || task.column === "blocked";
+  const active = isActiveColumn(task.column) || task.column === "blocked";
   const openable = task.hasOpenableRun;
   // Combine structured interactions with codex's narrative `blocked` signal.
   // The latter has no answerable payload — the user resolves it from the run
@@ -117,6 +121,31 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               >
                 <Bot className="size-3" />
                 {runningSubagents}
+              </Badge>
+            )}
+            {task.pipelineStage && (
+              <Badge
+                variant="outline"
+                className="gap-1 text-[10px]"
+                title={
+                  task.revisionCount > 0
+                    ? `Pipeline stage: ${task.pipelineStage} (revision ${task.revisionCount}/${PIPELINE_STAGE_COLUMNS.length + 1})`
+                    : `Pipeline stage: ${task.pipelineStage}`
+                }
+              >
+                {PIPELINE_STAGE_COLUMNS.includes(task.column) && (
+                  // Same green-pulsing-dot pattern used elsewhere for "agent
+                  // actively working" (RunPanel's SubagentTab/RunningIndicator)
+                  // — deliberately NOT the amber awaiting-pulse this card's
+                  // outer ring already uses, which means "waiting on a human,"
+                  // the opposite state.
+                  <span className="relative inline-flex size-1.5 shrink-0">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
+                    <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
+                  </span>
+                )}
+                {COLUMNS.find((c) => c.id === task.pipelineStage)?.label ?? task.pipelineStage}
+                {task.revisionCount > 0 && ` · rev ${task.revisionCount}`}
               </Badge>
             )}
           </div>

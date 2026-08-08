@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, ClipboardList, Code2, GitBranch, SlidersHorizontal } from "lucide-react";
+import { ChevronLeft, ChevronRight, ClipboardList, Code2, GitBranch, SlidersHorizontal, Workflow } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type BranchNamingConfig } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -74,6 +74,9 @@ interface Props {
       effort: string | null;
       references: TaskReference[];
       taskType: TaskType;
+      /** Opt-in: create as a pipeline task (see isPipeline's declaration
+       *  below). Matches CreateTaskInput.pipeline's name exactly server-side. */
+      pipeline: boolean;
     },
     options: { start: boolean },
   ) => void;
@@ -127,6 +130,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   // persisted list.
   const [workdir, setWorkdir] = useState("");
   const [isolate, setIsolate] = useState(true);
+  // Requires isolation: a pipeline task needs the SAME worktree/branch
+  // stable across all 4 auto-advancing stages, which is exactly what
+  // isolation already provides — pipeline without it has no coherent
+  // meaning. Unchecking isolate clears pipeline too (effect below).
+  const [isPipeline, setIsPipeline] = useState(false);
   const [baseRef, setBaseRef] = useState("");
   // Branch nomenclature for the selected project (loaded from the server;
   // falls back to the built-in defaults). While clean (`!branchDirty`), the
@@ -413,6 +421,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
         effort,
         references,
         taskType,
+        pipeline: isPipeline,
       },
       { start },
     );
@@ -429,6 +438,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     setBaseRef("");
     setReferences([]);
     setDropHint(null);
+    // A fresh form defaults back to non-pipeline — pipeline is a deliberate
+    // per-task opt-in, never sticky across tasks the way workdir/model/mode
+    // are.
+    setIsPipeline(false);
     // Reset the branch field so the next task re-derives from its (now empty)
     // title and gets a fresh unique token; drop any manual override.
     setBranchDirty(false);
@@ -440,6 +453,22 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const isolateTitle =
     "Runs the agent on a dedicated branch off the chosen base, so parallel tasks "
     + "on the same repo don't collide. No-op when the workdir isn't a git repo.";
+
+  // Isolation is a hard requirement for pipeline mode (see isPipeline's
+  // declaration above) — if the user turns isolation off after having
+  // checked pipeline, uncheck pipeline too rather than leaving it in a
+  // state that has no real meaning.
+  useEffect(() => {
+    if (!isolate && isPipeline) setIsPipeline(false);
+  }, [isolate, isPipeline]);
+
+  const pipelineTitle =
+    "Automatically walks this task through 4 stages with no click between "
+    + "them — Planning, Plan Review, Building, Testing — each running the "
+    + "same agent with a different prompt, looping revisions between "
+    + "Plan Review/Planning and Testing/Building until both approve or the "
+    + "revision budget runs out. Requires isolation (worktree) — the same "
+    + "worktree/branch has to persist across every stage.";
 
   // Sidebar-wide drag/drop — anything dropped on the form (not just the
   // ReferencesPicker) gets added to the references list. The inner picker
@@ -692,6 +721,23 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                 />
                 <GitBranch className="size-3" />
                 <span>Isolate (worktree)</span>
+              </label>
+
+              <label
+                className={cn(
+                  "flex items-center gap-1.5",
+                  isolate ? "cursor-pointer" : "cursor-not-allowed text-muted-foreground/60",
+                )}
+                title={pipelineTitle}
+              >
+                <input
+                  type="checkbox"
+                  checked={isPipeline}
+                  disabled={!isolate}
+                  onChange={(e) => setIsPipeline(e.target.checked)}
+                />
+                <Workflow className="size-3" />
+                <span>Run as pipeline</span>
               </label>
 
               {isolate && (
