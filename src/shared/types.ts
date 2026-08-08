@@ -2064,7 +2064,14 @@ export type GlobalEvent =
        *  than the generic "waiting on you" used for permission prompts.
        *  Unset for transitions whose reason is fully implied by the
        *  (prev, column) pair (e.g. plain success → review). */
-      reason?: "api-error" | "approval" | "session-died" | "unknown-command";
+      reason?:
+        | "api-error" | "approval" | "session-died" | "unknown-command"
+        // Pipeline-task-only reasons (see orchestrator.ts's advancePipelineStage):
+        // "stage-advance" — normal forward/back move between pipeline stages.
+        // "revision-cap" — hit PIPELINE_REVISION_CAP, landed on blocked.
+        // "pipeline-failed" — a verdict-bearing stage produced no parseable
+        //   PIPELINE_VERDICT, or a planning stage didn't write PLAN.md.
+        | "stage-advance" | "revision-cap" | "pipeline-failed";
     }
   | {
       kind: "update";

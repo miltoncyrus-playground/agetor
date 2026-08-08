@@ -113,8 +113,15 @@ import type {
   WorktreeStaleReason,
   WorktreeTeardownResult,
 } from "../shared/types.ts";
-import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
+import { WORKTREE_STALE_AFTER_MS, PIPELINE_REVISION_CAP, PIPELINE_STAGE_COLUMNS, isActiveColumn } from "../shared/types.ts";
 import { appendReferences } from "../shared/refs.ts";
+import {
+  PIPELINE_PLAN_FILE,
+  parsePipelineVerdict,
+  stagePrompt,
+  type PlanReviewVerdict,
+  type TestingVerdict,
+} from "./pipeline-prompts.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -347,7 +354,7 @@ function updateColumn(
   taskId: string,
   runId: string | null,
   next: ColumnId,
-  reason?: "api-error" | "approval" | "session-died" | "unknown-command",
+  reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "stage-advance" | "revision-cap" | "pipeline-failed",
 ): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
@@ -370,7 +377,7 @@ function updateColumn(
  * redundant `tasks.get`.
  */
 function isTaskHeldByBackgroundAgents(task: Task): boolean {
-  if (task.column !== "running" || task.runId == null) return false;
+  if (!isActiveColumn(task.column) || task.runId == null) return false;
   if (runs.get(task.runId)?.status !== "succeeded") return false;
   return subagents.hasRunning(task.id);
 }
@@ -381,19 +388,30 @@ function isHeldByBackgroundAgents(taskId: string): boolean {
 }
 
 /**
- * Flip a held task to `review` once its last subagent finishes. Called on
- * every subagent completion (via the settle hook), so it must be cheap and
- * safe to call repeatedly — it no-ops unless the task is still held-and-clear:
- * the user hasn't moved the card, the terminal run still succeeded, and no
- * subagent is left running. A newer in-flight run (status !== succeeded) also
- * bails, so a held release can't stomp a follow-up turn's `running` state.
+ * Flip a held task to `review` (or, for a pipeline task, advance its stage)
+ * once its last subagent finishes. Called on every subagent completion (via
+ * the settle hook), so it must be cheap and safe to call repeatedly — it
+ * no-ops unless the task is still held-and-clear: the user hasn't moved the
+ * card, the terminal run still succeeded, and no subagent is left running. A
+ * newer in-flight run (status !== succeeded) also bails, so a held release
+ * can't stomp a follow-up turn's `running` state.
+ *
+ * The held run's own terminal status is already known to be `"succeeded"`
+ * (checked above) — so for a pipeline task, `advancePipelineStage` gets the
+ * same `{kind:"success"}` outcome `attachDoneHandler` would have computed
+ * for this run had it not been held, deferred only by however long the
+ * subagents took to finish.
  */
 function maybeReleaseHeldTask(taskId: string): void {
   const task = tasks.get(taskId);
-  if (!task || task.column !== "running" || task.runId == null) return;
+  if (!task || !isActiveColumn(task.column) || task.runId == null) return;
   if (runs.get(task.runId)?.status !== "succeeded") return;
   if (subagents.hasRunning(taskId)) return;
-  updateColumn(taskId, task.runId, "review");
+  if (task.pipelineStage != null) {
+    advancePipelineStage(taskId, task.runId, { kind: "success" });
+  } else {
+    updateColumn(taskId, task.runId, "review");
+  }
 }
 
 /**
@@ -409,7 +427,11 @@ function maybeReleaseHeldTask(taskId: string): void {
  * shape: the visible turn finished, background work continued after it).
  * Never pulls from `done`/`blocked`/`ready`/`backlog` — those encode user
  * intent or an error state the discovery of a background agent must not
- * override.
+ * override. Not pipeline-aware on purpose: a pipeline task never sits in
+ * `review` (its "held" states use the 4 stage columns, handled instead by
+ * `isTaskHeldByBackgroundAgents`/`maybeReleaseHeldTask` above), so this
+ * function's own `column === "review"` guard already excludes it — no
+ * separate pipeline branch needed here.
  */
 function pullBackParkedTask(taskId: string): void {
   const task = tasks.get(taskId);
@@ -547,7 +569,7 @@ export function reconcileOrphans(): number {
   ).all();
 
   const reattachedTaskIds = new Set<string>();
-  const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null }[] = [];
+  const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null; isPipeline: boolean }[] = [];
 
   for (const row of stale) {
     const task = tasks.get(row.task_id);
@@ -639,7 +661,7 @@ export function reconcileOrphans(): number {
       // session and fall through to orphan marking.
       killSessionByName(row.tmux_session as string);
     }
-    orphaned.push({ id: row.id, task_id: row.task_id, prevColumn });
+    orphaned.push({ id: row.id, task_id: row.task_id, prevColumn, isPipeline: task?.pipelineStage != null });
   }
 
   const now = Date.now();
@@ -654,9 +676,17 @@ export function reconcileOrphans(): number {
           `INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, ?, ?, ?)`,
           [row.id, "status", "orphaned — agetor restarted while this run was active", now],
         );
+        // A pipeline task orphaned mid-stage lands on `blocked`, not `ready`
+        // — nothing auto-resumes a bare `ready` pipeline task the way a
+        // plain task's Run button does, so `blocked` is where a human is
+        // actually expected to look. `WHERE "column" = ?` matches whatever
+        // column the row was actually in (`running` for an ordinary task,
+        // one of the 4 stage columns for a pipeline one) rather than
+        // hardcoding "running", so a pipeline row isn't silently skipped.
+        const targetColumn: ColumnId = row.isPipeline ? "blocked" : "ready";
         db.run(
-          `UPDATE tasks SET "column" = 'ready', run_id = NULL WHERE id = ? AND "column" = 'running'`,
-          [row.task_id],
+          `UPDATE tasks SET "column" = ?, run_id = NULL WHERE id = ? AND "column" = ?`,
+          [targetColumn, row.task_id, row.prevColumn],
         );
       }
     });
@@ -669,8 +699,9 @@ export function reconcileOrphans(): number {
         status: "orphaned",
         ts: now,
       });
-      if (row.prevColumn === "running") {
-        emitGlobal({ kind: "column", taskId: row.task_id, runId: null, column: "ready", prev: row.prevColumn, ts: now });
+      if (row.prevColumn != null && (row.prevColumn === "running" || PIPELINE_STAGE_COLUMNS.includes(row.prevColumn))) {
+        const targetColumn: ColumnId = row.isPipeline ? "blocked" : "ready";
+        emitGlobal({ kind: "column", taskId: row.task_id, runId: null, column: targetColumn, prev: row.prevColumn, ts: now });
       }
     }
   }
@@ -841,12 +872,17 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   const runId = randomUUID();
   const now = Date.now();
   const prevColumn: ColumnId = task.column;
+  // A pipeline task's "running" column IS its current stage — startTask is
+  // what actually spawns each stage's turn (called directly for the first
+  // stage, and again by advancePipelineStage for every stage after). An
+  // ordinary task keeps the plain "running" column.
+  const startColumn: ColumnId = task.pipelineStage ?? "running";
 
   // Single transaction: flip the task into running with the new run id, branch,
   // worktree path; insert the run row. Either everything sticks or nothing does.
   const persist = db.transaction(() => {
     tasks.update(taskId, {
-      column: "running",
+      column: startColumn,
       branch: prepared.branch,
       worktreePath: prepared.worktreePath,
       runId,
@@ -871,11 +907,18 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     });
   });
   persist();
-  if (prevColumn !== "running") {
-    emitGlobal({ kind: "column", taskId, runId, column: "running", prev: prevColumn, ts: now });
+  if (prevColumn !== startColumn) {
+    emitGlobal({ kind: "column", taskId, runId, column: startColumn, prev: prevColumn, ts: now });
   }
 
-  const promptWithRefs = appendReferences(task.prompt, task.references);
+  // A pipeline task's turn text is the current stage's prompt template
+  // (which already folds task.prompt — the ticket — back in), not the raw
+  // ticket alone. Still runs through appendReferences for user-attached
+  // file refs either way.
+  const promptWithRefs = appendReferences(
+    task.pipelineStage ? stagePrompt(task, task.pipelineStage) : task.prompt,
+    task.references,
+  );
 
   const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
   // Echo the initial prompt as a "user" event so the panel renders a
@@ -1088,6 +1131,14 @@ function attachDoneHandler(
             data: `background agents still running (${runningCount}) — holding in running`,
             ts: Date.now(),
           });
+        } else if (task.pipelineStage != null) {
+          const outcome: PipelineOutcome = wasCancelled
+            ? { kind: "cancelled" }
+            : wasApiError ? { kind: "hard-failure", reason: "api-error" }
+            : wasSessionDied ? { kind: "hard-failure", reason: "session-died" }
+            : wasUnknownCommand ? { kind: "hard-failure", reason: "unknown-command" }
+            : { kind: "success" };
+          advancePipelineStage(taskId, runId, outcome);
         } else {
           // Cancellation wins over api-error here, matching the newStatus
           // resolution above — a user-cancelled run shouldn't land in
@@ -1125,11 +1176,23 @@ function attachDoneHandler(
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
-        // A session-death / unknown-command that reaches the reject path (not
-        // the case today — both drivers resolve on these — but keep the
-        // column consistent with the resolve path if a future refactor ever
-        // rejects instead).
-        updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
+        if (task.pipelineStage != null) {
+          const outcome: PipelineOutcome = wasCancelled
+            ? { kind: "cancelled" }
+            : wasSessionDied ? { kind: "hard-failure", reason: "session-died" }
+            : wasUnknownCommand ? { kind: "hard-failure", reason: "unknown-command" }
+            // A bare rejection with none of the sentinel flags set isn't
+            // meant to happen today (see the comment below) — a genuinely
+            // unexpected internal error, not any of the three known causes.
+            : { kind: "hard-failure", reason: "pipeline-failed" };
+          advancePipelineStage(taskId, runId, outcome);
+        } else {
+          // A session-death / unknown-command that reaches the reject path (not
+          // the case today — both drivers resolve on these — but keep the
+          // column consistent with the resolve path if a future refactor ever
+          // rejects instead).
+          updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
+        }
       }
       emit({
         runId,
@@ -1146,6 +1209,186 @@ function attachDoneHandler(
       drainCodexQueue(taskId);
       drainGeminiQueue(taskId);
     });
+}
+
+/** Outcome of a pipeline stage's terminal run, as `advancePipelineStage`'s
+ *  callers already have it computed (the same booleans `attachDoneHandler`
+ *  itself derives from the run handle). */
+type PipelineOutcome =
+  | { kind: "success" }
+  | { kind: "cancelled" }
+  | { kind: "hard-failure"; reason: "api-error" | "session-died" | "unknown-command" | "pipeline-failed" };
+
+/** Read a run's LAST main-stream (non-subagent) assistant message and parse
+ *  it for the PIPELINE_VERDICT sentinel. `{ ok: false }` when the run has no
+ *  assistant output at all (shouldn't happen for a real turn, but a fake
+ *  driver or a crash-before-first-token run could hit this). */
+function lastPipelineVerdict(runId: string, stage: "plan-review"): PlanReviewVerdict;
+function lastPipelineVerdict(runId: string, stage: "testing"): TestingVerdict;
+function lastPipelineVerdict(
+  runId: string,
+  stage: "plan-review" | "testing",
+): PlanReviewVerdict | TestingVerdict {
+  const events = runs.events(runId);
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.stream === "assistant" && e.subagentId == null) {
+      return stage === "plan-review"
+        ? parsePipelineVerdict("plan-review", e.data)
+        : parsePipelineVerdict("testing", e.data);
+    }
+  }
+  return { ok: false };
+}
+
+/**
+ * Advance (or block) a pipeline task once its current stage's terminal run
+ * has resolved. Called from `attachDoneHandler` in place of the plain
+ * `nextColumn` ternary whenever `task.pipelineStage != null`. No-ops if the
+ * task vanished, isn't a pipeline task, or `task.runId !== runId` (a
+ * superseded run) — callers already guard on the latter via `isTerminalRun`
+ * before invoking this, but it's re-checked here since this function can
+ * also be reached from `maybeReleaseHeldTask`'s release path.
+ *
+ * A hard failure or cancellation always lands on `blocked` with
+ * `pipelineStage` left exactly where it was, so a human sees precisely
+ * where the run died and can manually re-`startTask` the same stage to
+ * retry. Everything else is per-stage:
+ *   - planning success: requires PLAN.md to exist in the worktree (a cheap
+ *     safety net, not a hard spec requirement) before advancing.
+ *   - plan-review: parses the Critic's verdict off the run's last assistant
+ *     message. approve → planApproved=true, advance to building (or
+ *     straight to ready if implementationApproved was already true from an
+ *     earlier pass). revise → bump the shared revision counter; over cap →
+ *     blocked; under cap → back to planning with the reason folded into
+ *     pipelineFeedback.
+ *   - building success: not verdict-bearing, straight to testing.
+ *   - testing: same verdict shape. pass → implementationApproved=true,
+ *     straight to ready (planApproved is true by construction — testing is
+ *     only reachable after an approved plan). fail → same cap arithmetic,
+ *     bounce target is building (not planning).
+ *
+ * The `startTask` call for the next stage is fired-and-forgotten
+ * (`void ...catch(...)`), never awaited — it must not block the caller's
+ * own `emit`/`emitGlobal`/`drainCodexQueue`/`drainGeminiQueue` tail calls,
+ * matching the existing "must never derail run settlement" treatment
+ * `pumpWatcherForHoldCheck` already gets a few lines up in
+ * `attachDoneHandler`. A `startTask` failure (harness unavailable, etc.)
+ * has no other path to the user, so it's caught here and landed on
+ * `blocked` itself.
+ */
+function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOutcome): void {
+  const task = tasks.get(taskId);
+  if (!task || task.pipelineStage == null || task.runId !== runId) return;
+
+  if (outcome.kind !== "success") {
+    updateColumn(taskId, runId, "blocked", outcome.kind === "hard-failure" ? outcome.reason : undefined);
+    return;
+  }
+
+  // Move to `nextStage`, persisting `patch` first so `startTask` (which
+  // re-reads the task row) picks up the new stage's prompt and, on a
+  // resume, the new pipelineFeedback. If the task was paused, the column
+  // still lands on the target stage (so the card reflects where it's
+  // "at"), but no run is spawned — advancePipelineStage will fire again
+  // once POST /tasks/:id/pipeline-resume calls startTask directly.
+  const spawnStage = (nextStage: NonNullable<Task["pipelineStage"]>, patch: Partial<Task> = {}) => {
+    tasks.update(taskId, { pipelineStage: nextStage, ...patch });
+    updateColumn(taskId, runId, nextStage, "stage-advance");
+    if (tasks.get(taskId)?.pausedAt != null) return;
+    void startTask(taskId).catch((err) => {
+      console.error(`[agetor] pipeline auto-advance failed for task ${taskId} (stage ${nextStage}):`, err);
+      // Nothing else surfaces a startTask failure here — land it on
+      // blocked ourselves so the task doesn't silently stall.
+      if (tasks.get(taskId)?.runId == null) {
+        updateColumn(taskId, null, "blocked", "pipeline-failed");
+      }
+    });
+  };
+
+  const bounceOrBlock = (
+    targetStage: NonNullable<Task["pipelineStage"]>,
+    reason: string,
+    resetPatch: Partial<Task>,
+  ) => {
+    const revisionCount = task.revisionCount + 1;
+    if (revisionCount > PIPELINE_REVISION_CAP) {
+      tasks.update(taskId, { revisionCount });
+      emit({
+        runId, taskId, stream: "status",
+        data: `revision cap (${PIPELINE_REVISION_CAP}) reached — ${reason}`,
+        ts: Date.now(),
+      });
+      updateColumn(taskId, runId, "blocked", "revision-cap");
+      return;
+    }
+    spawnStage(targetStage, { revisionCount, pipelineFeedback: reason, ...resetPatch });
+  };
+
+  switch (task.pipelineStage) {
+    case "planning": {
+      const planPath = join(task.worktreePath ?? task.workdir, PIPELINE_PLAN_FILE);
+      if (!existsSync(planPath)) {
+        emit({
+          runId, taskId, stream: "status",
+          data: `${PIPELINE_PLAN_FILE} was not found in the worktree — cannot advance to plan-review`,
+          ts: Date.now(),
+        });
+        updateColumn(taskId, runId, "blocked", "pipeline-failed");
+        return;
+      }
+      spawnStage("plan-review", { pipelineFeedback: null });
+      return;
+    }
+    case "plan-review": {
+      const verdict = lastPipelineVerdict(runId, "plan-review");
+      if (!verdict.ok) {
+        emit({
+          runId, taskId, stream: "status",
+          data: "no PIPELINE_VERDICT found in the Critic's response — cannot advance",
+          ts: Date.now(),
+        });
+        updateColumn(taskId, runId, "blocked", "pipeline-failed");
+        return;
+      }
+      if (verdict.kind === "approve") {
+        tasks.update(taskId, { planApproved: true, pipelineFeedback: null });
+        if (tasks.get(taskId)?.implementationApproved) {
+          updateColumn(taskId, runId, "ready", "stage-advance");
+          return;
+        }
+        spawnStage("building");
+        return;
+      }
+      bounceOrBlock("planning", verdict.reason, { planApproved: false });
+      return;
+    }
+    case "building": {
+      spawnStage("testing", { pipelineFeedback: null });
+      return;
+    }
+    case "testing": {
+      const verdict = lastPipelineVerdict(runId, "testing");
+      if (!verdict.ok) {
+        emit({
+          runId, taskId, stream: "status",
+          data: "no PIPELINE_VERDICT found in the Tester's response — cannot advance",
+          ts: Date.now(),
+        });
+        updateColumn(taskId, runId, "blocked", "pipeline-failed");
+        return;
+      }
+      if (verdict.kind === "pass") {
+        tasks.update(taskId, { implementationApproved: true, pipelineFeedback: null });
+        // planApproved is true by construction here — testing is only
+        // reachable after an approved plan (see the plan-review case above).
+        updateColumn(taskId, runId, "ready", "stage-advance");
+        return;
+      }
+      bounceOrBlock("building", verdict.reason, { implementationApproved: false });
+      return;
+    }
+  }
 }
 
 /**

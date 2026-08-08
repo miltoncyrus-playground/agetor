@@ -24,10 +24,16 @@ export const PIPELINE_PLAN_FILE = "PLAN.md";
  */
 export const PIPELINE_VERDICT_PREFIX = "PIPELINE_VERDICT:";
 
-/** Result of parsing a verdict-bearing stage's last assistant message. */
-export type PipelineVerdict =
-  | { ok: true; kind: "approve" | "pass" }
-  | { ok: true; kind: "revise" | "fail"; reason: string }
+/** Result of parsing the Critic's (plan-review) verdict. */
+export type PlanReviewVerdict =
+  | { ok: true; kind: "approve" }
+  | { ok: true; kind: "revise"; reason: string }
+  | { ok: false };
+
+/** Result of parsing the Tester's (testing) verdict. */
+export type TestingVerdict =
+  | { ok: true; kind: "pass" }
+  | { ok: true; kind: "fail"; reason: string }
   | { ok: false };
 
 const APPROVE_KEYWORDS: Record<"plan-review" | "testing", { ok: string; bounce: string }> = {
@@ -42,11 +48,18 @@ const APPROVE_KEYWORDS: Record<"plan-review" | "testing", { ok: string; bounce: 
  * blank line or closing remark after the sentinel doesn't break the match;
  * if the sentinel appears more than once, the LAST occurrence wins (an
  * agent correcting itself mid-message should have the final word).
+ *
+ * Overloaded per stage so a caller that already knows `stage` gets a
+ * verdict type narrowed to that stage's own keywords (`approve`/`revise` vs
+ * `pass`/`fail`) — accessing `.reason` on the bounce branch doesn't need a
+ * runtime `"reason" in verdict` guard at the call site.
  */
+export function parsePipelineVerdict(stage: "plan-review", text: string): PlanReviewVerdict;
+export function parsePipelineVerdict(stage: "testing", text: string): TestingVerdict;
 export function parsePipelineVerdict(
   stage: "plan-review" | "testing",
   text: string,
-): PipelineVerdict {
+): PlanReviewVerdict | TestingVerdict {
   const { ok, bounce } = APPROVE_KEYWORDS[stage];
   const lines = text.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -54,14 +67,14 @@ export function parsePipelineVerdict(
     if (!line.startsWith(PIPELINE_VERDICT_PREFIX)) continue;
     const rest = line.slice(PIPELINE_VERDICT_PREFIX.length).trim();
     const lower = rest.toLowerCase();
-    if (lower === ok) return { ok: true, kind: ok as "approve" | "pass" };
+    if (lower === ok) return { ok: true, kind: ok } as PlanReviewVerdict | TestingVerdict;
     if (lower === bounce || lower.startsWith(`${bounce} `)) {
       const reason = rest.slice(bounce.length).trim();
       return {
         ok: true,
-        kind: bounce as "revise" | "fail",
+        kind: bounce,
         reason: reason || "(no reason given)",
-      };
+      } as PlanReviewVerdict | TestingVerdict;
     }
     // Prefix matched but the keyword didn't — malformed sentinel, not a
     // silent miss. Treat as unparseable rather than guessing which way.
