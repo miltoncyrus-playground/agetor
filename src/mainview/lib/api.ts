@@ -386,6 +386,8 @@ export const api = {
     }),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  renameProject: (p: string, name: string) =>
+    j<Project>("/projects", { method: "PATCH", body: JSON.stringify({ path: p, name }) }),
   /** Per-project branch nomenclature. GET resolves to built-in defaults when the
    *  project has no stored config, so the form always gets a usable shape. */
   getProjectBranchConfig: (p: string) =>

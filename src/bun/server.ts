@@ -511,6 +511,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               : path.basename(p) || p;
           return json(projects.upsert(p, name), { headers: corsHeaders(req) });
         }),
+        PATCH: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: unknown; name?: unknown };
+          const p = typeof body.path === "string" ? body.path.trim() : "";
+          const name = typeof body.name === "string" ? body.name.trim() : "";
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+          const updated = projects.rename(p, name);
+          if (!updated) return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
+          return json(updated, { headers: corsHeaders(req) });
+        }),
         DELETE: authed(async (req) => {
           const { path: p } = (await req.json().catch(() => ({}))) as { path?: string };
           if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });

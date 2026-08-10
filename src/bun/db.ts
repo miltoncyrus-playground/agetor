@@ -462,6 +462,16 @@ export const projects = {
     );
     return this.get(path);
   },
+  /**
+   * Update a project's display name. Returns the refreshed row, or null if the
+   * project isn't registered. `upsert` can't do this — it only refreshes
+   * added_at on conflict, deliberately, so re-picking a project never clobbers
+   * its name/config.
+   */
+  rename(path: string, name: string): Project | null {
+    db.run(`UPDATE projects SET name = ? WHERE path = ?`, [name, path]);
+    return this.get(path);
+  },
   delete(path: string) {
     db.run(`DELETE FROM projects WHERE path = ?`, [path]);
   },

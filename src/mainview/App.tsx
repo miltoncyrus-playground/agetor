@@ -11,6 +11,7 @@ import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } fr
 import { KanbanFilters, basename } from "@/components/kanban/KanbanFilters";
 import { SwimLane } from "@/components/kanban/SwimLane";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
+import { ProjectsSidebar } from "@/components/kanban/ProjectsSidebar";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
@@ -949,6 +950,10 @@ export default function App() {
             </DndContext>
           </div>
         </main>
+        <ProjectsSidebar
+          projects={projects}
+          onChanged={() => { void api.listProjects().then(setProjects).catch(() => {}); }}
+        />
       </div>
       <RunPanel
         task={selected}
