@@ -857,6 +857,10 @@ export default function App() {
         </div>
       </header>
       <div className="flex min-h-0 flex-1">
+        <ProjectsSidebar
+          projects={projects}
+          onChanged={() => { void api.listProjects().then(setProjects).catch(() => {}); }}
+        />
         <NewTaskForm
           agents={agents}
           harnesses={harnesses}
@@ -950,10 +954,6 @@ export default function App() {
             </DndContext>
           </div>
         </main>
-        <ProjectsSidebar
-          projects={projects}
-          onChanged={() => { void api.listProjects().then(setProjects).catch(() => {}); }}
-        />
       </div>
       <RunPanel
         task={selected}
