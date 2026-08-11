@@ -883,6 +883,40 @@ export function resumeInFlightBuilds(): number {
   return parents.length;
 }
 
+/**
+ * Pipeline stages where the agent only reads and judges — it produces no
+ * artifact of its own. Running these on Opus wastes budget; Sonnet handles
+ * them reliably at a fraction of the cost.
+ */
+const PIPELINE_VERDICT_STAGES = new Set<NonNullable<Task["pipelineStage"]>>([
+  "plan-review",
+  "code-review",
+  "testing",
+]);
+const PIPELINE_VERDICT_MODEL = "sonnet-5";
+
+/**
+ * Model to use for this specific run. For claude-code pipeline tasks in
+ * verdict-only stages (plan-review, code-review, testing) we tier down to
+ * Sonnet — those stages read and judge, they don't generate original
+ * artifacts. All other paths return task.model unchanged.
+ *
+ * Exported so the model selection is directly unit-testable.
+ */
+export function resolveRunModel(
+  task: Task,
+  harnessKind: AgentKind,
+): string | null | undefined {
+  if (
+    harnessKind === "claude-code" &&
+    task.pipelineStage != null &&
+    PIPELINE_VERDICT_STAGES.has(task.pipelineStage)
+  ) {
+    return PIPELINE_VERDICT_MODEL;
+  }
+  return task.model;
+}
+
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
@@ -1024,14 +1058,18 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
         ? { codexSessionId: sessionId }
         : { geminiSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: task.model, effort: task.effort },
+    opts: { mode: task.mode, model: resolveRunModel(task, harness.kind), effort: task.effort },
   });
   registerActiveRun(runId, taskId, task, agent);
+  const runModel = resolveRunModel(task, harness.kind);
+  const modelNote = runModel !== task.model
+    ? `${runModel ?? "—"} (stage override; task default ${task.model ?? "—"})`
+    : (runModel ?? "—");
   emit({
     runId,
     taskId,
     stream: "status",
-    data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? "auto"}`,
+    data: `started — ${prepared.note} — agent=${task.agent}, model=${modelNote}, mode=${task.mode ?? "auto"}`,
     ts: now,
   });
 

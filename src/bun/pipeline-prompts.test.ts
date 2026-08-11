@@ -387,3 +387,67 @@ test("stagePrompt: analyze returns empty string (no agent turn)", () => {
   const p = stagePrompt(task({ pipelineStage: "analyze" }), "analyze");
   expect(p).toBe("");
 });
+
+// --- S3: ticket block only in early stages ------------------------------------
+
+test("stagePrompt: specify embeds ticket (early stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "specify" }), "specify");
+  expect(p).toContain("Add a dark mode toggle to settings.");
+});
+
+test("stagePrompt: clarify embeds ticket (early stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "clarify" }), "clarify");
+  expect(p).toContain("Add a dark mode toggle to settings.");
+});
+
+test("stagePrompt: planning embeds ticket (early stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "planning" }), "planning");
+  expect(p).toContain("Add a dark mode toggle to settings.");
+});
+
+test("stagePrompt: plan-review embeds ticket (early stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "plan-review" }), "plan-review");
+  expect(p).toContain("Add a dark mode toggle to settings.");
+});
+
+test("stagePrompt: decompose does NOT embed the raw ticket (late stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
+  expect(p).not.toContain("Add a dark mode toggle to settings.");
+  expect(p).not.toContain("## Original ticket");
+});
+
+test("stagePrompt: building does NOT embed the raw ticket (late stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "building" }), "building");
+  expect(p).not.toContain("Add a dark mode toggle to settings.");
+  expect(p).not.toContain("## Original ticket");
+});
+
+test("stagePrompt: code-review does NOT embed the raw ticket (late stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "code-review", baseRef: "abc123" }), "code-review");
+  expect(p).not.toContain("Add a dark mode toggle to settings.");
+  expect(p).not.toContain("## Original ticket");
+});
+
+test("stagePrompt: testing does NOT embed the raw ticket (late stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "testing", branch: "feature/dark-mode" }), "testing");
+  expect(p).not.toContain("Add a dark mode toggle to settings.");
+  expect(p).not.toContain("## Original ticket");
+});
+
+// --- S4: compact verdict prompts ----------------------------------------------
+
+test("stagePrompt: plan-review requests bullet-point output, not paragraphs", () => {
+  const p = stagePrompt(task({ pipelineStage: "plan-review" }), "plan-review");
+  expect(p).toContain("bullet");
+  expect(p.toLowerCase()).toContain("concise");
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} approve`);
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} revise`);
+});
+
+test("stagePrompt: code-review requests bullet-point output, not paragraphs", () => {
+  const p = stagePrompt(task({ pipelineStage: "code-review", baseRef: "abc123" }), "code-review");
+  expect(p).toContain("bullet");
+  expect(p.toLowerCase()).toContain("concise");
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} approve`);
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} revise`);
+});

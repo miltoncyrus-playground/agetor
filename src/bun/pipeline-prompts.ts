@@ -416,13 +416,13 @@ function planReviewPrompt(task: Task): string {
     `- Is anything it proposes likely to break something else?\n` +
     `- If ${PIPELINE_CONSTITUTION_FILE} exists, does it violate any project principles?\n\n` +
     `Do not write or change any files yourself; this is a review, not an implementation pass.\n\n` +
-    `End your final message with exactly one line, in exactly this form:\n` +
+    `Be concise — write at most three bullet points (one per check above: AC coverage, ` +
+    `approach soundness, constitution), then end with exactly one line in this form:\n` +
     `${PIPELINE_VERDICT_PREFIX} approve\n` +
     `— if the plan is ready to build — or:\n` +
-    `${PIPELINE_VERDICT_PREFIX} revise <one-paragraph reason>\n` +
-    `— if it needs another pass, explaining concretely what's wrong or missing so the ` +
-    `Planner can fix it. Nothing else you write is parsed — only this line decides what ` +
-    `happens next, so make sure it's the literal last line of your message.\n\n${ticketBlock(task)}`
+    `${PIPELINE_VERDICT_PREFIX} revise <reason in ≤20 words>\n` +
+    `— if it needs another pass. No prose paragraphs. Nothing else you write is parsed — ` +
+    `only this line decides what happens next, so make sure it's the literal last line.\n\n${ticketBlock(task)}`
   );
 }
 
@@ -466,7 +466,7 @@ function decomposePrompt(task: Task): string {
     `The commit is required: each subtask's own agent will work in a separate git worktree ` +
     `branched off this branch, and can only see files that have actually been committed ` +
     `here, not ones left as uncommitted working-tree edits.\n\n` +
-    `When done, stop — do not ask a question, do not wait for confirmation.\n\n${ticketBlock(task)}`
+    `When done, stop — do not ask a question, do not wait for confirmation.`
   );
 }
 
@@ -485,7 +485,7 @@ function buildingPrompt(task: Task): string {
     `intent — don't redesign the approach. A Tester agent will run linters/typecheck/tests ` +
     `against your changes next. ` +
     `When you're done, stop — do not ask a question, do not wait for confirmation, do not ` +
-    `commit anything (a later stage handles that).${feedback}\n\n${ticketBlock(task)}`
+    `commit anything (a later stage handles that).${feedback}`
   );
 }
 
@@ -547,13 +547,13 @@ function codeReviewPrompt(task: Task): string {
     `every AC-N in ${PIPELINE_SPEC_FILE} at a code level? (3) code quality — correctness, ` +
     `no obvious regressions. Do not write or change any files yourself, and do not run the ` +
     `test suite or linters — a Tester agent does that next.\n\n` +
-    `End your final message with exactly one line, in exactly this form:\n` +
+    `Be concise — write at most three bullet points (one per check above: diff vs PLAN.md, ` +
+    `diff vs SPEC.md AC items, code quality), then end with exactly one line in this form:\n` +
     `${PIPELINE_VERDICT_PREFIX} approve\n` +
     `— if the implementation is ready to test — or:\n` +
-    `${PIPELINE_VERDICT_PREFIX} revise <one-paragraph reason>\n` +
-    `— if something needs to change first, explaining concretely what and why so the ` +
-    `Builder can fix it. Nothing else you write is parsed — only this line decides what ` +
-    `happens next, so make sure it's the literal last line of your message.\n\n${ticketBlock(task)}`
+    `${PIPELINE_VERDICT_PREFIX} revise <reason in ≤20 words>\n` +
+    `— if something needs to change first. No prose paragraphs. Nothing else you write is ` +
+    `parsed — only this line decides what happens next, so make sure it's the literal last line.`
   );
 }
 
@@ -581,15 +581,17 @@ function testingPrompt(task: Task): string {
     `${PIPELINE_VERDICT_PREFIX} fail <one-paragraph reason>\n` +
     `— if something is still broken or an AC is unverified, explaining concretely what so ` +
     `the Builder can fix it. Nothing else you write is parsed — only this line decides what ` +
-    `happens next, so make sure it's the literal last line of your message.\n\n${ticketBlock(task)}`
+    `happens next, so make sure it's the literal last line of your message.`
   );
 }
 
 /** Dispatch to the right stage's prompt builder. The returned string
- *  *replaces* the raw ticket prompt as the turn's text in startTask —
- *  nothing is lost, since every builder above folds task.prompt back in
- *  via ticketBlock(). The `constitutionRaw` param is only used by `specify`
- *  (other stages ignore it). */
+ *  *replaces* the raw ticket prompt as the turn's text in startTask.
+ *  Early stages (specify → plan-review) fold task.prompt back in via
+ *  ticketBlock(). Late stages (decompose → testing) work from SPEC.md
+ *  and PLAN.md on disk — the raw ticket is superseded by that point and
+ *  omitting it saves input tokens. The `constitutionRaw` param is only
+ *  used by `specify` (other stages ignore it). */
 export function stagePrompt(
   task: Task,
   stage: NonNullable<Task["pipelineStage"]>,

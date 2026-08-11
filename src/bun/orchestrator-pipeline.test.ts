@@ -916,3 +916,78 @@ test("pipeline: resumeInFlightBuilds ignores archived and non-building tasks", a
   expect(tasks.get(someChildId)!.column).toBe("building");
   expect(tasks.get(someChildId)!.childMergeStatus).toBe("pending");
 });
+
+// --- S2: resolveRunModel — model tiering for verdict-only pipeline stages ----
+
+test("resolveRunModel: verdict stages on claude-code return sonnet-5", async () => {
+  const { resolveRunModel } = await import("./orchestrator.ts");
+  const base: Parameters<typeof resolveRunModel>[0] = {
+    id: "t", title: "", prompt: "", column: "plan-review", agent: "claude-code",
+    workdir: "/tmp", isolation: "worktree", taskType: "task", branch: null,
+    branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: null, model: "opus-5", effort: null,
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: 0, updatedAt: 0, archivedAt: null,
+    pipelineStage: "plan-review", planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
+    parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  };
+  expect(resolveRunModel({ ...base, pipelineStage: "plan-review" }, "claude-code")).toBe("sonnet-5");
+  expect(resolveRunModel({ ...base, pipelineStage: "code-review" }, "claude-code")).toBe("sonnet-5");
+  expect(resolveRunModel({ ...base, pipelineStage: "testing" }, "claude-code")).toBe("sonnet-5");
+});
+
+test("resolveRunModel: artifact stages on claude-code return task.model unchanged", async () => {
+  const { resolveRunModel } = await import("./orchestrator.ts");
+  const base: Parameters<typeof resolveRunModel>[0] = {
+    id: "t", title: "", prompt: "", column: "specify", agent: "claude-code",
+    workdir: "/tmp", isolation: "worktree", taskType: "task", branch: null,
+    branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: null, model: "opus-5", effort: null,
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: 0, updatedAt: 0, archivedAt: null,
+    pipelineStage: "specify", planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
+    parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  };
+  for (const stage of ["specify", "clarify", "planning", "decompose", "building"] as const) {
+    expect(resolveRunModel({ ...base, pipelineStage: stage }, "claude-code")).toBe("opus-5");
+  }
+});
+
+test("resolveRunModel: non-pipeline claude-code task returns task.model", async () => {
+  const { resolveRunModel } = await import("./orchestrator.ts");
+  const base: Parameters<typeof resolveRunModel>[0] = {
+    id: "t", title: "", prompt: "", column: "running", agent: "claude-code",
+    workdir: "/tmp", isolation: "worktree", taskType: "task", branch: null,
+    branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: null, model: "opus-5", effort: null,
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: 0, updatedAt: 0, archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
+    parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  };
+  expect(resolveRunModel(base, "claude-code")).toBe("opus-5");
+});
+
+test("resolveRunModel: verdict stages on codex/gemini are NOT overridden", async () => {
+  const { resolveRunModel } = await import("./orchestrator.ts");
+  const base: Parameters<typeof resolveRunModel>[0] = {
+    id: "t", title: "", prompt: "", column: "plan-review", agent: "codex",
+    workdir: "/tmp", isolation: "worktree", taskType: "task", branch: null,
+    branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: null, model: "gpt-5.5", effort: null,
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: 0, updatedAt: 0, archivedAt: null,
+    pipelineStage: "plan-review", planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
+    parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  };
+  expect(resolveRunModel({ ...base, agent: "codex" }, "codex")).toBe("gpt-5.5");
+  expect(resolveRunModel({ ...base, agent: "gemini", model: "gemini-3-pro-preview" }, "gemini")).toBe("gemini-3-pro-preview");
+});
