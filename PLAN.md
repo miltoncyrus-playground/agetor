@@ -1,269 +1,124 @@
-# PLAN — Project management sidebar (create / edit / delete projects)
+# PLAN — Move the Projects sidebar to the left side (coexist with New Task)
 
-## Ticket
-In the GUI, let the user create / edit / delete projects. Add a new sidebar that
-handles project settings and that also auto-hides (collapses to a thin rail like
-the existing New Task sidebar).
+## Ticket interpretation
 
-## Outcome this moves (measurable)
-Today a "project" (a registered working directory) can only be **added**
-(implicitly via task creation, or the native folder picker inside the New Task
-`ProjectPicker`) and its branch nomenclature edited via `BranchNamingDialog`.
-There is **no UI to rename a project or remove it** — `api.deleteProject` exists
-but nothing calls it, and rename isn't supported by the server at all.
+"Move protect tab to the left side. It needs to coexist with the new Task tab."
 
-After this change: a dedicated, collapsible **Projects sidebar** on the right of
-the board lets the user add a project (native folder dialog), rename it, edit its
-branch naming, and delete it. Visible behavior: the sidebar's `w-72 ⇄ w-11`
-collapse persists across launches (localStorage), and the board's `<main>`
-reclaims/yields the space in the same frame (mirrors the New Task sidebar).
+`protect` is a mis-transcription of **projects**. The **Projects sidebar** (`ProjectsSidebar`) currently renders on the **right** edge of the board. The **New Task** sidebar (`NewTaskForm`) renders on the **left**. The ticket asks to relocate the Projects sidebar to the left so it sits alongside the New Task sidebar, with the kanban board taking the remaining width to the right.
 
-## Background — what already exists (do not rebuild)
+No other reading fits: `grep -rniE "protect" src/mainview` returns nothing, and the only two collapsible edge "tabs" in the layout are New Task (left) and Projects (right). The branch name `feature/move-protect-tab-to-the-left-side` confirms it.
 
-Backend is almost complete already:
-- `projects` table: `path` (PK), `name`, `added_at`, `branch_config`
-  (migrations `005_projects.sql`, `026_project_branch_config.sql`).
-- `src/bun/db.ts` `projects` module (line ~427): `list()`, `get(path)`,
-  `upsert(path, name)` (⚠️ `ON CONFLICT DO UPDATE SET added_at` only — **name is
-  NOT updated on conflict**, so upsert cannot rename), `setBranchConfig`,
-  `delete(path)`.
-- `src/bun/server.ts` `/projects` route object (line ~494): `GET` (list),
-  `POST` (add by path), `DELETE` (remove by path). `/projects/pick` (native
-  folder dialog → upsert), `/projects/settings` GET/PUT (branch config).
-- `src/mainview/lib/api.ts` (line ~381): `listProjects`, `pickProject`,
-  `deleteProject`, `getProjectBranchConfig`, `setProjectBranchConfig`.
-- `src/mainview/components/settings/BranchNamingDialog.tsx` — the per-project
-  branch-naming editor. **Reuse it as-is** (it takes `projectPath`,
-  `projectName`, `onSaved`, `open`, `onClose`). Do not duplicate branch-config UI.
-- Collapse plumbing: `src/mainview/lib/panel-collapse.ts`
-  (`readCollapsed`/`writeCollapsed` + `NEW_TASK_PANEL_COLLAPSED_KEY`), used by
-  `NewTaskForm.tsx` (lines 93–102, 543–594) — the exact pattern to mirror.
-- Confirm dialog: `useConfirm()` from `src/mainview/components/ui/confirm.tsx`
-  (already mounted in `main.tsx`; already used in `App.tsx` line 175). Use it for
-  destructive delete.
-- `App.tsx` owns `projects` state (line 147), loads it once (line 227), and
-  passes it to `KanbanFilters` (repo filter) and swimlane grouping (lines
-  547–591). The new sidebar must keep this state fresh so filters/swimlanes
-  reflect adds/renames/deletes.
+## Current layout (App.tsx)
 
-Missing pieces: **(1)** a server/db way to rename, **(2)** the client
-`renameProject`, **(3)** the sidebar component, **(4)** App wiring, **(5)** a
-persisted collapse key. That is the whole scope.
+`src/mainview/App.tsx:859-957` renders a horizontal flex row:
 
-## Design decisions
-- **Placement: right side of the board.** The New Task sidebar is on the left;
-  put the Projects sidebar on the right so the layout reads add-task-left,
-  manage-projects-right. It goes inside the existing
-  `<div className="flex min-h-0 flex-1">` row in `App.tsx`, **after** `</main>`
-  (App.tsx line 951) and before that row's closing `</div>` (line 952).
-  `<main>` is `flex-1`, so it reclaims the freed width automatically — same
-  mechanism the New Task sidebar relies on. RunPanel (line 953+) is an overlay
-  rendered after the row and is unaffected.
-- **"Auto-hides" = collapse-to-rail**, matching the New Task sidebar (the "also"
-  in the ticket references that sidebar). Mirror it: `w-72` expanded / `w-11`
-  collapsed rail, `transition-[width] duration-200`, a round straddle toggle
-  button on the panel's **left** edge (`-left-2.5`, since border is on the left),
-  state persisted via `panel-collapse.ts`.
-- **Add** = native folder dialog via `api.pickProject()` (same call the
-  `ProjectPicker` "Browse for folder…" uses). No free-text path entry — matches
-  existing UX and avoids the absolute-path validation dance.
-- **Edit** = two things: inline **rename** of the display name, and a
-  **Branch naming** button that opens the existing `BranchNamingDialog`.
-- **Delete** = `useConfirm({ variant: "destructive" })` then
-  `api.deleteProject(path)`. Confirm copy must state it only removes the list
-  entry: **tasks and worktrees are not touched** (there is no FK from `tasks`
-  to `projects`; delete is a `DELETE FROM projects WHERE path=?` only). Note the
-  existing auto-upsert on task creation means a deleted project reappears if a
-  task with that workdir is later created — acceptable, existing behavior.
+```
+<div className="flex min-h-0 flex-1">
+  <NewTaskForm ... />          // left sidebar,  border-r, w-80/w-11
+  <main className="flex min-w-0 flex-1 flex-col"> ... board ... </main>
+  <ProjectsSidebar ... />      // right sidebar, border-l, w-72/w-11
+</div>
+```
+
+Both sidebars are `shrink-0` collapsible rails driven by `localStorage` collapse flags (`src/mainview/lib/panel-collapse.ts`): `NEW_TASK_PANEL_COLLAPSED_KEY` and `PROJECTS_PANEL_COLLAPSED_KEY`. `main` is `flex-1`, so it reclaims freed width automatically when either sidebar collapses.
+
+`NewTaskForm` (`src/mainview/components/kanban/NewTaskForm.tsx`) is the reference left-side chrome:
+- outer `<aside>` uses `border-r border-border/60` (`NewTaskForm.tsx:547`)
+- collapse toggle straddles the **right** edge: `absolute -right-2.5 …` (`NewTaskForm.tsx:566`)
+- toggle icons: `collapsed ? <ChevronRight/> : <ChevronLeft/>` (`NewTaskForm.tsx:568-570`)
+- widths `collapsed ? "w-11" : "w-80"` (`NewTaskForm.tsx:549`)
+- collapsed rail label uses `[writing-mode:vertical-rl]` (`NewTaskForm.tsx:590`)
+
+`ProjectsSidebar` (`src/mainview/components/kanban/ProjectsSidebar.tsx`) is currently built as **right-side** chrome (mirror image of the above):
+- outer `<aside>` uses `border-l border-border/60` (`ProjectsSidebar.tsx:104`)
+- collapse toggle straddles the **left** edge: `absolute -left-2.5 …` (`ProjectsSidebar.tsx:118`)
+- toggle icons: `collapsed ? <ChevronLeft/> : <ChevronRight/>` (`ProjectsSidebar.tsx:120-122`)
+- widths `collapsed ? "w-11" : "w-72"` (`ProjectsSidebar.tsx:106`)
+- JSDoc + inline comments describe it as the "Right-side Projects sidebar" with the border/toggle on the LEFT (`ProjectsSidebar.tsx:31-36`, `109-111`)
+
+## Target layout
+
+Order left→right: **Projects sidebar, New Task sidebar, board.**
+
+```
+<div className="flex min-h-0 flex-1">
+  <ProjectsSidebar ... />      // leftmost, now left-side chrome (border-r, toggle on right edge)
+  <NewTaskForm ... />          // UNCHANGED
+  <main className="flex min-w-0 flex-1 flex-col"> ... board ... </main>
+</div>
+```
+
+### Why Projects goes leftmost (not between New Task and the board)
+
+Putting Projects as the first child leaves `NewTaskForm` **completely untouched** — its right-edge toggle keeps overhanging into `main`'s `p-4` gutter exactly as today. Only two files change: `App.tsx` (reorder) and `ProjectsSidebar.tsx` (flip chrome to left-side). Projects' collapse toggle then straddles the gutter **between the two sidebars**, which reads as a natural VS Code-style panel divider. `main` stays `flex-1` and reclaims all freed width; nothing on the board side needs to change.
+
+(Alternative considered and rejected: order `[NewTaskForm][ProjectsSidebar][main]`. That would force edits to `NewTaskForm` too — its toggle would then overhang into Projects instead of the board — for no benefit. Keep Projects leftmost.)
 
 ## Changes
 
-### 1. `src/bun/db.ts` — add `projects.rename`
-In the `projects` object (after `setBranchConfig`, before `delete`), add:
-```ts
-/**
- * Update a project's display name. Returns the refreshed row, or null if the
- * project isn't registered. `upsert` can't do this — it only refreshes
- * added_at on conflict, deliberately, so re-picking a project never clobbers
- * its name/config.
- */
-rename(path: string, name: string): Project | null {
-  db.run(`UPDATE projects SET name = ? WHERE path = ?`, [name, path]);
-  return this.get(path);
-},
-```
-No migration needed (column exists). `db.run` on a non-existent path is a no-op;
-`get` then returns null → caller 404s.
+### 1. `src/mainview/App.tsx` — reorder the flex children
 
-### 2. `src/bun/server.ts` — add `PATCH` to the `/projects` route object
-Inside the existing `"/projects": { GET, POST, DELETE }` object (line ~494), add
-a `PATCH` sibling:
-```ts
-PATCH: authed(async (req) => {
-  const body = (await req.json().catch(() => ({}))) as { path?: unknown; name?: unknown };
-  const p = typeof body.path === "string" ? body.path.trim() : "";
-  const name = typeof body.name === "string" ? body.name.trim() : "";
-  if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-  if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
-  const updated = projects.rename(p, name);
-  if (!updated) return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
-  return json(updated, { headers: corsHeaders(req) });
-}),
-```
-Mirror the existing POST/DELETE style in that block (`authed`, `corsHeaders(req)`,
-`json(...)`). `projects` is already imported (server.ts line 14).
+Move the `<ProjectsSidebar … />` element from **after** `</main>` to **before** `<NewTaskForm … />`, inside the same `<div className="flex min-h-0 flex-1">`.
 
-### 3. `src/mainview/lib/api.ts` — add `renameProject`
-After `deleteProject` (line ~388):
-```ts
-renameProject: (p: string, name: string) =>
-  j<Project>("/projects", { method: "PATCH", body: JSON.stringify({ path: p, name }) }),
-```
-`Project` is already imported. `j<void>` for delete already sets method/body the
-same way — follow that shape.
+- Cut the block at `App.tsx:953-956`:
+  ```tsx
+  <ProjectsSidebar
+    projects={projects}
+    onChanged={() => { void api.listProjects().then(setProjects).catch(() => {}); }}
+  />
+  ```
+- Paste it as the **first** child of the flex row, immediately after the opening `<div className="flex min-h-0 flex-1">` at `App.tsx:859` and before `<NewTaskForm` at `App.tsx:860`.
 
-### 4. `src/mainview/lib/panel-collapse.ts` — add the collapse key
-Add next to `NEW_TASK_PANEL_COLLAPSED_KEY` (line 17):
-```ts
-/** Storage key for the Projects sidebar's collapsed flag. */
-export const PROJECTS_PANEL_COLLAPSED_KEY = "agetor:projectsPanelCollapsed";
-```
-No other change — `readCollapsed`/`writeCollapsed` are already key-parameterized.
+The resulting child order inside that div must be: `ProjectsSidebar`, then `NewTaskForm`, then `<main>`. Leave the `<NewTaskForm …>` and `<main …>` blocks otherwise unchanged. Props to `ProjectsSidebar` are unchanged. No import changes (both components already imported at `App.tsx:13-14`).
 
-### 5. NEW `src/mainview/components/kanban/ProjectsSidebar.tsx`
-Mirror `NewTaskForm.tsx`'s collapse structure (lines 543–594), border on the
-**left** (`border-l`), toggle button at `-left-2.5` with `ChevronLeft`/
-`ChevronRight` swapped for the right-side edge (collapsed → `ChevronLeft` to
-expand-leftward; expanded → `ChevronRight` to collapse-rightward).
+### 2. `src/mainview/components/kanban/ProjectsSidebar.tsx` — flip to left-side chrome
 
-Props:
-```ts
-interface Props {
-  projects: Project[];       // from App (source of truth for the list)
-  onChanged: () => void;     // App refreshes its projects state after any mutation
-}
-```
+Convert the panel from right-edge to left-edge (matching `NewTaskForm`). Four edits:
 
-State: `collapsed` (lazy init from `readCollapsed(PROJECTS_PANEL_COLLAPSED_KEY)`,
-`useEffect` → `writeCollapsed` on change, same as NewTaskForm lines 97–102);
-`renamingPath: string | null` + `renameText: string` for inline rename;
-`branchProjectPath: string | null` to drive one shared `BranchNamingDialog`;
-`busy` guard for the add/pick call.
+a. **Border side** — `ProjectsSidebar.tsx:104`, in the outer `<aside>` `cn(...)`:
+   - change `border-l border-border/60` → `border-r border-border/60`
 
-Expanded body (`w-72`):
-- Header row: `"Projects"` label + an **Add** button (`Plus` icon) →
-  `const { project } = await api.pickProject(); if (project) onChanged();`
-  (guard with `busy`; on failure no-op, matches ProjectPicker).
-- Scrollable list of `projects` (already sorted `added_at DESC`). Each row:
-  - When `renamingPath === p.path`: an `Input` bound to `renameText`, save on
-    Enter or blur → `await api.renameProject(p.path, renameText.trim()); onChanged();`
-    then clear renaming state; Escape cancels. Empty/whitespace name → cancel
-    (no call).
-  - Otherwise: the name (click / a `Pencil`-style edit button starts rename),
-    the path shown small + truncated (`title={p.path}`), and two actions:
-    - **Branch naming** button → `setBranchProjectPath(p.path)`.
-    - **Delete** button (`Trash2`) → `if (await confirm({ title: "Remove project?",
-      description: "Removes it from the project list. Tasks and worktrees are not
-      affected.", confirmLabel: "Remove", variant: "destructive" })) { await
-      api.deleteProject(p.path); onChanged(); }`.
-  - Empty state when `projects.length === 0`: a short muted line + the Add button.
-- Reuse `basename(p.path)` helper (copy the 3-line helper from `ProjectPicker.tsx`
-  lines 26–30) for the fallback label.
+b. **Toggle position** — `ProjectsSidebar.tsx:118`, the collapse `<button>` className:
+   - change `absolute -left-2.5 top-1/2 …` → `absolute -right-2.5 top-1/2 …`
+   - (keep the rest of the class list identical)
 
-Collapsed rail (`w-11`): vertical `"Projects"` label button (`[writing-mode:vertical-rl]`)
-that expands on click — copy NewTaskForm lines 585–594.
+c. **Toggle chevron icons** — `ProjectsSidebar.tsx:120-122`, swap the two icons so the panel expands rightward / collapses leftward like New Task:
+   ```tsx
+   {collapsed
+     ? <ChevronRight className="size-3.5" />
+     : <ChevronLeft className="size-3.5" />}
+   ```
+   Both `ChevronLeft` and `ChevronRight` are already imported (`ProjectsSidebar.tsx:2`) — no import change.
 
-Shared dialog at the bottom of the component (rendered once):
-```tsx
-<BranchNamingDialog
-  open={branchProjectPath !== null}
-  projectPath={branchProjectPath ?? ""}
-  projectName={projects.find((p) => p.path === branchProjectPath)?.name}
-  onClose={() => setBranchProjectPath(null)}
-  onSaved={() => { setBranchProjectPath(null); onChanged(); }}
-/>
-```
+d. **Doc/inline comments** — update to reflect the new side so the source doesn't lie:
+   - `ProjectsSidebar.tsx:31-36` JSDoc: change "Right-side Projects sidebar … border on the LEFT edge and the straddle toggle overhanging into the board's left gutter" to describe a **left-side** panel with the border on the **right** edge and the toggle straddling the **right** edge (into the gutter between it and the New Task sidebar). Keep the "Mirrors the New Task sidebar's collapse-to-rail chrome" line.
+   - `ProjectsSidebar.tsx:109-111` inline comment: change "straddling the LEFT border … Collapsed → ChevronLeft to expand leftward; expanded → ChevronRight to collapse rightward." to the right-edge equivalent: "straddling the RIGHT border … Collapsed → ChevronRight to expand rightward; expanded → ChevronLeft to collapse leftward."
 
-Use `useConfirm()` from `@/components/ui/confirm`, `cn` from `@/lib/utils`,
-`Button`/`Input` from `@/components/ui/*`, icons from `lucide-react`
-(`Plus`, `Pencil`, `Trash2`, `Settings2`/`GitBranch`, `ChevronLeft`,
-`ChevronRight`). Import `Project` type from `../../../shared/types.ts` (match
-ProjectPicker's relative import).
+Do **not** change the widths (`w-11`/`w-72`), the clip-layer `overflow-hidden` div, the collapsed rail `[writing-mode:vertical-rl]` label, the `PROJECTS_PANEL_COLLAPSED_KEY` persistence, or any of the project add/rename/delete/branch-naming logic. Those are side-agnostic and stay as-is.
 
-### 6. `src/mainview/App.tsx` — mount the sidebar
-- Import: `import { ProjectsSidebar } from "@/components/kanban/ProjectsSidebar";`
-  (near the other kanban imports, line ~13).
-- Inside `<div className="flex min-h-0 flex-1">`, after `</main>` (line 951),
-  add:
-```tsx
-<ProjectsSidebar
-  projects={projects}
-  onChanged={() => { void api.listProjects().then(setProjects).catch(() => {}); }}
-/>
-```
-`projects`/`setProjects` already exist (App.tsx line 147). This keeps the repo
-filter and swimlane grouping in sync after any project mutation.
+### No other files
 
-## Tests (gate tests — deterministic, in the same commit)
+- `src/mainview/components/kanban/NewTaskForm.tsx` — **no change** (stays the left-of-board sidebar, chrome already correct).
+- `src/mainview/lib/panel-collapse.ts` — no change (collapse key already exists and is reused).
+- No new imports, no API/server/shared-types changes. This is a pure webview layout relocation.
 
-### A. NEW `src/bun/projects-crud-endpoint.test.ts`
-Model it on `project-settings-endpoint.test.ts` (temp `AGETOR_DATA_DIR`, a fixed
-`AGETOR_API_PORT` **distinct from 4401** — use `4402`; boot server; `Bearer`
-auth). Cover:
-- `POST /projects` with an absolute existing path (use the temp `DATA_DIR`
-  itself, which exists) → 200, body `{ path, name }`; `projects.get` returns it.
-- `POST /projects` with a relative path → 400; with a non-existent path → 404.
-- `PATCH /projects` renames → 200, `projects.get(path).name` updated + response
-  body reflects new name.
-- `PATCH /projects` with empty `name` → 400.
-- `PATCH /projects` for an unregistered path → 404.
-- `DELETE /projects` → 204 and `projects.get(path)` is null.
+## Verification
 
-### B. NEW `src/bun/projects-db.test.ts` (or extend if a projects db test exists — none does)
-Temp `AGETOR_DATA_DIR`, import `projects` from `./db.ts`:
-- `upsert` then `rename` changes `name`, leaves `branchConfig` untouched
-  (set a config first via `setBranchConfig`, rename, assert config survives).
-- `rename` on an unknown path returns `null`.
-- `upsert` re-call keeps the original name (documents why `rename` is needed —
-  upsert's ON CONFLICT only bumps `added_at`).
+1. `bun run typecheck` must be green (only JSX reorder + className/comment edits; no type surface touched).
+2. `bun test src/mainview/lib/panel-collapse.test.ts` still passes (untouched logic; the Projects collapse flag continues to round-trip through the same key).
+3. Manual/visual check via `bun run dev:hmr` (headless: `scripts/dev-headless.sh` per repo memory):
+   - Projects sidebar renders on the **far left**, New Task sidebar to its right, board fills the rest.
+   - Projects collapse toggle sits on the panel's **right** edge; clicking it collapses the panel leftward to the `w-11` rail and the board widens; chevron shows `ChevronRight` when collapsed, `ChevronLeft` when expanded.
+   - New Task sidebar is visually unchanged and still collapses independently.
+   - Collapse state for both panels survives a reload (localStorage), and the two flags are independent.
+   - Add / rename / delete / branch-naming actions in the Projects panel still work from the new position.
 
-### C. `src/mainview/lib/panel-collapse.test.ts` — extend
-Add a test importing `PROJECTS_PANEL_COLLAPSED_KEY`: it is a non-empty string,
-distinct from `NEW_TASK_PANEL_COLLAPSED_KEY`, and round-trips through
-`writeCollapsed`/`readCollapsed` with a `fakeStorage` (independent of the New
-Task key — writing one doesn't affect the other).
+### On tests
 
-## Evals
-N/A — this is pure deterministic-space work (CRUD + UI chrome), no LLM /
-latent-space component to evaluate. Gate tests above are the full verification
-surface. (Stated explicitly per CLAUDE.md's latent-vs-deterministic rule.)
+There is **no unit-testable pure logic** introduced by this change — it is entirely JSX ordering and Tailwind class/comment edits, and the codebase has no React-render/DOM test harness (all `src/mainview/**/*.test.ts` are pure-function tests; no testing-library). The collapse-persistence behavior that *could* regress is already covered by `panel-collapse.test.ts`, which this change does not touch. Adding a render test would require standing up a new DOM-testing dependency for a one-time layout move — out of scope and not the repo's convention. Verification is therefore typecheck + the existing panel-collapse test + the manual visual pass above. Call this out to the Tester so a missing new test file isn't flagged as an omission.
 
-## Verification checklist (for Builder)
-- `bun run typecheck` green (watch the `Project` import path in the new
-  component; `@/`-alias vs relative — ProjectPicker uses the relative
-  `../../../shared/types.ts`).
-- `bun test src/bun/projects-crud-endpoint.test.ts src/bun/projects-db.test.ts`
-  green.
-- `bun test src/mainview/lib/panel-collapse.test.ts` green.
-- Manual (dev app, `scripts/dev-headless.sh` per memory — the normal
-  `dev:hmr` GUI crashes on this host): sidebar collapses/expands and remembers
-  state across reload; Add opens the folder dialog and the project appears in
-  both the sidebar and the repo filter; rename updates the swimlane header and
-  filter; delete removes it after confirm; Branch naming opens the existing
-  dialog and saves.
+## Risk / edge cases
 
-## Files touched
-- `src/bun/db.ts` (add `projects.rename`)
-- `src/bun/server.ts` (add `PATCH /projects`)
-- `src/mainview/lib/api.ts` (add `renameProject`)
-- `src/mainview/lib/panel-collapse.ts` (add `PROJECTS_PANEL_COLLAPSED_KEY`)
-- `src/mainview/components/kanban/ProjectsSidebar.tsx` (NEW)
-- `src/mainview/App.tsx` (import + mount sidebar)
-- `src/bun/projects-crud-endpoint.test.ts` (NEW)
-- `src/bun/projects-db.test.ts` (NEW)
-- `src/mainview/lib/panel-collapse.test.ts` (extend)
-
-## Restart after build
-Main-process files changed (`db.ts`, `server.ts`) → the Builder/human must
-restart `bun run dev` (or `scripts/dev-headless.sh`); those do not HMR. Webview
-files (`App.tsx`, sidebar, api, panel-collapse) HMR under `dev:hmr`.
+- **Toggle overhang between the two sidebars**: Projects' `-right-2.5` toggle (z-20, absolutely positioned on its own `<aside>`) overhangs ~10px onto the New Task sidebar's left edge. It is not clipped (it lives outside its own aside's box and New Task's `overflow-hidden` only clips New Task's own children) and z-20 keeps it clickable above the neighbor's non-positioned content. This mirrors how each toggle currently overhangs the board's `p-4` gutter — acceptable and consistent.
+- **Two expanded sidebars = up to ~152px** (`w-80` + `w-72`) of fixed left chrome. `main` is `flex-1 min-w-0`, so it simply narrows; no horizontal page scroll is introduced. Users who want more board width collapse either rail.
+- **No data/state migration**: the Projects collapse flag key is unchanged, so a user's previously-persisted collapse state carries over verbatim.
