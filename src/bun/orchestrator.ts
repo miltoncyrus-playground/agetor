@@ -118,9 +118,13 @@ import { WORKTREE_STALE_AFTER_MS, PIPELINE_REVISION_CAP, PIPELINE_STAGE_COLUMNS,
 import { appendReferences } from "../shared/refs.ts";
 import {
   PIPELINE_PLAN_FILE,
-  PIPELINE_BUILD_PLAN_FILE,
+  PIPELINE_SPEC_FILE,
+  PIPELINE_TASKS_FILE,
+  PIPELINE_CONSTITUTION_FILE,
   parsePipelineVerdict,
   parseBuildPlan,
+  parseSpecAcceptanceCriteria,
+  analyzeCoverage,
   stagePrompt,
   type PlanReviewVerdict,
   type TestingVerdict,
@@ -985,8 +989,15 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // (which already folds task.prompt — the ticket — back in), not the raw
   // ticket alone. Still runs through appendReferences for user-attached
   // file refs either way.
+  let constitutionRaw: string | null = null;
+  if (task.pipelineStage === "specify") {
+    const constitutionPath = join(task.worktreePath ?? task.workdir, PIPELINE_CONSTITUTION_FILE);
+    if (existsSync(constitutionPath)) {
+      try { constitutionRaw = readFileSync(constitutionPath, "utf8"); } catch { /* proceed without */ }
+    }
+  }
   const promptWithRefs = appendReferences(
-    task.pipelineStage ? stagePrompt(task, task.pipelineStage) : task.prompt,
+    task.pipelineStage ? stagePrompt(task, task.pipelineStage, constitutionRaw) : task.prompt,
     task.references,
   );
 
@@ -1474,38 +1485,30 @@ function settleChildRun(taskId: string, runId: string, outcome: PipelineOutcome)
  * `pipelineStage` left exactly where it was, so a human sees precisely
  * where the run died and can manually re-`startTask` the same stage to
  * retry. Everything else is per-stage:
- *   - planning success: requires PLAN.md to exist in the worktree (a cheap
- *     safety net, not a hard spec requirement) before advancing.
- *   - plan-review: parses the Critic's verdict off the run's last assistant
- *     message. approve → planApproved=true, advance to pre-builder (or
- *     straight to ready if implementationApproved was already true from an
- *     earlier pass). revise → bump the shared revision counter; over cap →
- *     blocked; under cap → back to planning with the reason folded into
- *     pipelineFeedback.
- *   - pre-builder success: not verdict-bearing — requires BUILD_PLAN.json to
- *     exist AND parse/validate (see pipeline-prompts.ts's parseBuildPlan:
- *     schema, unique ids, resolvable dependsOn, acyclic) before advancing.
- *     Fresh entry into building (spawns a DAG of child tasks via
- *     build-scheduler.ts's tickBuild, no agent turn of its own) rather than
- *     spawnStage/startTask, unlike every other transition here.
+ *   - specify success: requires SPEC.md to exist → advance to clarify.
+ *   - clarify success: requires SPEC.md still present → advance to planning.
+ *   - planning success: requires PLAN.md to exist → advance to plan-review.
+ *   - plan-review: parses the Critic's verdict. approve → planApproved=true,
+ *     advance to decompose (or straight to ready if implementationApproved
+ *     was already true from an earlier pass). revise → bump the shared
+ *     revision counter; over cap → blocked; under cap → back to planning
+ *     with the reason folded into pipelineFeedback.
+ *   - decompose success: not verdict-bearing — requires TASKS.json to exist
+ *     AND parse/validate, then runs the inline analyze step (AC coverage
+ *     check, zero agent turns). Coverage ok → fresh entry into building via
+ *     tickBuild. Gap found → bounce to decompose (same revision cap).
+ *   - analyze: handled inline inside the "decompose" case; never has its own
+ *     terminal run — this switch arm is a safety no-op.
  *   - building success: not verdict-bearing, straight to code-review. This
  *     is the BOUNCE-entry path only (a plain single-agent fixup turn) —
- *     the fresh-entry path is handled entirely in the "pre-builder" case
- *     above and never reaches this function's "building" case, since the
- *     parent has no terminal run of its own while its children work (the
- *     barrier-complete → code-review transition is called directly by
- *     build-scheduler.ts's tickBuild instead).
+ *     the fresh-entry path is handled entirely in the "decompose" case above.
  *   - code-review: parses the Code Reviewer's verdict (same approve/revise
- *     shape plan-review uses, reviewing the merged diff instead of the
- *     plan). approve → straight to testing (no flag to set — unlike
- *     plan-review/testing, code-review doesn't gate the AND that unlocks
- *     `ready`). revise → same cap arithmetic as the other two edges,
- *     bounce target is building (a plain single-agent fixup, no
- *     re-decomposition, no children re-spawned).
+ *     shape plan-review uses, reviewing the merged diff and AC checklist).
+ *     approve → straight to testing. revise → same cap arithmetic,
+ *     bounce target is building (plain fixup, no re-decomposition).
  *   - testing: same verdict shape. pass → implementationApproved=true,
- *     straight to ready (planApproved is true by construction — testing is
- *     only reachable after an approved plan). fail → same cap arithmetic,
- *     bounce target is building (not planning).
+ *     straight to ready (planApproved is true by construction). fail → same
+ *     cap arithmetic, bounce target is building (not planning).
  *
  * The `startTask` call for the next stage is fired-and-forgotten
  * (`void ...catch(...)`), never awaited — it must not block the caller's
@@ -1548,6 +1551,34 @@ function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOu
   };
 
   switch (task.pipelineStage) {
+    case "specify": {
+      const specPath = join(task.worktreePath ?? task.workdir, PIPELINE_SPEC_FILE);
+      if (!existsSync(specPath)) {
+        emit({
+          runId, taskId, stream: "status",
+          data: `${PIPELINE_SPEC_FILE} was not found in the worktree — cannot advance to clarify`,
+          ts: Date.now(),
+        });
+        updateColumn(taskId, runId, "blocked", "pipeline-failed");
+        return;
+      }
+      spawnStage("clarify", { pipelineFeedback: null });
+      return;
+    }
+    case "clarify": {
+      const specPath = join(task.worktreePath ?? task.workdir, PIPELINE_SPEC_FILE);
+      if (!existsSync(specPath)) {
+        emit({
+          runId, taskId, stream: "status",
+          data: `${PIPELINE_SPEC_FILE} was not found in the worktree after clarify — cannot advance to planning`,
+          ts: Date.now(),
+        });
+        updateColumn(taskId, runId, "blocked", "pipeline-failed");
+        return;
+      }
+      spawnStage("planning", { pipelineFeedback: null });
+      return;
+    }
     case "planning": {
       const planPath = join(task.worktreePath ?? task.workdir, PIPELINE_PLAN_FILE);
       if (!existsSync(planPath)) {
@@ -1579,39 +1610,71 @@ function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOu
           updateColumn(taskId, runId, "ready", "stage-advance");
           return;
         }
-        spawnStage("pre-builder");
+        spawnStage("decompose");
         return;
       }
       bounceOrBlock("planning", verdict.reason, { planApproved: false });
       return;
     }
-    case "pre-builder": {
-      const planPath = join(task.worktreePath ?? task.workdir, PIPELINE_BUILD_PLAN_FILE);
-      if (!existsSync(planPath)) {
+    case "decompose": {
+      const tasksPath = join(task.worktreePath ?? task.workdir, PIPELINE_TASKS_FILE);
+      if (!existsSync(tasksPath)) {
         emit({
           runId, taskId, stream: "status",
-          data: `${PIPELINE_BUILD_PLAN_FILE} was not found in the worktree — cannot advance to building`,
+          data: `${PIPELINE_TASKS_FILE} was not found in the worktree — cannot advance to analyze`,
           ts: Date.now(),
         });
         updateColumn(taskId, runId, "blocked", "pipeline-failed");
         return;
       }
-      const parsed = parseBuildPlan(readFileSync(planPath, "utf8"));
+      const parsed = parseBuildPlan(readFileSync(tasksPath, "utf8"));
       if (!parsed.ok) {
         emit({
           runId, taskId, stream: "status",
-          data: `${PIPELINE_BUILD_PLAN_FILE} is invalid — ${parsed.reason} — cannot advance to building`,
+          data: `${PIPELINE_TASKS_FILE} is invalid — ${parsed.reason} — cannot advance`,
           ts: Date.now(),
         });
         tasks.update(taskId, { pipelineFeedback: parsed.reason });
         updateColumn(taskId, runId, "blocked", "pipeline-failed");
         return;
       }
-      // Fresh entry into building: unlike every other transition, this is
-      // NOT spawnStage/startTask — the parent runs no agent of its own
-      // while children do the work. Persist the stage/column exactly like
-      // spawnPipelineStage does, then hand off to the DAG scheduler instead
-      // of starting a single agent turn.
+      // Inline the analyze step — no agent turn needed, just a deterministic
+      // AC-coverage check. Advance column to "analyze" for UI visibility of
+      // this (instant) stage, then immediately resolve it.
+      tasks.update(taskId, { pipelineStage: "analyze" });
+      updateColumn(taskId, runId, "analyze", "stage-advance");
+
+      const specPath = join(task.worktreePath ?? task.workdir, PIPELINE_SPEC_FILE);
+      let specAcIds: string[] = [];
+      if (existsSync(specPath)) {
+        try { specAcIds = parseSpecAcceptanceCriteria(readFileSync(specPath, "utf8")); } catch { /* no ACs */ }
+      }
+      const coverage = analyzeCoverage(specAcIds, parsed.plan);
+      if (!coverage.ok) {
+        const reason = coverage.reason;
+        emit({
+          runId, taskId, stream: "status",
+          data: `AC coverage gap in ${PIPELINE_TASKS_FILE} — ${reason}`,
+          ts: Date.now(),
+        });
+        // bounce back to decompose so the Decomposer can fix the gap
+        const revisionCount = task.revisionCount + 1;
+        tasks.update(taskId, { pipelineStage: "decompose" });
+        if (revisionCount > PIPELINE_REVISION_CAP) {
+          tasks.update(taskId, { revisionCount });
+          emit({
+            runId, taskId, stream: "status",
+            data: `revision cap (${PIPELINE_REVISION_CAP}) reached — ${reason}`,
+            ts: Date.now(),
+          });
+          updateColumn(taskId, runId, "blocked", "revision-cap");
+          return;
+        }
+        spawnPipelineStage(taskId, runId, "decompose", { revisionCount, pipelineFeedback: reason });
+        return;
+      }
+      // Coverage OK — fresh entry into building (same pattern as the old
+      // pre-builder case: no agent turn of its own, hand off to DAG scheduler).
       tasks.update(taskId, { pipelineStage: "building", pipelineFeedback: null });
       updateColumn(taskId, runId, "building", "stage-advance");
       if (tasks.get(taskId)?.pausedAt == null) {
@@ -1622,6 +1685,12 @@ function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOu
           }
         });
       }
+      return;
+    }
+    case "analyze": {
+      // analyze is handled inline in the "decompose" case above — it never
+      // has its own terminal run, so advancePipelineStage is never called
+      // with pipelineStage === "analyze". This branch is a safety no-op.
       return;
     }
     case "building": {
@@ -1646,7 +1715,7 @@ function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOu
       // Revise bounces to "building" as a plain single-agent fixup (the
       // BOUNCE-entry path building already has — no re-decomposition, no
       // children spawned), consuming a slot from the SAME shared
-      // revision-cap counter as the other two edges.
+      // revision-cap counter as the other three edges.
       bounceOrBlock("building", verdict.reason, {});
       return;
     }
@@ -2552,10 +2621,11 @@ export interface CreateTaskInput extends Partial<Task> {
    */
   existingBranch?: string;
   /**
-   * Opt-in: create this task as a pipeline task (`pipelineStage: "planning"`,
-   * the 4 auto-advancing stages — see pipeline-prompts.ts and
-   * advancePipelineStage below). Never inferred from any other field —
-   * always explicit. Absent/false is a completely ordinary task.
+   * Opt-in: create this task as a pipeline task (`pipelineStage: "specify"`,
+   * the first of 9 spec-driven auto-advancing stages — see
+   * pipeline-prompts.ts and advancePipelineStage below). Never inferred
+   * from any other field — always explicit. Absent/false is a completely
+   * ordinary task.
    */
   pipeline?: boolean;
 }
@@ -2740,7 +2810,7 @@ export async function createTask(
     // lifecycle — column choices in startTask, prompt selection, stage
     // transitions — is driven off pipelineStage from here on, never off
     // input.pipeline again. An ordinary task gets all-zero/null defaults.
-    pipelineStage: input.pipeline ? "planning" : null,
+    pipelineStage: input.pipeline ? "specify" : null,
     planApproved: false,
     implementationApproved: false,
     revisionCount: 0,

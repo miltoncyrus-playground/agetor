@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-// Real-git end-to-end tests for the pre-builder -> DAG scheduler -> merge
+// Real-git end-to-end tests for the decompose -> DAG scheduler -> merge
 // -> code-review path. Kept in a SEPARATE file from orchestrator-pipeline.test.ts
 // deliberately: these spawn several real `git` subprocesses each (init,
 // config, commit, worktree add, merge) and are meaningfully slower than
@@ -49,8 +49,8 @@ async function makeGitRepo(): Promise<string> {
 }
 
 /** Writes and commits a file directly in an already-checked-out worktree —
- *  stands in for what a real pre-builder agent turn would do (write +
- *  commit BUILD_PLAN.json) since the fake driver never touches the
+ *  stands in for what a real decompose agent turn would do (write +
+ *  commit TASKS.json) since the fake driver never touches the
  *  filesystem itself. Must run BEFORE the fake's ~20ms resolve timer fires
  *  — same "before the timer" window startAndGetRunId's own doc comment
  *  describes. */
@@ -66,7 +66,7 @@ async function startAndGetRunId(startTask: typeof import("./orchestrator.ts").st
   return started.runId;
 }
 
-test("pipeline: pre-builder success with a valid BUILD_PLAN.json fresh-enters building, spawns a child, and merges it back on success", async () => {
+test("pipeline: decompose success with a valid TASKS.json fresh-enters building, spawns a child, and merges it back on success", async () => {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");
 
@@ -79,19 +79,19 @@ test("pipeline: pre-builder success with a valid BUILD_PLAN.json fresh-enters bu
   if ("error" in created) throw new Error(created.error);
   const taskId = created.task.id;
   tasks.update(taskId, {
-    pipelineStage: "pre-builder", planApproved: true, implementationApproved: false,
+    pipelineStage: "decompose", planApproved: true, implementationApproved: false,
     revisionCount: 0, pipelineFeedback: null,
   });
 
   await startAndGetRunId(startTask, taskId);
-  // Stand in for what a real pre-builder agent turn would write+commit —
+  // Stand in for what a real decompose agent turn would write+commit —
   // must happen before the fake driver's ~20ms resolve timer fires.
   await commitFile(
-    tasks.get(taskId)!.worktreePath!, "BUILD_PLAN.json",
-    JSON.stringify({ subtasks: [{ id: "a", title: "A", prompt: "do a", dependsOn: [] }] }),
+    tasks.get(taskId)!.worktreePath!, "TASKS.json",
+    JSON.stringify({ subtasks: [{ id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: [] }] }),
   );
   // The fresh-entry path is several async hops deep (advancePipelineStage's
-  // "pre-builder" case -> tickBuild -> createTask + startTask for the
+  // "decompose" case -> tickBuild -> createTask + startTask for the
   // child -> the child's own fake run -> settleChildRun ->
   // completeChildBuild's real `git merge`), vs. one hop for a plain
   // spawnStage/startTask transition — plus real git subprocess latency.

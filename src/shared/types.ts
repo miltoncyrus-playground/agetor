@@ -1,6 +1,6 @@
 export type ColumnId =
   | "backlog" | "ready" | "running" | "blocked" | "review" | "done"
-  | "planning" | "plan-review" | "pre-builder" | "building" | "code-review" | "testing";
+  | "specify" | "clarify" | "planning" | "plan-review" | "decompose" | "analyze" | "building" | "code-review" | "testing";
 
 /**
  * The exact `HarnessStatus.reason` string the server emits when claude-code
@@ -36,9 +36,12 @@ export const GIT_HOST_TOKENS_SECTION = "Git host tokens";
 export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "backlog", label: "Backlog" },
   { id: "ready", label: "Ready" },
+  { id: "specify", label: "Specify" },
+  { id: "clarify", label: "Clarify" },
   { id: "planning", label: "Planning" },
   { id: "plan-review", label: "Plan Review" },
-  { id: "pre-builder", label: "Pre-Builder" },
+  { id: "decompose", label: "Decompose" },
+  { id: "analyze", label: "Analyze" },
   { id: "building", label: "Building" },
   { id: "code-review", label: "Code Review" },
   { id: "testing", label: "Testing" },
@@ -48,7 +51,7 @@ export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "done", label: "Done" },
 ];
 
-/** The 6 columns a pipeline task's own agent occupies while auto-advancing
+/** The 9 columns a pipeline task's own agent occupies while auto-advancing
  *  (see src/bun/pipeline-prompts.ts and orchestrator.ts's advancePipelineStage).
  *  Never used by a non-pipeline task — `running`/`review` stay exactly as
  *  they are for those. Also the set of columns a CHILD task (see
@@ -56,13 +59,15 @@ export const COLUMNS: { id: ColumnId; label: string }[] = [
  *  `building` (or `blocked` on failure, outside this list), so it inherits
  *  the same undraggable/isActiveColumn treatment for free. */
 export const PIPELINE_STAGE_COLUMNS: readonly ColumnId[] =
-  ["planning", "plan-review", "pre-builder", "building", "code-review", "testing"];
+  ["specify", "clarify", "planning", "plan-review", "decompose", "analyze", "building", "code-review", "testing"];
 
-/** Shared send-back budget for a pipeline task across BOTH loop edges
- *  (plan-review→planning and testing→building combined, not 4 each).
- *  Hitting the cap routes the task to `blocked` (reason "revision-cap")
- *  instead of looping again. */
-export const PIPELINE_REVISION_CAP = 4;
+/** Shared send-back budget for a pipeline task across ALL bounce edges
+ *  (plan-review→planning, analyze→decompose, code-review→building, and
+ *  testing→building — one budget, not one per edge). Bumped 4→6 to
+ *  accommodate the new analyze→decompose edge (which costs zero agent turns
+ *  but still counts, so the cap needs room). Hitting the cap routes the
+ *  task to `blocked` (reason "revision-cap") instead of looping again. */
+export const PIPELINE_REVISION_CAP = 6;
 
 /** True when a task's column means "an agent is actively occupying this row
  *  right now" — the plain `running` column for an ordinary task, or any of
@@ -767,29 +772,30 @@ export interface Task {
    *  that don't join the subagents table. */
   runningSubagents?: number;
   /**
-   * Non-null marks this a "pipeline task": its 6 stages (planning →
-   * plan-review → pre-builder → building → code-review → testing → ready)
-   * run automatically with no human click between them, using the same
-   * harness/CLI as an ordinary task — just a different prompt template per
-   * stage (see src/bun/pipeline-prompts.ts). Null (the default, and every
-   * legacy row) is a completely ordinary task — every existing single-agent
-   * behavior is unaffected; this includes every CHILD task a "building"
-   * stage spawns (see `parentTaskId`) — a child is an ordinary task in its
-   * own right, never a pipeline task itself. Set once at creation from the
-   * "Run as pipeline" checkbox; never settable via PATCH — deliberately
-   * absent from `ALLOWED_PATCH_FIELDS` (server.ts), same treatment as
+   * Non-null marks this a "pipeline task": its 9 stages
+   * (specify → clarify → planning → plan-review → decompose → analyze →
+   * building → code-review → testing → ready) run automatically with no
+   * human click between them (except one bounded `ask_user` pause in
+   * `clarify` for claude-code tasks), using the same harness/CLI as an
+   * ordinary task — just a different prompt template per stage (see
+   * src/bun/pipeline-prompts.ts). Null (the default, and every legacy row)
+   * is a completely ordinary task — every existing single-agent behavior is
+   * unaffected; this includes every CHILD task a "building" stage spawns
+   * (see `parentTaskId`) — a child is an ordinary task in its own right,
+   * never a pipeline task itself. Set once at creation from the "Run as
+   * pipeline" checkbox; never settable via PATCH — deliberately absent from
+   * `ALLOWED_PATCH_FIELDS` (server.ts), same treatment as
    * `branch`/`worktreePath`/`prUrl`. Written exclusively by
-   * orchestrator.ts's `advancePipelineStage` (and, for the pre-builder →
+   * orchestrator.ts's `advancePipelineStage` (and, for the decompose →
    * building fresh-entry transition, `spawnPipelineStage`) from here on.
    *
-   * `building` has two distinct entries: FRESH (from pre-builder success —
-   * the parent spawns child tasks per BUILD_PLAN.json and runs no agent of
-   * its own; see build-scheduler.ts's `tickBuild`) and BOUNCE (from
+   * `building` has two distinct entries: FRESH (from decompose/analyze
+   * success — the parent spawns child tasks per TASKS.json and runs no
+   * agent of its own; see build-scheduler.ts's `tickBuild`) and BOUNCE (from
    * code-review "revise" or testing "fail" — a plain single-agent fixup
-   * turn, no children spawned, identical to how `building` always worked
-   * before this stage existed).
+   * turn, no children spawned).
    */
-  pipelineStage: "planning" | "plan-review" | "pre-builder" | "building" | "code-review" | "testing" | null;
+  pipelineStage: "specify" | "clarify" | "planning" | "plan-review" | "decompose" | "analyze" | "building" | "code-review" | "testing" | null;
   /**
    * Set true by the Critic's "approve" verdict on a plan-review run; reset
    * to false whenever a later plan-review run instead sends the task back

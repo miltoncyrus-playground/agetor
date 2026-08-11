@@ -1,13 +1,36 @@
 import { branchCommitType, type Task } from "../shared/types.ts";
 
 /**
- * Fixed filename the Planner writes its plan to, at the worktree root. New
- * convention introduced by pipeline tasks — nothing like it exists
- * elsewhere in agetor. Plain markdown, overwritten on every planning pass
- * (including a revision), no fixed internal schema — just "a human/agent
- * can read what to build and why."
+ * Fixed filename the Specify stage writes its spec to, at the worktree root.
+ * Machine-checkable: must contain at least one `AC-N:` acceptance criterion.
+ */
+export const PIPELINE_SPEC_FILE = "SPEC.md";
+
+/**
+ * Fixed filename the Decompose stage writes its task breakdown to, at the
+ * worktree root. Renamed from BUILD_PLAN.json to signal the SDD change —
+ * agents see the new name in every prompt.
+ */
+export const PIPELINE_TASKS_FILE = "TASKS.json";
+
+/**
+ * Back-compat alias for PIPELINE_TASKS_FILE — used by any call site that
+ * hasn't been updated yet.
+ * @deprecated use PIPELINE_TASKS_FILE
+ */
+export const PIPELINE_BUILD_PLAN_FILE = PIPELINE_TASKS_FILE;
+
+/**
+ * Fixed filename the Planner writes its plan to, at the worktree root.
  */
 export const PIPELINE_PLAN_FILE = "PLAN.md";
+
+/**
+ * Optional repo-level constitution file that every Specify prompt looks for.
+ * Written once (by the standalone constitution flow) and committed to the
+ * default branch so all subsequent pipeline tasks' worktrees can see it.
+ */
+export const PIPELINE_CONSTITUTION_FILE = ".specify/memory/constitution.md";
 
 /**
  * Single line prefix both verdict-bearing stages (plan-review, testing) are
@@ -90,15 +113,75 @@ export function parsePipelineVerdict(
   return { ok: false };
 }
 
-/**
- * Fixed filename the pre-builder writes its decomposition to, at the
- * worktree root. Unlike PLAN.md (prose, for a human/agent to read),
- * BUILD_PLAN.json is machine-parseable — build-scheduler.ts's `tickBuild`
- * walks it to create and start child tasks per {@link parseBuildPlan}.
- */
-export const PIPELINE_BUILD_PLAN_FILE = "BUILD_PLAN.json";
+// ─── Acceptance-criteria parsing ─────────────────────────────────────────────
 
-/** One independently-buildable unit of work declared in BUILD_PLAN.json. */
+/**
+ * Extract every `AC-N:` acceptance-criterion id from a SPEC.md body.
+ * Pure — no IO. Returns a sorted, deduplicated list of id strings
+ * (e.g. `["AC-1", "AC-2", "AC-3"]`). An empty list means the spec has
+ * no parseable acceptance criteria.
+ *
+ * The format is deliberately rigid: `AC-<digits>:` at the start of a
+ * line (after optional leading whitespace), mirroring how
+ * `PIPELINE_VERDICT:` works — a fixed regex-parseable sentinel that
+ * these agents reliably follow when given an example.
+ */
+export function parseSpecAcceptanceCriteria(raw: string): string[] {
+  const pattern = /^\s*(AC-\d+):/gm;
+  const seen = new Set<string>();
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(raw)) !== null) {
+    seen.add(match[1]!);
+  }
+  return Array.from(seen).sort((a, b) => {
+    const na = parseInt(a.slice(3), 10);
+    const nb = parseInt(b.slice(3), 10);
+    return na - nb;
+  });
+}
+
+/**
+ * Cross-check a task plan's `acceptanceCriteria` arrays against the spec's
+ * declared AC ids. Pure — no IO — so it's directly unit-testable.
+ *
+ * Checks two failure modes:
+ *  1. A spec AC id that no subtask claims (`gap` — likely forgotten).
+ *  2. A subtask `acceptanceCriteria` entry that doesn't appear in SPEC.md
+ *     (`phantom` — a typo or stale reference).
+ *
+ * Subtasks with `acceptanceCriteria: []` are allowed — some plumbing
+ * subtasks have no user-visible AC to own.
+ */
+export function analyzeCoverage(
+  specAcIds: string[],
+  plan: BuildPlan,
+): { ok: true } | { ok: false; reason: string } {
+  const specSet = new Set(specAcIds);
+  const claimed = new Set<string>();
+  const phantoms: string[] = [];
+
+  for (const subtask of plan.subtasks) {
+    for (const acId of subtask.acceptanceCriteria) {
+      if (!specSet.has(acId)) {
+        phantoms.push(`"${acId}" (subtask "${subtask.id}")`);
+      } else {
+        claimed.add(acId);
+      }
+    }
+  }
+
+  const gaps = specAcIds.filter((id) => !claimed.has(id));
+  const parts: string[] = [];
+  if (gaps.length > 0) parts.push(`${gaps.join(", ")} ${gaps.length === 1 ? "has" : "have"} no owning subtask`);
+  if (phantoms.length > 0) parts.push(`${phantoms.join(", ")} ${phantoms.length === 1 ? "does" : "do"} not exist in ${PIPELINE_SPEC_FILE}`);
+
+  if (parts.length === 0) return { ok: true };
+  return { ok: false, reason: parts.join("; ") };
+}
+
+// ─── Build plan ──────────────────────────────────────────────────────────────
+
+/** One independently-buildable unit of work declared in TASKS.json. */
 export interface BuildSubtask {
   /** Local id, unique within this plan — referenced by other subtasks'
    *  `dependsOn` and persisted on the resulting child task as
@@ -112,6 +195,11 @@ export interface BuildSubtask {
    *  into the parent branch before this one can start. Empty = startable
    *  immediately. */
   dependsOn: string[];
+  /** Which `AC-N` ids from SPEC.md this subtask is responsible for satisfying.
+   *  Empty array is allowed for purely mechanical/plumbing subtasks with no
+   *  user-visible acceptance criterion. Shape-validated by parseBuildPlan;
+   *  cross-checked against SPEC.md's actual AC list by analyzeCoverage. */
+  acceptanceCriteria: string[];
 }
 
 export interface BuildPlan {
@@ -119,14 +207,15 @@ export interface BuildPlan {
 }
 
 /**
- * Parse and validate a pre-builder's BUILD_PLAN.json. Pure — no DB/IO, the
+ * Parse and validate a decompose stage's TASKS.json. Pure — no DB/IO, the
  * caller reads the file — so it's directly unit-testable, same convention
  * as {@link parsePipelineVerdict}. Validates: valid JSON, an object with a
  * non-empty `subtasks` array, every subtask has a non-empty `id`/`prompt`,
  * ids are unique, every `dependsOn` entry resolves to another declared id
  * (not itself), and the resulting dependency graph is acyclic (DFS-based
  * cycle check). `dependsOn` may be omitted on a subtask (treated as `[]`)
- * but if present must be an array of strings.
+ * but if present must be an array of strings. `acceptanceCriteria` may be
+ * omitted (treated as `[]`) but if present must be an array of strings.
  */
 export function parseBuildPlan(raw: string): { ok: true; plan: BuildPlan } | { ok: false; reason: string } {
   let json: unknown;
@@ -172,7 +261,14 @@ export function parseBuildPlan(raw: string): { ok: true; plan: BuildPlan } | { o
     if (dependsOn.includes(r.id)) {
       return { ok: false, reason: `subtask "${r.id}" cannot depend on itself` };
     }
-    subtasks.push({ id: r.id, title, prompt: r.prompt, dependsOn });
+    let acceptanceCriteria: string[] = [];
+    if (r.acceptanceCriteria !== undefined) {
+      if (!Array.isArray(r.acceptanceCriteria) || r.acceptanceCriteria.some((a) => typeof a !== "string")) {
+        return { ok: false, reason: `subtasks[${i}] ("${r.id}").acceptanceCriteria must be an array of strings` };
+      }
+      acceptanceCriteria = r.acceptanceCriteria as string[];
+    }
+    subtasks.push({ id: r.id, title, prompt: r.prompt, dependsOn, acceptanceCriteria });
   }
 
   for (const s of subtasks) {
@@ -213,40 +309,113 @@ export function parseBuildPlan(raw: string): { ok: true; plan: BuildPlan } | { o
   return { ok: true, plan: { subtasks } };
 }
 
+// ─── Prompt builders ──────────────────────────────────────────────────────────
+
 const TICKET_HEADER = "## Original ticket";
 
 function ticketBlock(task: Task): string {
   return `${TICKET_HEADER}\n\n${task.prompt}`;
 }
 
-/** Planner stage — not verdict-bearing. Success is just "the run finished". */
+/** Specify stage — writes SPEC.md. Not verdict-bearing; gate is file-existence. */
+function specifyPrompt(task: Task, constitutionRaw: string | null): string {
+  const constitution = constitutionRaw
+    ? `\n\nThe following project constitution (from ${PIPELINE_CONSTITUTION_FILE}) ` +
+      `describes project principles and constraints that apply to all work here. ` +
+      `Respect every principle it states when writing the spec:\n\n${constitutionRaw}`
+    : `\n\n(No project constitution found at ${PIPELINE_CONSTITUTION_FILE} — proceed without one.)`;
+  return (
+    `You are the Spec Author in an automated spec-driven pipeline: ` +
+    `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
+    `Your job is to write a clear, testable specification for the ticket below — NOT to design ` +
+    `the implementation. Do NOT name files, frameworks, or approach; those are the Planner's job.\n\n` +
+    `Write ${PIPELINE_SPEC_FILE} at the repository root with exactly this structure:\n` +
+    `## Summary\n<one paragraph>\n\n` +
+    `## User stories\n<bulleted list>\n\n` +
+    `## Acceptance criteria\n` +
+    `AC-1: <first criterion, testable, behavioural>\n` +
+    `AC-2: <second criterion>\n` +
+    `<…more AC-N: lines as needed>\n\n` +
+    `## Non-goals\n<what is explicitly out of scope>\n\n` +
+    `## Edge cases considered\n<notable edge/failure cases the implementation must handle>\n\n` +
+    `Rules for acceptance criteria:\n` +
+    `- Each must be independently testable — a pass/fail check, not a quality hope.\n` +
+    `- Use the exact format "AC-N: <text>" (e.g. "AC-1: The settings toggle persists across reloads.").\n` +
+    `- Number them sequentially from 1 with no gaps.\n` +
+    `- Do NOT mention file names, function names, or implementation details.\n\n` +
+    `When ${PIPELINE_SPEC_FILE} is written, stop — do not ask a question, do not wait for ` +
+    `confirmation.${constitution}\n\n${ticketBlock(task)}`
+  );
+}
+
+/** Clarify stage — resolves ambiguity in SPEC.md before design begins.
+ *  Not verdict-bearing; gate is SPEC.md still present. For claude-code
+ *  tasks this stage may pause on `ask_user`; for codex/gemini it
+ *  self-resolves by picking the lowest-risk interpretation. */
+function clarifyPrompt(task: Task): string {
+  return (
+    `You are the Clarifier in an automated spec-driven pipeline: ` +
+    `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
+    `Read ${PIPELINE_SPEC_FILE} at the repository root (written by the Specify stage) and scan ` +
+    `it against this ambiguity taxonomy:\n` +
+    `1. Functional scope — is it clear what features are IN vs OUT?\n` +
+    `2. Data shape — are inputs/outputs/state clearly defined?\n` +
+    `3. UX flow — are the interaction steps clear?\n` +
+    `4. Non-functional (perf/security/a11y) — any implicit requirements?\n` +
+    `5. Integration behaviour — how does this interact with existing features?\n` +
+    `6. Edge/failure handling — are error cases specified?\n` +
+    `7. Terminology — are any domain terms ambiguous?\n\n` +
+    `If you find up to 5 material ambiguities, use the \`ask_user\` tool to ask the human ` +
+    `(one question at a time, or grouped if closely related). Then append a ` +
+    `\`## Clarifications\` section to ${PIPELINE_SPEC_FILE} recording each Q and the answer, ` +
+    `and fold the answer into the relevant AC or requirement inline.\n\n` +
+    `If no material ambiguities exist, or if you cannot use \`ask_user\` (e.g. you are a ` +
+    `codex/gemini agent), instead append an \`## Assumptions\` section to ${PIPELINE_SPEC_FILE} ` +
+    `recording each ambiguity and how you resolved it (always by choosing the lowest-risk ` +
+    `conventional interpretation).\n\n` +
+    `Do NOT rewrite or remove any existing content from ${PIPELINE_SPEC_FILE} — only append. ` +
+    `Do not write or change any other files. When done, stop — do not ask a question beyond ` +
+    `the \`ask_user\` calls above, do not wait for confirmation.\n\n${ticketBlock(task)}`
+  );
+}
+
+/** Planner stage — reads SPEC.md (authoritative for *what*), writes PLAN.md
+ *  (authoritative for *how*). Not verdict-bearing. */
 function planningPrompt(task: Task): string {
   const feedback = task.pipelineFeedback
     ? `\n\nThe previous plan was sent back for revision. Reviewer feedback to address:\n\n${task.pipelineFeedback}`
     : "";
   return (
-    `You are the Planner in an automated pipeline: Planner → Critic → Pre-Builder → Builder → Code Reviewer → Tester. ` +
-    `Investigate this codebase enough to design a concrete implementation plan for the ` +
-    `ticket below, then write that plan to ${PIPELINE_PLAN_FILE} at the repository root ` +
-    `(overwrite it if it already exists). The plan should name the files/areas that need ` +
-    `to change and the approach — a Critic agent will review it next, and a Builder agent ` +
-    `will implement it from the file alone, so it needs to be concrete enough to act on ` +
-    `without further clarification from you. Do not write or change any other files, and ` +
-    `do not run any commands beyond what's needed to investigate the codebase. When ` +
-    `${PIPELINE_PLAN_FILE} is written, stop — do not ask a question, do not wait for ` +
-    `confirmation.${feedback}\n\n${ticketBlock(task)}`
+    `You are the Planner in an automated spec-driven pipeline: ` +
+    `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
+    `${PIPELINE_SPEC_FILE} at the repository root (already written and clarified) defines WHAT ` +
+    `to build — read it first. Your job is to design HOW to build it: name the files/areas ` +
+    `that need to change, the approach, and reference each acceptance criterion by its ` +
+    `AC-N id (e.g. "AC-1 is satisfied by…") rather than repeating its text. ` +
+    `Do NOT restate the requirements — ${PIPELINE_SPEC_FILE} owns those. ` +
+    `A Critic agent will review your plan next, and a Builder will implement it from the file ` +
+    `alone, so it needs to be concrete enough to act on without further clarification from you.\n\n` +
+    `Write ${PIPELINE_PLAN_FILE} at the repository root (overwrite it if it already exists). ` +
+    `Do not write or change any other files, and do not run any commands beyond what's needed ` +
+    `to investigate the codebase. When ${PIPELINE_PLAN_FILE} is written, stop — do not ask a ` +
+    `question, do not wait for confirmation.${feedback}\n\n${ticketBlock(task)}`
   );
 }
 
-/** Critic stage — must end with PIPELINE_VERDICT: approve|revise <reason>. */
+/** Critic stage — must end with PIPELINE_VERDICT: approve|revise <reason>.
+ *  Review scope includes AC coverage and constitution (if present). */
 function planReviewPrompt(task: Task): string {
   return (
-    `You are the Critic in an automated pipeline: Planner → Critic → Pre-Builder → Builder → Code Reviewer → Tester. ` +
-    `Read ${PIPELINE_PLAN_FILE} at the repository root (written by the Planner) and check ` +
-    `it against the actual codebase — does it name real files/patterns, is the approach ` +
-    `sound, does it fully address the ticket below, is anything it proposes likely to break ` +
-    `something else? Do not write or change any files yourself; this is a review, not an ` +
-    `implementation pass.\n\n` +
+    `You are the Critic in an automated spec-driven pipeline: ` +
+    `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
+    `Read ${PIPELINE_SPEC_FILE} (the acceptance criteria are the source of truth for "done") ` +
+    `and ${PIPELINE_PLAN_FILE} (what the Planner proposes) at the repository root. ` +
+    `Check the plan against the actual codebase and ask:\n` +
+    `- Does ${PIPELINE_PLAN_FILE}'s approach address EVERY AC-N in ${PIPELINE_SPEC_FILE} at a design level?\n` +
+    `- Does it name real files/patterns, is the approach sound?\n` +
+    `- Is anything it proposes likely to break something else?\n` +
+    `- If ${PIPELINE_CONSTITUTION_FILE} exists, does it violate any project principles?\n\n` +
+    `Do not write or change any files yourself; this is a review, not an implementation pass.\n\n` +
     `End your final message with exactly one line, in exactly this form:\n` +
     `${PIPELINE_VERDICT_PREFIX} approve\n` +
     `— if the plan is ready to build — or:\n` +
@@ -257,46 +426,46 @@ function planReviewPrompt(task: Task): string {
   );
 }
 
-/** Pre-Builder stage — not verdict-bearing (validity of the file it writes
- *  IS the gate, checked by orchestrator.ts's advancePipelineStage). Reads
- *  the approved PLAN.md and decomposes it into independently-buildable
- *  subtasks, declaring which depend on which — build-scheduler.ts's
- *  tickBuild then runs each subtask as a REAL concurrent child task
- *  (own worktree/branch/agent session), starting the independent ones in
- *  parallel and holding dependents until their deps are merged back. */
-function preBuilderPrompt(task: Task): string {
+/** Decompose stage (renamed from pre-builder) — reads PLAN.md, writes TASKS.json.
+ *  Not verdict-bearing; validity of the file IS the gate.
+ *  Every subtask now carries an `acceptanceCriteria` array. */
+function decomposePrompt(task: Task): string {
   return (
-    `You are the Pre-Builder in an automated pipeline: Planner → Critic → Pre-Builder → ` +
-    `Builder → Code Reviewer → Tester. Read ${PIPELINE_PLAN_FILE} at the repository root ` +
-    `(already reviewed and approved) and decompose it into independently-buildable ` +
-    `subtasks — units of work that can be implemented in isolation, in their OWN git ` +
-    `worktree, without needing to see another subtask's in-progress changes. Declare a ` +
-    `dependency only when one subtask's code genuinely can't be written without another's ` +
-    `already existing (e.g. a route that imports a middleware module another subtask adds) ` +
-    `— everything else should be independent, since independent subtasks run in parallel. ` +
+    `You are the Decomposer in an automated spec-driven pipeline: ` +
+    `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
+    `Read ${PIPELINE_PLAN_FILE} at the repository root (already reviewed and approved) and ` +
+    `decompose it into independently-buildable subtasks — units of work that can be ` +
+    `implemented in isolation, in their OWN git worktree, without needing to see another ` +
+    `subtask's in-progress changes. Declare a dependency only when one subtask's code ` +
+    `genuinely can't be written without another's already existing — everything else should ` +
+    `be independent, since independent subtasks run in parallel. ` +
     `If the plan doesn't decompose naturally, that's fine: emit exactly one subtask ` +
     `covering the whole implementation.\n\n` +
-    `Write your decomposition to ${PIPELINE_BUILD_PLAN_FILE} at the repository root, as ` +
+    `Also read ${PIPELINE_SPEC_FILE} (at the repository root) to understand the acceptance ` +
+    `criteria (AC-N: lines). For each subtask, declare which AC-N ids it is responsible for ` +
+    `satisfying in its \`acceptanceCriteria\` array. A subtask with no user-visible AC ` +
+    `(e.g. a pure plumbing change) may have \`"acceptanceCriteria": []\`.\n\n` +
+    `Write your decomposition to ${PIPELINE_TASKS_FILE} at the repository root, as ` +
     `JSON in exactly this shape:\n` +
     `{\n` +
     `  "subtasks": [\n` +
     `    { "id": "short-unique-id", "title": "short title", "prompt": "concrete, ` +
     `self-contained instructions for exactly this slice — the agent that implements it ` +
     `will see ONLY this text plus ${PIPELINE_PLAN_FILE} itself, not your reasoning here", ` +
-    `"dependsOn": [] },\n` +
-    `    { "id": "another-id", "title": "...", "prompt": "...", "dependsOn": ["short-unique-id"] }\n` +
+    `"dependsOn": [], "acceptanceCriteria": ["AC-1", "AC-2"] },\n` +
+    `    { "id": "another-id", "title": "...", "prompt": "...", "dependsOn": ["short-unique-id"], "acceptanceCriteria": [] }\n` +
     `  ]\n` +
     `}\n\n` +
     `Every "id" must be unique within the file; every "dependsOn" entry must name another ` +
     `declared "id" (never itself); the resulting dependency graph must be acyclic. Each ` +
     `subtask's "prompt" must be concrete enough to implement without further clarification ` +
     `— the agent implementing it works from that text and ${PIPELINE_PLAN_FILE} alone.\n\n` +
-    `Then commit BOTH ${PIPELINE_PLAN_FILE} and ${PIPELINE_BUILD_PLAN_FILE} to this branch ` +
-    `(they may already be committed from an earlier pass — commit again only if you changed ` +
-    `something). Do NOT push, do not open a pull request — this stays local. The commit is ` +
-    `required: each subtask's own agent will work in a separate git worktree branched off ` +
-    `this branch, and can only see files that have actually been committed here, not ones ` +
-    `left as uncommitted working-tree edits.\n\n` +
+    `Then commit ${PIPELINE_SPEC_FILE}, ${PIPELINE_PLAN_FILE}, and ${PIPELINE_TASKS_FILE} ` +
+    `to this branch (they may already be committed from an earlier pass — commit again only ` +
+    `if you changed something). Do NOT push, do not open a pull request — this stays local. ` +
+    `The commit is required: each subtask's own agent will work in a separate git worktree ` +
+    `branched off this branch, and can only see files that have actually been committed ` +
+    `here, not ones left as uncommitted working-tree edits.\n\n` +
     `When done, stop — do not ask a question, do not wait for confirmation.\n\n${ticketBlock(task)}`
   );
 }
@@ -307,11 +476,14 @@ function buildingPrompt(task: Task): string {
     ? `\n\nThe previous implementation was sent back by the Tester. What it found:\n\n${task.pipelineFeedback}`
     : "";
   return (
-    `You are the Builder in an automated pipeline: Planner → Critic → Pre-Builder → Builder → Code Reviewer → Tester. ` +
+    `You are the Builder in an automated spec-driven pipeline: ` +
+    `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
     `${PIPELINE_PLAN_FILE} at the repository root (already reviewed and approved) describes ` +
-    `what to build. Implement it. Follow the plan; if you need to deviate in a small way to ` +
-    `make it actually work, that's fine, but stay within its intent — don't redesign the ` +
-    `approach. A Tester agent will run linters/typecheck/tests against your changes next. ` +
+    `what to build. Implement it. The acceptance criteria in ${PIPELINE_SPEC_FILE} are the ` +
+    `testable definition of done — implement towards those. Follow the plan; if you need to ` +
+    `deviate in a small way to make it actually work, that's fine, but stay within its ` +
+    `intent — don't redesign the approach. A Tester agent will run linters/typecheck/tests ` +
+    `against your changes next. ` +
     `When you're done, stop — do not ask a question, do not wait for confirmation, do not ` +
     `commit anything (a later stage handles that).${feedback}\n\n${ticketBlock(task)}`
   );
@@ -323,14 +495,23 @@ function buildingPrompt(task: Task): string {
  * time — a child has `pipelineStage: null`, so `startTask` uses
  * `task.prompt` directly rather than routing through `stagePrompt`). Pure,
  * same convention as every other prompt builder here. Folds in the
- * subtask's own instructions, points the child at PLAN.md for full context
- * (a terse subtask prompt alone may not carry the plan's rationale), and —
- * critically — an explicit local-commit instruction: without it, a child
- * that finishes without committing leaves nothing for the merge-back step
- * (worktree.mergeBranch) to merge.
+ * subtask's own instructions, points the child at PLAN.md for full context,
+ * AND inlines the subtask's assigned acceptance-criteria text from SPEC.md
+ * so each child agent has a concrete, testable target rather than just a
+ * prose-only directive.
  */
-export function childBuildPrompt(parentTask: Task, subtask: BuildSubtask): string {
+export function childBuildPrompt(
+  parentTask: Task,
+  subtask: BuildSubtask,
+  specAcMap: Record<string, string> = {},
+): string {
   const ccType = branchCommitType(parentTask.branch, parentTask.taskType);
+  const acLines = subtask.acceptanceCriteria
+    .map((id) => specAcMap[id] ? `  ${id}: ${specAcMap[id]}` : `  ${id}`)
+    .join("\n");
+  const acBlock = subtask.acceptanceCriteria.length > 0
+    ? `\n\nYour slice must satisfy these acceptance criteria from ${PIPELINE_SPEC_FILE}:\n${acLines}`
+    : "";
   return (
     `You are one of several agents implementing independent slices of a larger plan in ` +
     `parallel, each in your own git worktree branched off the same commit. Your slice: ` +
@@ -338,7 +519,7 @@ export function childBuildPrompt(parentTask: Task, subtask: BuildSubtask): strin
     `${PIPELINE_PLAN_FILE} at the repository root has the full plan for context — read it ` +
     `if you need to understand how your slice fits in, but implement ONLY what's described ` +
     `below; the other slices are being built separately and will be merged in alongside ` +
-    `yours.\n\n${subtask.prompt}\n\n` +
+    `yours.${acBlock}\n\n${subtask.prompt}\n\n` +
     `When you're done, commit your changes locally with a clear commit message (prefix the ` +
     `subject with "${ccType}:", e.g. "${ccType}: ..."). This step is required — your work ` +
     `is only picked up by the rest of the pipeline once it's committed. Do NOT push, do not ` +
@@ -351,26 +532,21 @@ export function childBuildPrompt(parentTask: Task, subtask: BuildSubtask): strin
 
 /**
  * Code Reviewer stage — must end with PIPELINE_VERDICT: approve|revise
- * <reason>, same sentinel shape plan-review uses (a Critic-style gate,
- * just reviewing the actual merged diff instead of the plan). Reached only
- * after every building sub-task has merged into this branch, so `git diff`
- * against the branch's own base captures the FULL implementation —
- * whether that came from one plain building turn (a revision bounce) or
- * several parallel child tasks merged in (a fresh pre-builder-driven
- * build) is invisible from here, and doesn't need to be: this stage
- * reviews the resulting code, not how it was produced.
+ * <reason>. Review scope grows: check off each AC-N the diff's subtasks
+ * claimed, not just "does this match PLAN.md."
  */
 function codeReviewPrompt(task: Task): string {
   const base = task.baseRef ?? "the branch's base commit";
   return (
-    `You are the Code Reviewer in an automated pipeline: Planner → Critic → Pre-Builder → ` +
-    `Builder → Code Reviewer → Tester. Review the actual code changes on this branch — run ` +
+    `You are the Code Reviewer in an automated spec-driven pipeline: ` +
+    `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
+    `Review the actual code changes on this branch — run ` +
     `\`git diff ${base}\` (or \`git log -p ${base}..HEAD\`) to see everything that's landed ` +
-    `since this branch started. Check correctness, whether it actually implements ` +
-    `${PIPELINE_PLAN_FILE} (at the repository root) as intended, code quality, and whether ` +
-    `anything looks likely to break something else. Do not write or change any files ` +
-    `yourself, and do not run the test suite or linters — a Tester agent does that next; ` +
-    `this is a read of the code itself, not its behavior.\n\n` +
+    `since this branch started. Read ${PIPELINE_SPEC_FILE} for the acceptance criteria, and ` +
+    `check: (1) does the diff correctly implement ${PIPELINE_PLAN_FILE}? (2) does it satisfy ` +
+    `every AC-N in ${PIPELINE_SPEC_FILE} at a code level? (3) code quality — correctness, ` +
+    `no obvious regressions. Do not write or change any files yourself, and do not run the ` +
+    `test suite or linters — a Tester agent does that next.\n\n` +
     `End your final message with exactly one line, in exactly this form:\n` +
     `${PIPELINE_VERDICT_PREFIX} approve\n` +
     `— if the implementation is ready to test — or:\n` +
@@ -381,17 +557,19 @@ function codeReviewPrompt(task: Task): string {
   );
 }
 
-/** Tester stage — must end with PIPELINE_VERDICT: pass|fail <reason>. Local
- *  commit only, reusing commitPushPrompt's commit-type derivation — every
- *  push/PR-drafting instruction is deliberately absent; this must never
- *  leave the local branch. */
+/** Tester stage — must end with PIPELINE_VERDICT: pass|fail <reason>. Hands
+ *  the Tester the full AC checklist so it verifies each criterion is actually
+ *  exercised, not just that lint/typecheck pass. */
 function testingPrompt(task: Task): string {
   const ccType = branchCommitType(task.branch, task.taskType);
   return (
-    `You are the Tester in an automated pipeline: Planner → Critic → Pre-Builder → Builder → Code Reviewer → Tester. ` +
-    `Run this project's linters, type-checker, and test suite. If something fails and the ` +
-    `fix is small and obviously correct, fix it directly; for anything larger, leave it and ` +
-    `report it in your verdict instead of guessing at a bigger change.\n\n` +
+    `You are the Tester in an automated spec-driven pipeline: ` +
+    `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
+    `Run this project's linters, type-checker, and test suite. Also read ${PIPELINE_SPEC_FILE} ` +
+    `and verify that every AC-N in its acceptance-criteria list is actually exercised — by an ` +
+    `assertion in the test suite, or by a manual check you perform yourself. If something ` +
+    `fails and the fix is small and obviously correct, fix it directly; for anything larger, ` +
+    `leave it and report it in your verdict instead of guessing at a bigger change.\n\n` +
     `If you changed anything, commit it locally with a clear commit message (prefix the ` +
     `subject with "${ccType}:", e.g. "${ccType}: ..."). Do NOT push, do not open a pull ` +
     `request, do not run any git command that touches a remote — this commit stays local, ` +
@@ -399,26 +577,35 @@ function testingPrompt(task: Task): string {
     `message.\n\n` +
     `End your final message with exactly one line, in exactly this form:\n` +
     `${PIPELINE_VERDICT_PREFIX} pass\n` +
-    `— if everything is clean — or:\n` +
+    `— if everything is clean and every AC is verified — or:\n` +
     `${PIPELINE_VERDICT_PREFIX} fail <one-paragraph reason>\n` +
-    `— if something is still broken, explaining concretely what so the Builder can fix it. ` +
-    `Nothing else you write is parsed — only this line decides what happens next, so make ` +
-    `sure it's the literal last line of your message.\n\n${ticketBlock(task)}`
+    `— if something is still broken or an AC is unverified, explaining concretely what so ` +
+    `the Builder can fix it. Nothing else you write is parsed — only this line decides what ` +
+    `happens next, so make sure it's the literal last line of your message.\n\n${ticketBlock(task)}`
   );
 }
 
 /** Dispatch to the right stage's prompt builder. The returned string
  *  *replaces* the raw ticket prompt as the turn's text in startTask —
  *  nothing is lost, since every builder above folds task.prompt back in
- *  via ticketBlock(). */
+ *  via ticketBlock(). The `constitutionRaw` param is only used by `specify`
+ *  (other stages ignore it). */
 export function stagePrompt(
   task: Task,
   stage: NonNullable<Task["pipelineStage"]>,
+  constitutionRaw?: string | null,
 ): string {
   switch (stage) {
+    case "specify": return specifyPrompt(task, constitutionRaw ?? null);
+    case "clarify": return clarifyPrompt(task);
     case "planning": return planningPrompt(task);
     case "plan-review": return planReviewPrompt(task);
-    case "pre-builder": return preBuilderPrompt(task);
+    case "decompose": return decomposePrompt(task);
+    case "analyze":
+      // analyze is handled inline in advancePipelineStage (no agent turn) —
+      // this branch is unreachable in production but must not be a compile
+      // error in the switch.
+      return "";
     case "building": return buildingPrompt(task);
     case "code-review": return codeReviewPrompt(task);
     case "testing": return testingPrompt(task);

@@ -2,10 +2,13 @@ import { test, expect } from "bun:test";
 import {
   parsePipelineVerdict,
   parseBuildPlan,
+  parseSpecAcceptanceCriteria,
+  analyzeCoverage,
   childBuildPrompt,
   stagePrompt,
   PIPELINE_PLAN_FILE,
-  PIPELINE_BUILD_PLAN_FILE,
+  PIPELINE_TASKS_FILE,
+  PIPELINE_SPEC_FILE,
   PIPELINE_VERDICT_PREFIX,
 } from "./pipeline-prompts.ts";
 import type { Task } from "../shared/types.ts";
@@ -179,10 +182,10 @@ test("stagePrompt: code-review instructs reviewing the actual diff against baseR
   expect(p.toLowerCase()).toContain("do not run the test suite");
 });
 
-test("stagePrompt: pre-builder shows the BUILD_PLAN.json schema and instructs a commit, no verdict instruction", () => {
-  const p = stagePrompt(task({ pipelineStage: "pre-builder" }), "pre-builder");
+test("stagePrompt: decompose shows the TASKS.json schema and instructs a commit, no verdict instruction", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
   expect(p).toContain(PIPELINE_PLAN_FILE);
-  expect(p).toContain(PIPELINE_BUILD_PLAN_FILE);
+  expect(p).toContain(PIPELINE_TASKS_FILE);
   expect(p).toContain("\"subtasks\"");
   expect(p).toContain("\"dependsOn\"");
   expect(p.toLowerCase()).toContain("commit");
@@ -278,7 +281,7 @@ test("parseBuildPlan: a subtask missing a prompt is rejected", () => {
 test("childBuildPrompt: folds in the subtask's own prompt, points at PLAN.md, requires a local commit, forbids push", () => {
   const p = childBuildPrompt(
     task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
-    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [] },
+    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [], acceptanceCriteria: [] },
   );
   expect(p).toContain("Add a toggle component to settings.");
   expect(p).toContain(PIPELINE_PLAN_FILE);
@@ -287,4 +290,100 @@ test("childBuildPrompt: folds in the subtask's own prompt, points at PLAN.md, re
   expect(p.toLowerCase()).toContain("do not push");
   expect(p.toLowerCase()).toContain("do not open a pull request");
   expect(p).toContain('"feature:');
+});
+
+test("childBuildPrompt: inlines AC text from specAcMap when the subtask owns ACs", () => {
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
+    { id: "toggle", title: "Add the toggle", prompt: "Do the thing.", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2"] },
+    { "AC-1": "The toggle persists across reloads.", "AC-2": "The toggle is accessible." },
+  );
+  expect(p).toContain("AC-1: The toggle persists across reloads.");
+  expect(p).toContain("AC-2: The toggle is accessible.");
+  expect(p).toContain(PIPELINE_SPEC_FILE);
+});
+
+// --- parseSpecAcceptanceCriteria -----------------------------------------------
+
+test("parseSpecAcceptanceCriteria: extracts AC ids in order, deduplicating", () => {
+  const raw = "## Acceptance criteria\nAC-1: It works.\nAC-2: It's fast.\nAC-1: (duplicate — ignored)";
+  expect(parseSpecAcceptanceCriteria(raw)).toEqual(["AC-1", "AC-2"]);
+});
+
+test("parseSpecAcceptanceCriteria: returns empty array when no AC-N lines are present", () => {
+  expect(parseSpecAcceptanceCriteria("# Spec\n\nNo criteria here.")).toEqual([]);
+});
+
+test("parseSpecAcceptanceCriteria: sorts numerically (AC-10 after AC-9, not after AC-1)", () => {
+  const raw = "AC-10: x\nAC-2: y\nAC-1: z";
+  expect(parseSpecAcceptanceCriteria(raw)).toEqual(["AC-1", "AC-2", "AC-10"]);
+});
+
+test("parseSpecAcceptanceCriteria: leading whitespace is tolerated", () => {
+  expect(parseSpecAcceptanceCriteria("  AC-3: indented")).toEqual(["AC-3"]);
+});
+
+// --- analyzeCoverage -----------------------------------------------------------
+
+test("analyzeCoverage: all ACs covered returns ok", () => {
+  const plan = {
+    subtasks: [
+      { id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: ["AC-1"] },
+      { id: "b", title: "B", prompt: "do b", dependsOn: [], acceptanceCriteria: ["AC-2", "AC-3"] },
+    ],
+  };
+  expect(analyzeCoverage(["AC-1", "AC-2", "AC-3"], plan)).toEqual({ ok: true });
+});
+
+test("analyzeCoverage: an unclaimed AC id returns a gap error", () => {
+  const plan = {
+    subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-1"] }],
+  };
+  const result = analyzeCoverage(["AC-1", "AC-2"], plan);
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toContain("AC-2");
+});
+
+test("analyzeCoverage: a phantom AC id (in subtask but not in spec) returns a phantom error", () => {
+  const plan = {
+    subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-99"] }],
+  };
+  const result = analyzeCoverage(["AC-1"], plan);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toContain("AC-99");
+    expect(result.reason).toContain("AC-1"); // also a gap
+  }
+});
+
+test("analyzeCoverage: empty spec ACs with empty subtask ACs returns ok", () => {
+  const plan = { subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: [] }] };
+  expect(analyzeCoverage([], plan)).toEqual({ ok: true });
+});
+
+// --- stagePrompt: new SDD stages -----------------------------------------------
+
+test("stagePrompt: specify mentions SPEC.md, AC format, and the ticket title", () => {
+  const p = stagePrompt(task({ pipelineStage: "specify" }), "specify");
+  expect(p).toContain(PIPELINE_SPEC_FILE);
+  expect(p).toContain("AC-1:");
+  expect(p).toContain("Add a dark mode toggle to settings."); // ticket prompt appears in the block
+  expect(p).not.toContain(PIPELINE_VERDICT_PREFIX);
+});
+
+test("stagePrompt: specify folds in the constitution when provided", () => {
+  const p = stagePrompt(task({ pipelineStage: "specify" }), "specify", "## Project principles\nAlways write tests.");
+  expect(p).toContain("Always write tests.");
+});
+
+test("stagePrompt: clarify mentions SPEC.md and the ask_user tool", () => {
+  const p = stagePrompt(task({ pipelineStage: "clarify" }), "clarify");
+  expect(p).toContain(PIPELINE_SPEC_FILE);
+  expect(p).toContain("ask_user");
+  expect(p).not.toContain(PIPELINE_VERDICT_PREFIX);
+});
+
+test("stagePrompt: analyze returns empty string (no agent turn)", () => {
+  const p = stagePrompt(task({ pipelineStage: "analyze" }), "analyze");
+  expect(p).toBe("");
 });

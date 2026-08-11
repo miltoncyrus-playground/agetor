@@ -463,12 +463,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   }, [isolate, isPipeline]);
 
   const pipelineTitle =
-    "Automatically walks this task through 4 stages with no click between "
-    + "them — Planning, Plan Review, Building, Testing — each running the "
-    + "same agent with a different prompt, looping revisions between "
-    + "Plan Review/Planning and Testing/Building until both approve or the "
-    + "revision budget runs out. Requires isolation (worktree) — the same "
-    + "worktree/branch has to persist across every stage.";
+    "Spec-driven pipeline: automatically walks this task through 9 stages "
+    + "— Specify, Clarify, Plan, Plan Review, Decompose, Analyze, Build, "
+    + "Code Review, Test — with no click between them. Writes a SPEC.md "
+    + "with numbered acceptance criteria, then designs and implements towards "
+    + "those criteria, looping revisions until all gates pass or the "
+    + "revision budget runs out. Requires isolation (worktree).";
 
   // Sidebar-wide drag/drop — anything dropped on the form (not just the
   // ReferencesPicker) gets added to the references list. The inner picker
