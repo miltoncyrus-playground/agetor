@@ -1648,7 +1648,10 @@ function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOu
           updateColumn(taskId, runId, "ready", "stage-advance");
           return;
         }
-        spawnStage("decompose");
+        // Reset the shared revision budget so decompose/build phases each get
+        // a full PIPELINE_REVISION_CAP of their own (plan-review bounces must
+        // not eat into the decompose/build budget).
+        spawnStage("decompose", { revisionCount: 0 });
         return;
       }
       bounceOrBlock("planning", verdict.reason, { planApproved: false });

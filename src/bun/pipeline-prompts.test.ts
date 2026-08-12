@@ -193,6 +193,27 @@ test("stagePrompt: decompose shows the TASKS.json schema and instructs a commit,
   expect(p).not.toContain(PIPELINE_VERDICT_PREFIX);
 });
 
+test("stagePrompt: decompose prohibits phantom AC ids", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
+  expect(p).toContain("Do NOT invent or guess AC ids");
+});
+
+test("stagePrompt: decompose on a fresh pass has no revision-context block", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose", revisionCount: 0, pipelineFeedback: null }), "decompose");
+  expect(p).not.toContain("revision pass");
+});
+
+test("stagePrompt: decompose on a revision pass injects the error and instructs targeted fix", () => {
+  const p = stagePrompt(
+    task({ pipelineStage: "decompose", revisionCount: 1, pipelineFeedback: '"AC-99" does not exist in SPEC.md' }),
+    "decompose",
+  );
+  expect(p).toContain("revision pass #1");
+  expect(p).toContain('"AC-99" does not exist in SPEC.md');
+  expect(p).toContain("Fix ONLY");
+  expect(p).toContain("Remove any id not in that list");
+});
+
 // --- parseBuildPlan -----------------------------------------------------------
 
 test("parseBuildPlan: valid plan with independent and dependent subtasks", () => {

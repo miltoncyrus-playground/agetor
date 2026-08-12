@@ -440,6 +440,15 @@ function planReviewPrompt(task: Task): string {
  *  Not verdict-bearing; validity of the file IS the gate.
  *  Every subtask now carries an `acceptanceCriteria` array. */
 function decomposePrompt(task: Task): string {
+  const isRevision = task.revisionCount > 0 && task.pipelineFeedback != null;
+  const revisionContext = isRevision
+    ? `\n\nThis is revision pass #${task.revisionCount}. The previous ${PIPELINE_TASKS_FILE} ` +
+      `was rejected for this reason:\n\n"${task.pipelineFeedback}"\n\n` +
+      `Fix ONLY what the error above describes — do not restructure the rest of the decomposition. ` +
+      `The most common cause is referencing an AC-N id that does not appear in ${PIPELINE_SPEC_FILE}. ` +
+      `Before writing ${PIPELINE_TASKS_FILE}, read ${PIPELINE_SPEC_FILE} and list every AC-N id ` +
+      `it actually contains — then use ONLY those ids. Remove any id not in that list.`
+    : "";
   return (
     `You are the Decomposer in an automated spec-driven pipeline: ` +
     `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
@@ -452,9 +461,11 @@ function decomposePrompt(task: Task): string {
     `If the plan doesn't decompose naturally, that's fine: emit exactly one subtask ` +
     `covering the whole implementation.\n\n` +
     `Also read ${PIPELINE_SPEC_FILE} (at the repository root) to understand the acceptance ` +
-    `criteria (AC-N: lines). For each subtask, declare which AC-N ids it is responsible for ` +
-    `satisfying in its \`acceptanceCriteria\` array. A subtask with no user-visible AC ` +
-    `(e.g. a pure plumbing change) may have \`"acceptanceCriteria": []\`.\n\n` +
+    `criteria. Before assigning ACs to subtasks, enumerate EVERY "AC-N:" line in ` +
+    `${PIPELINE_SPEC_FILE} — that exact list is the ONLY valid set of AC ids. ` +
+    `Do NOT invent or guess AC ids; if a subtask covers work that has no matching AC ` +
+    `in ${PIPELINE_SPEC_FILE}, use \`"acceptanceCriteria": []\`. Using an id not ` +
+    `present in ${PIPELINE_SPEC_FILE} is an immediate error that blocks the pipeline.\n\n` +
     `Write your decomposition to ${PIPELINE_TASKS_FILE} at the repository root, as ` +
     `JSON in exactly this shape:\n` +
     `{\n` +
@@ -476,7 +487,7 @@ function decomposePrompt(task: Task): string {
     `The commit is required: each subtask's own agent will work in a separate git worktree ` +
     `branched off this branch, and can only see files that have actually been committed ` +
     `here, not ones left as uncommitted working-tree edits.\n\n` +
-    `When done, stop — do not ask a question, do not wait for confirmation.`
+    `When done, stop — do not ask a question, do not wait for confirmation.${revisionContext}`
   );
 }
 
