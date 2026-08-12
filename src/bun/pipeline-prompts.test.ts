@@ -451,3 +451,61 @@ test("stagePrompt: code-review requests bullet-point output, not paragraphs", ()
   expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} approve`);
   expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} revise`);
 });
+
+// --- revision-context injection (anti-moving-goalposts) -----------------------
+
+test("stagePrompt: plan-review on a fresh pass has no revision-context block", () => {
+  const p = stagePrompt(task({ pipelineStage: "plan-review", revisionCount: 0, pipelineFeedback: null }), "plan-review");
+  expect(p).not.toContain("revision pass");
+  expect(p).not.toContain("previous feedback");
+});
+
+test("stagePrompt: plan-review on a revision pass injects prior feedback and narrows scope", () => {
+  const p = stagePrompt(
+    task({ pipelineStage: "plan-review", revisionCount: 1, pipelineFeedback: "missing rollback plan" }),
+    "plan-review",
+  );
+  expect(p).toContain("revision pass #1");
+  expect(p).toContain("missing rollback plan");
+  expect(p).toContain("CHECK ONLY");
+  expect(p).toContain("Do NOT raise new concerns");
+});
+
+test("stagePrompt: plan-review with revisionCount>0 but null feedback produces no revision block (not a bounce)", () => {
+  const p = stagePrompt(task({ pipelineStage: "plan-review", revisionCount: 1, pipelineFeedback: null }), "plan-review");
+  expect(p).not.toContain("revision pass");
+});
+
+test("stagePrompt: code-review on a fresh pass has no revision-context block", () => {
+  const p = stagePrompt(task({ pipelineStage: "code-review", baseRef: "abc123", revisionCount: 0, pipelineFeedback: null }), "code-review");
+  expect(p).not.toContain("revision pass");
+  expect(p).not.toContain("previous feedback");
+});
+
+test("stagePrompt: code-review on a revision pass injects prior feedback and narrows scope", () => {
+  const p = stagePrompt(
+    task({ pipelineStage: "code-review", baseRef: "abc123", revisionCount: 2, pipelineFeedback: "error path swallows exception" }),
+    "code-review",
+  );
+  expect(p).toContain("revision pass #2");
+  expect(p).toContain("error path swallows exception");
+  expect(p).toContain("CHECK ONLY");
+  expect(p).toContain("Do NOT raise new concerns");
+});
+
+test("stagePrompt: testing on a fresh pass has no revision-context block", () => {
+  const p = stagePrompt(task({ pipelineStage: "testing", branch: "feature/x", revisionCount: 0, pipelineFeedback: null }), "testing");
+  expect(p).not.toContain("retry pass");
+  expect(p).not.toContain("previous failure");
+});
+
+test("stagePrompt: testing on a retry pass injects prior failure and narrows scope", () => {
+  const p = stagePrompt(
+    task({ pipelineStage: "testing", branch: "feature/x", revisionCount: 1, pipelineFeedback: "3 type errors in settings.ts" }),
+    "testing",
+  );
+  expect(p).toContain("retry pass #1");
+  expect(p).toContain("3 type errors in settings.ts");
+  expect(p).toContain("CHECK ONLY");
+  expect(p).toContain("Do NOT fail on new issues");
+});

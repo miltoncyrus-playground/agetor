@@ -813,10 +813,11 @@ export interface Task {
   implementationApproved: boolean;
   /**
    * Shared send-back counter for a pipeline task: incremented on EVERY
-   * plan-review→planning or testing→building bounce (both edges share one
-   * budget, not one each). Capped at `PIPELINE_REVISION_CAP` (4) — hitting
-   * the cap routes the task to `blocked` (reason "revision-cap") instead of
-   * looping again, so a human can see why. Always 0 for a non-pipeline task.
+   * bounce (plan-review→planning, code-review→building, testing→building,
+   * analyze→decompose — one budget shared across all edges). Capped at
+   * `PIPELINE_REVISION_CAP` (6) — hitting the cap routes the task to
+   * `blocked` (reason "revision-cap") instead of looping again, so a human
+   * can see why. Always 0 for a non-pipeline task.
    */
   revisionCount: number;
   /**

@@ -405,6 +405,15 @@ function planningPrompt(task: Task): string {
 /** Critic stage — must end with PIPELINE_VERDICT: approve|revise <reason>.
  *  Review scope includes AC coverage and constitution (if present). */
 function planReviewPrompt(task: Task): string {
+  const isRevision = task.revisionCount > 0 && task.pipelineFeedback != null;
+  const revisionContext = isRevision
+    ? `\n\nThis is revision pass #${task.revisionCount}. Your previous feedback was:\n\n` +
+      `"${task.pipelineFeedback}"\n\n` +
+      `CHECK ONLY whether that specific issue was addressed. Do NOT raise new concerns on a ` +
+      `revision pass — if the original issue is fixed, emit \`${PIPELINE_VERDICT_PREFIX} approve\` ` +
+      `even if you notice other imperfections. Raising a brand-new objection each revision is ` +
+      `the failure mode you must avoid.`
+    : "";
   return (
     `You are the Critic in an automated spec-driven pipeline: ` +
     `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
@@ -422,7 +431,8 @@ function planReviewPrompt(task: Task): string {
     `— if the plan is ready to build — or:\n` +
     `${PIPELINE_VERDICT_PREFIX} revise <reason in ≤20 words>\n` +
     `— if it needs another pass. No prose paragraphs. Nothing else you write is parsed — ` +
-    `only this line decides what happens next, so make sure it's the literal last line.\n\n${ticketBlock(task)}`
+    `only this line decides what happens next, so make sure it's the literal last line.` +
+    `${revisionContext}\n\n${ticketBlock(task)}`
   );
 }
 
@@ -537,6 +547,15 @@ export function childBuildPrompt(
  */
 function codeReviewPrompt(task: Task): string {
   const base = task.baseRef ?? "the branch's base commit";
+  const isRevision = task.revisionCount > 0 && task.pipelineFeedback != null;
+  const revisionContext = isRevision
+    ? `\n\nThis is revision pass #${task.revisionCount}. Your previous feedback was:\n\n` +
+      `"${task.pipelineFeedback}"\n\n` +
+      `CHECK ONLY whether that specific issue was addressed. Do NOT raise new concerns on a ` +
+      `revision pass — if the original issue is fixed, emit \`${PIPELINE_VERDICT_PREFIX} approve\` ` +
+      `even if you notice other imperfections. Raising a brand-new objection each revision is ` +
+      `the failure mode you must avoid.`
+    : "";
   return (
     `You are the Code Reviewer in an automated spec-driven pipeline: ` +
     `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
@@ -553,7 +572,8 @@ function codeReviewPrompt(task: Task): string {
     `— if the implementation is ready to test — or:\n` +
     `${PIPELINE_VERDICT_PREFIX} revise <reason in ≤20 words>\n` +
     `— if something needs to change first. No prose paragraphs. Nothing else you write is ` +
-    `parsed — only this line decides what happens next, so make sure it's the literal last line.`
+    `parsed — only this line decides what happens next, so make sure it's the literal last line.` +
+    `${revisionContext}`
   );
 }
 
@@ -562,6 +582,15 @@ function codeReviewPrompt(task: Task): string {
  *  exercised, not just that lint/typecheck pass. */
 function testingPrompt(task: Task): string {
   const ccType = branchCommitType(task.branch, task.taskType);
+  const isRevision = task.revisionCount > 0 && task.pipelineFeedback != null;
+  const revisionContext = isRevision
+    ? `\n\nThis is retry pass #${task.revisionCount}. Your previous failure report was:\n\n` +
+      `"${task.pipelineFeedback}"\n\n` +
+      `CHECK ONLY whether those specific failures are now fixed. Do NOT fail on new issues ` +
+      `discovered during this pass — if the original failures are resolved and the suite is ` +
+      `clean, emit \`${PIPELINE_VERDICT_PREFIX} pass\`. Raising a brand-new failure each retry ` +
+      `is the failure mode you must avoid.`
+    : "";
   return (
     `You are the Tester in an automated spec-driven pipeline: ` +
     `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
@@ -581,7 +610,7 @@ function testingPrompt(task: Task): string {
     `${PIPELINE_VERDICT_PREFIX} fail <one-paragraph reason>\n` +
     `— if something is still broken or an AC is unverified, explaining concretely what so ` +
     `the Builder can fix it. Nothing else you write is parsed — only this line decides what ` +
-    `happens next, so make sure it's the literal last line of your message.`
+    `happens next, so make sure it's the literal last line of your message.${revisionContext}`
   );
 }
 
