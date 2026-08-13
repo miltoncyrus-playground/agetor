@@ -491,10 +491,15 @@ function decomposePrompt(task: Task): string {
   );
 }
 
-/** Builder stage — not verdict-bearing. Success is just "the run finished". */
+/** Builder stage — not verdict-bearing. Success is just "the run finished".
+ *  The feedback preamble is stage-neutral because two gates bounce here
+ *  (Code Reviewer and Tester); the originating gate is named inside
+ *  `task.pipelineFeedback` itself — `bounceOrBlock`'s call sites prefix the
+ *  reason with "code review:" / "testing:" so the Builder knows which gate
+ *  it is answering. */
 function buildingPrompt(task: Task): string {
   const feedback = task.pipelineFeedback
-    ? `\n\nThe previous implementation was sent back by the Tester. What it found:\n\n${task.pipelineFeedback}`
+    ? `\n\nThe previous implementation was sent back. What the reviewing stage found:\n\n${task.pipelineFeedback}`
     : "";
   return (
     `You are the Builder in an automated spec-driven pipeline: ` +
@@ -516,22 +521,29 @@ function buildingPrompt(task: Task): string {
  * time — a child has `pipelineStage: null`, so `startTask` uses
  * `task.prompt` directly rather than routing through `stagePrompt`). Pure,
  * same convention as every other prompt builder here. Folds in the
- * subtask's own instructions, points the child at PLAN.md for full context,
- * AND inlines the subtask's assigned acceptance-criteria text from SPEC.md
- * so each child agent has a concrete, testable target rather than just a
- * prose-only directive.
+ * subtask's own instructions and points the child at PLAN.md / SPEC.md for
+ * full context.
+ *
+ * Deliberately kept SMALL: acceptance criteria are referenced by id (the
+ * full text lives in SPEC.md, already committed into the child's worktree)
+ * and the raw ticket is omitted (PLAN.md supersedes it by this stage — the
+ * same rationale `stagePrompt`'s doc gives for the late stages). Every byte
+ * here counts against `CLAUDE_PROMPT_ARGV_MAX_BYTES` (agents.ts): a prompt
+ * that fits in argv is submitted atomically by claude itself at launch,
+ * while an oversized one takes the deferred-paste path — which is exactly
+ * the path that lost the 2DOT2DOT children to an absorbed submit Enter (see
+ * docs/plans/pipeline-build-stage-postmortem.md, RC-1). `subtask.prompt` is
+ * agent-authored and unbounded, so fitting isn't guaranteed — but the fixed
+ * overhead must never be the reason a child falls off the fast path.
  */
 export function childBuildPrompt(
   parentTask: Task,
   subtask: BuildSubtask,
-  specAcMap: Record<string, string> = {},
 ): string {
   const ccType = branchCommitType(parentTask.branch, parentTask.taskType);
-  const acLines = subtask.acceptanceCriteria
-    .map((id) => specAcMap[id] ? `  ${id}: ${specAcMap[id]}` : `  ${id}`)
-    .join("\n");
   const acBlock = subtask.acceptanceCriteria.length > 0
-    ? `\n\nYour slice must satisfy these acceptance criteria from ${PIPELINE_SPEC_FILE}:\n${acLines}`
+    ? `\n\nYour slice must satisfy these acceptance criteria — read their full text in ` +
+      `${PIPELINE_SPEC_FILE} at the repository root: ${subtask.acceptanceCriteria.join(", ")}.`
     : "";
   return (
     `You are one of several agents implementing independent slices of a larger plan in ` +
@@ -547,7 +559,7 @@ export function childBuildPrompt(
     `open a pull request, do not run any git command that touches a remote — this commit ` +
     `stays local and gets merged into the parent branch by the pipeline itself. Do not ` +
     `include any AI attribution in the commit message. Then stop — do not ask a question, ` +
-    `do not wait for confirmation.\n\n${TICKET_HEADER}\n\n${parentTask.prompt}`
+    `do not wait for confirmation.`
   );
 }
 

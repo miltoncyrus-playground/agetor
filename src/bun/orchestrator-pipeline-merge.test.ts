@@ -263,3 +263,156 @@ test("pipeline: deleteTask cascades to a parent's still-live children — their 
   }
   for (const wt of childWorktrees) expect(existsSync(wt)).toBe(false);
 });
+
+test("pipeline: tickBuild merges a merge-deferred child FIRST, then completes the barrier (F-3 re-entry)", async () => {
+  // Manual setup, same style as the merge-conflict test above: a parent
+  // sitting in building whose sole subtask's child finished LATE (parked
+  // merge-deferred by doCompleteChild while the parent was elsewhere).
+  // A single tickBuild must land the deferred merge, see the barrier
+  // complete, and advance to code-review — the recovery path the stranded
+  // 2DOT2DOT children never had.
+  const { createTask } = await import("./orchestrator.ts");
+  const { tickBuild } = await import("./build-scheduler.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { tasks } = await import("./db.ts");
+
+  const repo = await makeGitRepo();
+
+  const parentCreated = await createTask({
+    title: "p3d", prompt: "x", agent: "claude-code",
+    workdir: repo, isolation: "worktree", taskType: "task",
+    mode: "auto", model: "opus-4.7", effort: "high",
+  });
+  if ("error" in parentCreated) throw new Error(parentCreated.error);
+  const parentId = parentCreated.task.id;
+  const parentPrepared = await prepareWorkdir(tasks.get(parentId)!);
+  if ("error" in parentPrepared) throw new Error(parentPrepared.error);
+  tasks.update(parentId, {
+    branch: parentPrepared.branch, worktreePath: parentPrepared.worktreePath,
+    pipelineStage: "building", column: "building",
+    planApproved: true, implementationApproved: false, revisionCount: 0, pipelineFeedback: null,
+    pausedAt: Date.now(), // pause so the code-review advance doesn't spawn a real run mid-test
+  });
+  const parentWorktree = parentPrepared.worktreePath!;
+  const parentBranch = parentPrepared.branch!;
+  await commitFile(
+    parentWorktree, "TASKS.json",
+    JSON.stringify({ subtasks: [{ id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: [] }] }),
+  );
+
+  const childCreated = await createTask({
+    title: "p3d — A", prompt: "do a", agent: "claude-code",
+    workdir: repo, isolation: "worktree", taskType: "task",
+    baseRef: parentBranch, mode: "auto", model: "opus-4.7", effort: "high",
+    parentTaskId: parentId, planSubtaskId: "a", column: "building",
+  });
+  if ("error" in childCreated) throw new Error(childCreated.error);
+  const childId = childCreated.task.id;
+  const childPrepared = await prepareWorkdir(tasks.get(childId)!);
+  if ("error" in childPrepared) throw new Error(childPrepared.error);
+  await commitFile(childPrepared.worktreePath!, "feature.txt", "the deferred work\n");
+  tasks.update(childId, {
+    branch: childPrepared.branch, worktreePath: childPrepared.worktreePath,
+    childMergeStatus: "merge-deferred", column: "review",
+  });
+
+  await tickBuild(parentId);
+
+  const { existsSync } = await import("node:fs");
+  const child = tasks.get(childId);
+  const parent = tasks.get(parentId)!;
+  // Deferred merge landed…
+  expect(existsSync(path.join(parentWorktree, "feature.txt"))).toBe(true);
+  // …the child is either still visible as merged or already archived by the
+  // barrier-completion sweep (archiveTask is fire-and-forget) — merged
+  // status is the invariant either way.
+  expect(child?.childMergeStatus).toBe("merged");
+  // …and the barrier completed: parent advanced to code-review (paused, so
+  // the stage landed without spawning a run).
+  expect(parent.pipelineStage).toBe("code-review");
+});
+
+test("pipeline: a no-progress bounce blocks immediately; a progressing bounce proceeds and stores the new fingerprint (F-5)", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { prepareWorkdir, treeFingerprintSync } = await import("./worktree.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const setup = async (): Promise<{ taskId: string; worktree: string }> => {
+    const repo = await makeGitRepo();
+    const created = await createTask({
+      title: "p5f", prompt: "x", agent: "claude-code",
+      workdir: repo, isolation: "worktree", taskType: "task",
+      mode: "auto", model: "opus-4.7", effort: "high",
+    });
+    if ("error" in created) throw new Error(created.error);
+    const taskId = created.task.id;
+    const prepared = await prepareWorkdir(tasks.get(taskId)!);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, {
+      branch: prepared.branch, worktreePath: prepared.worktreePath,
+      pipelineStage: "testing", column: "testing",
+      planApproved: true, implementationApproved: false, revisionCount: 0, pipelineFeedback: null,
+    });
+    await commitFile(
+      prepared.worktreePath!, "TASKS.json",
+      JSON.stringify({ subtasks: [{ id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: [] }] }),
+    );
+    // Satisfied barrier so the bounce takes the fixup path, where the
+    // fingerprint comparison lives.
+    const now = Date.now();
+    tasks.insert({
+      id: crypto.randomUUID(), title: "child a", prompt: "do a", column: "building", agent: "claude-code",
+      workdir: repo, isolation: "none", taskType: "task",
+      branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+      mode: "auto", model: "opus-4.7", effort: "high",
+      references: [], backlog: [], draft: null, runId: null,
+      hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+      createdAt: now, updatedAt: now, archivedAt: null,
+      pipelineStage: null, planApproved: false, implementationApproved: false,
+      revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
+      parentTaskId: taskId, planSubtaskId: "a", childMergeStatus: "merged",
+    });
+    return { taskId, worktree: prepared.worktreePath! };
+  };
+
+  // Case 1 — NO PROGRESS: the stored fingerprint matches the tree exactly
+  // as it stands at bounce time → block immediately, don't burn the budget.
+  {
+    const { taskId, worktree } = await setup();
+    const fp = treeFingerprintSync(worktree);
+    expect(fp).not.toBeNull();
+    tasks.update(taskId, { pipelineBounceFingerprint: `building:${fp}` });
+
+    const started = await startTask(taskId);
+    if ("error" in started) throw new Error(started.error);
+    runs.appendEvent(started.runId, "assistant", "PIPELINE_VERDICT: fail same failure as before");
+    await settle(300);
+
+    const task = tasks.get(taskId)!;
+    expect(task.column).toBe("blocked");
+    expect(task.pipelineFeedback).toContain("produced no changes");
+  }
+
+  // Case 2 — PROGRESS: a stale fingerprint (tree has changed since) lets
+  // the bounce proceed normally and stores the fresh fingerprint.
+  {
+    const { taskId, worktree } = await setup();
+    tasks.update(taskId, { pipelineBounceFingerprint: "building:stale-hash-from-before" });
+
+    const started = await startTask(taskId);
+    if ("error" in started) throw new Error(started.error);
+    runs.appendEvent(started.runId, "assistant", "PIPELINE_VERDICT: fail one test is red");
+    await settle(300);
+
+    const task = tasks.get(taskId)!;
+    // The bounce proceeded (no no-progress block): the fixup run spawned,
+    // its fake driver resolved, and the barrier-complete exit carried the
+    // task on to code-review (whose own run blocks awaiting a verdict).
+    expect(task.pipelineStage).toBe("code-review");
+    expect(task.revisionCount).toBe(1);
+    // The fresh fingerprint from the bounce is stored (the fake fixup run
+    // touches no files, so it still matches the tree).
+    const fp = treeFingerprintSync(worktree);
+    expect(task.pipelineBounceFingerprint).toBe(`building:${fp}`);
+  }
+});

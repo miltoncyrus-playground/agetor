@@ -510,3 +510,40 @@ test("decideScrapeTick — a session that never appended (lastJsonlAppendAt === 
   });
   expect(d).toEqual({ run: true, stampIdle: false });
 });
+
+// ─── UNSUBMITTED_PASTE_RE — deferred-paste submit verification (RC-1) ────────
+
+test("UNSUBMITTED_PASTE_RE matches the real 2DOT2DOT incident pane (paste parked in the composer)", async () => {
+  const { UNSUBMITTED_PASTE_RE } = await import("./claude-tmux.ts");
+  // Verbatim capture from run 067dde1a's stderr events — claude v2.1.229
+  // booted, the deferred paste landed in the composer, the submit Enter was
+  // absorbed, and the run died at the 30s boot timeout with this on screen.
+  const incidentPane = [
+    "╭─── Claude Code v2.1.229 ─────────────────────────────────────────────────────╮",
+    "│                                                    │ Tips for getting        │",
+    "│                Welcome back Milton!                │ started                 │",
+    "╰──────────────────────────────────────────────────────────────────────────────╯",
+    "",
+    "────────────────────────────────────────────────────────────────────────────────",
+    "❯ [Pasted text #1 +41 lines]",
+    "────────────────────────────────────────────────────────────────────────────────",
+    "  ⏵⏵ auto mode on (shift+tab to cycle)                                     /rc",
+  ].join("\n");
+  expect(UNSUBMITTED_PASTE_RE.test(incidentPane)).toBe(true);
+});
+
+test("UNSUBMITTED_PASTE_RE does NOT match a submitted paste in the transcript (different prefix) or an empty composer", async () => {
+  const { UNSUBMITTED_PASTE_RE } = await import("./claude-tmux.ts");
+  // After submit, the user message renders in the transcript with the `>`
+  // prefix and the composer prompt `❯` is empty — re-sending Enter here
+  // would be wrong, so the regex must not fire.
+  const submittedPane = [
+    "> [Pasted text #1 +41 lines]",
+    "",
+    "⏺ Working on it…",
+    "",
+    "❯ ",
+    "  ⏵⏵ auto mode on (shift+tab to cycle)",
+  ].join("\n");
+  expect(UNSUBMITTED_PASTE_RE.test(submittedPane)).toBe(false);
+});

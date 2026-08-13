@@ -5,7 +5,7 @@
 | Date | 2026-08-13 |
 | Source | User request: pipeline run on `~/2DOT2DOT` (task `189d6702`, "DOT2DOT pipelinerun with SDD") ended `blocked: revision-cap` with no application code on the pipeline branch. Investigate why, design the fixes. |
 | Evidence base | `~/.agetor-dev/agetor.sqlite` (tasks, 45 runs, 74 status events for the parent), the three `feature/dot2dot-*` branches, the parent/child worktrees under `~/.agetor-dev/worktrees/`, and the pipeline code on `feature/pipeline-tasks` |
-| Status | **Design only. No code has been written. Every fix below is a spec with a machine-checkable gate and a test plan, not an implementation.** |
+| Status | **Implemented.** F-1..F-6 are all in the tree with their gate tests (see `orchestrator-pipeline-guards.test.ts`, the new cases in `orchestrator-pipeline{,-merge}.test.ts`, `worktree.test.ts`, `claude-tmux-scraper.test.ts`). One finding was corrected during implementation: see the RC-1 revision note below — the paste WAS delivered; the submit Enter was absorbed. |
 | Relationship to prior work | `72e47c6` (moving-goalpost loops) and `5c4eee4` (phantom AC ids, revision-budget reset) landed *mid-run* on Aug 12 and fixed the decompose-stage half of this run. Everything below is about the build stage and later, which those commits do not touch. |
 
 ## 1. Net outcome of the run (what "failed with no real outcome" actually means)
@@ -36,11 +36,13 @@ The specify → clarify → plan → plan-review → decompose → analyze stage
 
 Ordered by causal position, not severity. RC-2 and RC-3 are the design bugs; RC-1 is the trigger; RC-4/5/6 are the amplifiers that turned a recoverable stumble into an 8-hour zombie loop.
 
-### RC-1 — Child spawn death: deferred-paste never delivers, boot timeout kills a healthy session
+### RC-1 — Child spawn death: the paste's submit Enter is absorbed during boot, and the boot timeout kills a healthy session
 
-`claude-tmux.ts` has two independent 30s clocks: `DEFERRED_PROMPT_TIMEOUT_MS` (`:4286`, the paste poller waiting for `readPaneMode()` to report a ready pane) and `BOOT_TIMEOUT_MS` (`:4529`, waiting for the session JSONL to appear). Claude only creates its JSONL **after the first message arrives**, so on the deferred-paste path the JSONL clock is really measuring "paste delivered + first token", not "claude booted". The pane captures show claude v2.1.229 alive on its welcome screen at second 30 — `readPaneMode` never recognized that screen as ready, the paste never fired, the JSONL never appeared, and the boot clock killed a perfectly healthy session. Four consecutive child runs died this exact death; the same children succeeded minutes later on manual retry (the boot dialog poller at `:4530-4560` handles consent *dialogs*, but the welcome screen is not a dialog).
+**Revision note (implementation pass):** the original draft blamed `readPaneMode` for not recognizing the welcome screen, so the paste "never fired". The full pane capture from run `067dde1a` disproves that: the composer visibly holds `❯ [Pasted text #1 +41 lines]` with the mode bar present — the paste WAS delivered promptly. What was lost is the **submit Enter**: during boot, claude's Ink TUI absorbs a `\r` arriving inside its paste-event coalescing window, the exact failure mode the `bracketedEnterGapMs` doc-comment warns "silently regresses with no log signal". The 80ms gap is tuned for an idle live REPL, not a booting one.
 
-Two aggravators: (a) `childBuildPrompt` inlines the subtask's full instructions plus its assigned AC text from SPEC.md, which is what pushed both prompts over the argv budget and onto the fragile path in the first place, even though PLAN.md/SPEC.md are already in the worktree and referenced by path; (b) there is no spawn retry for a child — one 30s hiccup hard-fails the entire build and cancels every sibling.
+So the mechanism is: paste lands in the composer → Enter absorbed → turn never submitted → JSONL (created only when the first turn starts) never appears → `BOOT_TIMEOUT_MS` (30s) kills a perfectly healthy session with the prompt parked on screen. Four consecutive child runs died this death; the same children succeeded minutes later on manual retry.
+
+Two aggravators stand as originally written: (a) `childBuildPrompt` inlined the subtask's AC text (and the raw ticket), pushing both prompts over the argv budget and onto the fragile deferred-paste path at all, even though SPEC.md/PLAN.md sit in the child's worktree; (b) there was no spawn retry for a child — one boot hiccup hard-failed the entire build and cancelled every sibling.
 
 ### RC-2 — `case "building"` advances on any parent-run success, with no DAG barrier check
 
@@ -66,14 +68,14 @@ Two related holes. (a) Any user free-text turn on a pipeline task ("continue", "
 
 Each fix names its gate (machine-checkable, deterministic) and its test lane. Gate tests use the existing fake drivers (`AGETOR_CLAUDE_DRIVER=fake`) and temp-repo harness from `orchestrator-pipeline.test.ts` / `orchestrator-pipeline-merge.test.ts`.
 
-### F-1 — Make child spawn survive slow boots (fixes RC-1)
+### F-1 — Make child spawn survive slow boots (fixes RC-1) — *as implemented*
 
-1. **Couple the two clocks.** While a deferred paste is still undelivered, the JSONL boot wait must not count down — mirror the existing `sawStartupPromptThisWindow` re-arm pattern (`claude-tmux.ts:4553`): the paste poller sets a `pasteStillPending` flag the boot-wait loop reads, and the boot window re-arms instead of expiring while it is set. The boot timeout then measures what it claims to measure (claude failing to boot), never paste latency.
-2. **Recognize the welcome screen.** Add the v2.1.229 welcome layout to `readPaneMode`'s ready detection (fixture from the captured pane content in run `067dde1a`'s events, which is preserved in the DB). Pane-scrape fixtures are the established pattern (`claude-tmux-scraper.test.ts`).
-3. **Shrink `childBuildPrompt` below the argv budget.** PLAN.md and TASKS.json are in the child's worktree already; replace the inlined AC bodies with AC *ids* plus "read your ACs in SPEC.md at the repo root". Target: every child prompt for a 7-subtask/47-AC plan fits in argv so the deferred-paste path is never exercised by the pipeline's own children. (The deferred-paste path stays, hardened by 1–2, for user-authored giant prompts.)
-4. **One automatic spawn retry for children.** In `settleChildRun`, a child whose run hard-failed **before its JSONL ever appeared** (no assistant/tool event on the run) gets one automatic re-`startTask` before the failure is escalated to the build-abort cascade. A boot flake and a real build failure are different events; today they are treated identically.
+1. **Couple the two clocks.** The boot JSONL wait re-arms its window while the deferred-paste flow hasn't settled (`deferredPasteSettled`, released in a `finally` on every paste-flow exit path), mirroring the existing `sawStartupPromptThisWindow` re-arm. The boot timeout now measures claude failing to boot, never paste latency — the two clocks can no longer race each other.
+2. **Verify the submit, don't out-tune it** (replaces the original "recognize the welcome screen" — see the RC-1 revision note). After the paste + Enter, a bounded verification loop (`PASTE_SUBMIT_VERIFY_MS` × `PASTE_SUBMIT_VERIFY_ATTEMPTS`) polls for the JSONL — the deterministic "turn submitted" signal — and, while the pane still shows the unsubmitted-paste placeholder on the composer line (`UNSUBMITTED_PASTE_RE`, fixture from the real incident pane), re-sends Enter. A check-and-retry loop can't be beaten by a slower boot the way any fixed gap can.
+3. **Shrink `childBuildPrompt`.** AC bodies replaced with AC *ids* + "read their full text in SPEC.md"; the raw ticket dropped (PLAN.md supersedes it, same rationale `stagePrompt` documents for late stages). The fixed template is size-asserted under half the argv budget; `subtask.prompt` remains agent-authored and unbounded, so the deferred path stays hardened by 1–2 for when it's still taken.
+4. **One automatic spawn retry for children.** `settleChildRun`: a hard failure whose run produced zero agent output (no assistant/tool_use event) re-`startTask`s once before escalating to the build-abort cascade.
 
-Gate tests: boot-wait re-arm under a pending paste (fake clock); welcome-screen fixture recognized as ready; `childBuildPrompt` length assertion over a synthetic 7-subtask/47-AC plan; child boot-flake retries once then escalates.
+Gate tests: unsubmitted-paste regex vs the verbatim incident pane and vs a submitted-transcript pane; `childBuildPrompt` fixed-overhead size assertion; child boot-flake retries once, real child failures (agent output present) escalate immediately.
 
 ### F-2 — Barrier-check the `building` exit (fixes RC-2, the load-bearing fix)
 
@@ -115,7 +117,7 @@ Gate tests: two identical-reason bounces with identical HEAD block on the second
 ### F-6 — Verdict provenance and honest overrides (fixes RC-6)
 
 1. **Only stage-prompted runs settle a stage.** Stamp pipeline-stage runs at spawn (e.g. `runs.origin = "pipeline-stage"`; the column exists and is already used for `continuation`). `advancePipelineStage` ignores terminal runs without the stamp: a user free-text turn on a pipeline task is a conversation, not a gate event. (F-2 already removes the worst consequence for `building`; this closes it for the verdict stages, where a "continue" turn's stray verdict line currently counts.)
-2. **Make override a real control, not a jailbreak.** The legitimate need behind "set the verdict to approve" is a human waving a gate through. Give it an explicit path — a `POST /tasks/:id/pipeline/override` route (UI button on the blocked/review card) that records `pipelineFeedback: "gate overridden by user"` and advances — so the audit trail is honest and the model never has to choose between obeying the user and lying to the pipeline. With provenance from (1), a coerced in-chat verdict line in a non-stage run simply stops working.
+2. **Make override a real control, not a jailbreak.** The legitimate need behind "set the verdict to approve" is a human waving a gate through. Give it an explicit path — a `POST /tasks/:id/pipeline-override` route (naming matches `pipeline-pause`/`pipeline-resume`; "Override gate" button on the blocked banner) that advances exactly one stage and records a durable "pipeline gate overridden by user" status event on the run log — so the audit trail is honest and the model never has to choose between obeying the user and lying to the pipeline. With provenance from (1), a coerced in-chat verdict line in a non-stage run simply stops working.
 
 Gate tests: user-turn verdict line does not advance a verdict stage; override route advances exactly one stage and records the feedback marker.
 

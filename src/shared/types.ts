@@ -830,6 +830,21 @@ export interface Task {
    */
   pipelineFeedback: string | null;
   /**
+   * Progress marker for the pipeline's bounce loop-breaker: set on every
+   * `bounceOrBlock` spawn to `"<targetStage>:<tree-fingerprint>"`, where the
+   * fingerprint hashes the parent worktree's HEAD + dirty state
+   * (`treeFingerprintSync` in worktree.ts). When the NEXT bounce to the same
+   * target computes the same fingerprint, the previous bounce cycle changed
+   * nothing on disk and looping again is guaranteed waste — the task blocks
+   * immediately instead of burning revision-cap slots one no-op cycle at a
+   * time. Null when there's no pending bounce baseline (fresh task, non-git
+   * workdir, or the last verdict was a pass/approve — cleared on every
+   * approve/pass edge and on a gate override). Optional so the many
+   * pre-existing `tasks.insert` fixture literals keep compiling; DB rows
+   * predating migration 039 read back as null.
+   */
+  pipelineBounceFingerprint?: string | null;
+  /**
    * Unix ms when auto-advance was paused for this pipeline task via
    * `POST /tasks/:id/pipeline-pause`, or null when running normally. While
    * paused, a stage's run still starts and finishes normally — pause never
@@ -883,8 +898,17 @@ export interface Task {
    * to `"blocked"` and aborts the whole build (see orchestrator.ts's
    * `blockPipelineTask`/`cancelSiblingChildren`). Never settable via
    * PATCH, same treatment as `parentTaskId`.
+   *
+   * A fourth value, `"merge-deferred"`, marks a child whose run succeeded
+   * AFTER the parent had already left its active `building` state (late
+   * settle — boot-reconciliation replay, a build aborted by a sibling then
+   * this child finishing anyway, or a manual child restart racing the
+   * parent). The work is preserved: the child moves to `"review"` so it's
+   * visible instead of stranded, and the next `tickBuild` for the parent
+   * (a bounce back into building, or the barrier check on the building
+   * exit) merges deferred children FIRST, before deciding anything else.
    */
-  childMergeStatus: "pending" | "merged" | "merge-failed" | null;
+  childMergeStatus: "pending" | "merged" | "merge-failed" | "merge-deferred" | null;
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can
@@ -1398,11 +1422,15 @@ export interface Run {
    * this field existed). `"continuation"` = opened automatically by the
    * orchestrator after the same claude session auto-resumed post `end_turn`
    * (e.g. it delegated to a background task and later kept talking once
-   * that task finished). Optional so callers that don't pass it (most of
-   * them — only the continuation-run factory sets it) keep compiling
-   * unchanged; DB rows predating migration 023 read back as null.
+   * that task finished). `"pipeline-stage"` = spawned by `startTask` for a
+   * pipeline task's stage turn or a build child's own build turn — the ONLY
+   * runs whose terminal outcome is allowed to move the pipeline
+   * (`advancePipelineStage` / `settleChildRun` ignore unstamped runs, so a
+   * user free-text follow-up or an auto-continuation can never advance a
+   * stage or trigger a merge). Optional so callers that don't pass it keep
+   * compiling unchanged; DB rows predating migration 023 read back as null.
    */
-  origin?: "continuation" | null;
+  origin?: "continuation" | "pipeline-stage" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

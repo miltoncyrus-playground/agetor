@@ -80,6 +80,7 @@ type TaskRow = {
   implementation_approved: number;
   revision_count: number;
   pipeline_feedback: string | null;
+  pipeline_bounce_fingerprint: string | null;
   paused_at: number | null;
   block_reason: string | null;
   parent_task_id: string | null;
@@ -207,6 +208,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   implementationApproved: r.implementation_approved === 1,
   revisionCount: r.revision_count,
   pipelineFeedback: r.pipeline_feedback,
+  pipelineBounceFingerprint: r.pipeline_bounce_fingerprint,
   pausedAt: r.paused_at,
   blockReason: r.block_reason as Task["blockReason"],
   parentTaskId: r.parent_task_id,
@@ -252,9 +254,9 @@ export const tasks = {
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, refs, backlog, draft,
           run_id, created_at, updated_at, archived_at,
-          pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, paused_at,
+          pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, pipeline_bounce_fingerprint, paused_at,
           block_reason, parent_task_id, plan_subtask_id, child_merge_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -264,7 +266,7 @@ export const tasks = {
         t.draft ? JSON.stringify(t.draft) : null,
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
         t.pipelineStage ?? null, t.planApproved ? 1 : 0, t.implementationApproved ? 1 : 0,
-        t.revisionCount ?? 0, t.pipelineFeedback ?? null, t.pausedAt ?? null,
+        t.revisionCount ?? 0, t.pipelineFeedback ?? null, t.pipelineBounceFingerprint ?? null, t.pausedAt ?? null,
         t.blockReason ?? null, t.parentTaskId ?? null, t.planSubtaskId ?? null, t.childMergeStatus ?? null,
       ],
     );
@@ -282,7 +284,7 @@ export const tasks = {
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
          branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, refs=?, backlog=?, draft=?,
          run_id=?, updated_at=?, archived_at=?,
-         pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, paused_at=?,
+         pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, pipeline_bounce_fingerprint=?, paused_at=?,
          block_reason=?, parent_task_id=?, plan_subtask_id=?, child_merge_status=?
        WHERE id=?`,
       [
@@ -294,7 +296,7 @@ export const tasks = {
         next.draft ? JSON.stringify(next.draft) : null,
         next.runId, next.updatedAt, next.archivedAt ?? null,
         next.pipelineStage ?? null, next.planApproved ? 1 : 0, next.implementationApproved ? 1 : 0,
-        next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pausedAt ?? null,
+        next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pipelineBounceFingerprint ?? null, next.pausedAt ?? null,
         next.blockReason ?? null, next.parentTaskId ?? null, next.planSubtaskId ?? null, next.childMergeStatus ?? null, id,
       ],
     );

@@ -1243,3 +1243,34 @@ describe("detachWorktree", () => {
     expect(alreadyAbsent).toEqual({ removed: false, reason: "already-absent" });
   });
 });
+
+describe("treeFingerprintSync", () => {
+  test("stable for an unchanged tree, changes on a dirty edit, changes again on commit", async () => {
+    const { treeFingerprintSync } = await import("./worktree.ts");
+    const repo = await makeRepo();
+
+    const a = treeFingerprintSync(repo);
+    const b = treeFingerprintSync(repo);
+    expect(a).not.toBeNull();
+    expect(b).toBe(a); // same tree → same fingerprint, every time
+
+    // Dirty (uncommitted) edit must change it — pipeline fixup turns leave
+    // their work uncommitted, so HEAD alone would miss their progress.
+    writeFileSync(path.join(repo, "dirty.txt"), "uncommitted work\n");
+    const c = treeFingerprintSync(repo);
+    expect(c).not.toBe(a);
+
+    // Committing changes it again (HEAD moved, dirty state cleared).
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "commit the work"], repo);
+    const d = treeFingerprintSync(repo);
+    expect(d).not.toBe(c);
+    expect(d).not.toBe(a);
+  });
+
+  test("returns null outside a git repo (callers skip the no-progress check)", async () => {
+    const { treeFingerprintSync } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-not-a-repo-"));
+    expect(treeFingerprintSync(dir)).toBeNull();
+  });
+});

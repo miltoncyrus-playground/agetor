@@ -1133,6 +1133,7 @@ export const api = {
    *  stage auto-spawns once the current one resolves. */
   pausePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-pause`, { method: "POST" }),
   resumePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-resume`, { method: "POST" }),
+  overridePipelineGate: (id: string) => j<Task>(`/tasks/${id}/pipeline-override`, { method: "POST" }),
 
   /** Every git worktree materialized on disk under `dataDir/worktrees/`,
    *  cross-referenced against the tasks table. Drives the Worktrees page. */

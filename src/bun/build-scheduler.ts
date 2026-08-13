@@ -1,9 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { tasks } from "./db.ts";
+import { tasks, runs } from "./db.ts";
 import { createTask, startTask, spawnPipelineStage, blockPipelineTask, cancelSiblingChildren, archiveTask } from "./orchestrator.ts";
 import { parseBuildPlan, childBuildPrompt, PIPELINE_BUILD_PLAN_FILE } from "./pipeline-prompts.ts";
 import { mergeBranch, abortMerge } from "./worktree.ts";
+import type { Task } from "../shared/types.ts";
 
 /**
  * DAG scheduler for a "building" stage's FRESH entry (from pre-builder
@@ -45,6 +46,79 @@ function runSerialized(parentTaskId: string, fn: () => Promise<void>): Promise<v
 }
 
 /**
+ * Snapshot of a parent's build barrier: is every subtask declared in
+ * TASKS.json backed by a `merged` child? This is THE gate every exit from
+ * the "building" stage must consult (advancePipelineStage's `case
+ * "building"` and `bounceOrBlock`'s building target) — the 2DOT2DOT
+ * postmortem's root cause RC-2 was precisely that the building exit trusted
+ * the caller's context ("a run ended, so building must be done") instead of
+ * this state. Pure read: TASKS.json parsed fresh + child rows, no mutation.
+ *
+ * `"invalid"` (missing/unparseable TASKS.json) is a real anomaly, not a
+ * soft case: building is only reachable through decompose, which committed
+ * a validated TASKS.json — callers block on it rather than guessing.
+ * `merge-deferred` children count as unmet: their work exists but hasn't
+ * landed on the parent branch yet (the next `tickBuild` merges them first).
+ */
+export type BuildBarrierState =
+  | { kind: "complete" }
+  | { kind: "incomplete"; unmet: string[] }
+  | { kind: "invalid"; reason: string };
+
+export function buildBarrierState(parent: Task): BuildBarrierState {
+  const planPath = join(parent.worktreePath ?? parent.workdir, PIPELINE_BUILD_PLAN_FILE);
+  if (!existsSync(planPath)) {
+    return { kind: "invalid", reason: `${PIPELINE_BUILD_PLAN_FILE} is missing` };
+  }
+  const parsed = parseBuildPlan(readFileSync(planPath, "utf8"));
+  if (!parsed.ok) return { kind: "invalid", reason: parsed.reason };
+  const childBySubtaskId = new Map(
+    tasks.list().filter((t) => t.parentTaskId === parent.id).map((c) => [c.planSubtaskId, c]),
+  );
+  const unmet = parsed.plan.subtasks
+    .filter((s) => childBySubtaskId.get(s.id)?.childMergeStatus !== "merged")
+    .map((s) => s.id);
+  return unmet.length === 0 ? { kind: "complete" } : { kind: "incomplete", unmet };
+}
+
+/**
+ * Merge one child's branch into the parent's worktree and record the
+ * outcome. The single merge core `doCompleteChild` (live settle) and
+ * `doTick` (deferred-child pickup) share, so the two paths can't drift.
+ * Returns true when the merge landed (`childMergeStatus: "merged"`); false
+ * means the build was aborted (conflict, or nothing to merge) — the parent
+ * is already blocked and siblings cancelled by the time this returns.
+ */
+async function mergeChildIntoParent(child: Task, parent: Task): Promise<boolean> {
+  if (!child.worktreePath || !child.branch) {
+    // Isolation was off, or the worktree never materialized — nothing to
+    // merge. Treated identically to a merge conflict: the build can't
+    // proceed without this subtask's work landing in the parent branch.
+    tasks.update(child.id, { childMergeStatus: "merge-failed", column: "blocked" });
+    blockPipelineTask(
+      parent.id, null, "pipeline-failed",
+      `subtask "${child.planSubtaskId}" has no worktree/branch to merge`,
+    );
+    cancelSiblingChildren(parent.id);
+    return false;
+  }
+  const parentWorktreePath = parent.worktreePath ?? parent.workdir;
+  const result = await mergeBranch(parentWorktreePath, child.branch);
+  if (!result.ok) {
+    if (result.conflict) await abortMerge(parentWorktreePath);
+    tasks.update(child.id, { childMergeStatus: "merge-failed", column: "blocked" });
+    blockPipelineTask(
+      parent.id, null, "pipeline-failed",
+      `merge conflict on subtask "${child.planSubtaskId}": ${result.detail}`,
+    );
+    cancelSiblingChildren(parent.id);
+    return false;
+  }
+  tasks.update(child.id, { childMergeStatus: "merged" });
+  return true;
+}
+
+/**
  * Continue (or start) a parent's build: reads+parses BUILD_PLAN.json fresh
  * from its worktree, creates+starts any subtask whose dependencies are all
  * merged and that has no child row yet, and — once every declared subtask
@@ -82,12 +156,29 @@ async function doTick(parentTaskId: string): Promise<void> {
   }
   const { subtasks } = parsed.plan;
 
+  // Pick up merge-deferred children FIRST — work that completed while the
+  // parent was outside its active building state (see settleChildRun /
+  // doCompleteChild). Their commits must land before the barrier below is
+  // evaluated, so a bounce back into building resumes from everything that
+  // actually got built rather than re-spawning subtasks whose work already
+  // exists on a dangling branch. A conflict aborts the build exactly like a
+  // live-settle merge would (mergeChildIntoParent blocks + cancels).
+  for (const child of tasks.list().filter((t) => t.parentTaskId === parentTaskId)) {
+    if (child.childMergeStatus !== "merge-deferred") continue;
+    const parentNow = tasks.get(parentTaskId);
+    if (!parentNow || parentNow.column !== "building") return;
+    if (!(await mergeChildIntoParent(child, parentNow))) return;
+  }
+
   const children = tasks.list().filter((t) => t.parentTaskId === parentTaskId);
   const childBySubtaskId = new Map(children.map((c) => [c.planSubtaskId, c]));
 
   const allMerged = subtasks.every((s) => childBySubtaskId.get(s.id)?.childMergeStatus === "merged");
   if (allMerged) {
-    spawnPipelineStage(parentTaskId, null, "code-review");
+    // `pipelineFeedback: null` — consumed on the building→code-review hop,
+    // matching what the old advancePipelineStage `case "building"` did
+    // before the barrier check moved that exit's decision here.
+    spawnPipelineStage(parentTaskId, null, "code-review", { pipelineFeedback: null });
     // Every child's commits are already merged into the parent branch at
     // this point, so archiving them (which tears down their now-redundant
     // worktree/branch — archiveTask, not just a hide-from-board flag) loses
@@ -187,38 +278,26 @@ async function doCompleteChild(childTaskId: string, parentTaskId: string): Promi
   const child = tasks.get(childTaskId);
   const parent = tasks.get(parentTaskId);
   if (!child || !parent) return;
-  // Build already aborted or moved on (e.g. two children settling around
-  // the same time, the first already triggered an abort) — nothing to do,
-  // same guard doTick uses.
-  if (parent.pipelineStage !== "building" || parent.column !== "building") return;
-
-  if (!child.worktreePath || !child.branch) {
-    // Isolation was off, or the worktree never materialized — nothing to
-    // merge. Treated identically to a merge conflict: the build can't
-    // proceed without this subtask's work landing in the parent branch.
-    tasks.update(childTaskId, { childMergeStatus: "merge-failed", column: "blocked" });
-    blockPipelineTask(
-      parentTaskId, null, "pipeline-failed",
-      `subtask "${child.planSubtaskId}" has no worktree/branch to merge`,
-    );
-    cancelSiblingChildren(parentTaskId);
+  // Parent no longer actively building — the build was aborted, blocked, or
+  // has moved to a later stage. This used to be a silent `return`, which is
+  // the 2DOT2DOT postmortem's RC-3: the child's completed work froze
+  // invisibly on `column: "running"` / `childMergeStatus: "pending"` forever.
+  // Now the work is explicitly parked: `merge-deferred` + `review` makes it
+  // visible, a status event on the parent names it, and the next tickBuild
+  // for this parent (a bounce back into building, or the building-exit
+  // barrier check) merges it before deciding anything else.
+  if (parent.pipelineStage !== "building" || parent.column !== "building") {
+    tasks.update(childTaskId, { childMergeStatus: "merge-deferred", column: "review" });
+    if (parent.runId) {
+      const data =
+        `subtask "${child.planSubtaskId}" completed after the build phase ended — ` +
+        `merge deferred until the build resumes`;
+      runs.appendEvent(parent.runId, "status", data);
+    }
     return;
   }
 
-  const parentWorktreePath = parent.worktreePath ?? parent.workdir;
-  const result = await mergeBranch(parentWorktreePath, child.branch);
-  if (!result.ok) {
-    if (result.conflict) await abortMerge(parentWorktreePath);
-    tasks.update(childTaskId, { childMergeStatus: "merge-failed", column: "blocked" });
-    blockPipelineTask(
-      parentTaskId, null, "pipeline-failed",
-      `merge conflict on subtask "${child.planSubtaskId}": ${result.detail}`,
-    );
-    cancelSiblingChildren(parentTaskId);
-    return;
-  }
-
-  tasks.update(childTaskId, { childMergeStatus: "merged" });
+  if (!(await mergeChildIntoParent(child, parent))) return;
   // Same serialized slot — call the inner function directly rather than
   // the exported `tickBuild` (which would enqueue a second, redundant slot
   // for this parent).

@@ -4284,6 +4284,26 @@ const DEFERRED_PROMPT_POLL_MS = 400;
  *  naturally, but they're independent constants — there's no shared source
  *  and no requirement to change one when the other changes. */
 const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
+/** Cadence of the post-paste submit-verification loop: after the deferred
+ *  prompt is pasted + Enter'd, we poll until claude's JSONL appears (proof
+ *  the turn was actually submitted). Each tick that still finds the
+ *  `[Pasted text …]` placeholder sitting in the composer re-sends Enter —
+ *  the submit `\r` can be absorbed while claude's Ink TUI is still booting
+ *  (the same coalescing window `bracketedEnterGapMs` covers for idle
+ *  sessions, but boot-time rendering can exceed any fixed gap: the 2DOT2DOT
+ *  children died with the paste visibly parked in the composer, see
+ *  docs/plans/pipeline-build-stage-postmortem.md RC-1). Verification is the
+ *  fix, not a bigger gap — a check-and-retry loop can't be out-tuned. */
+const PASTE_SUBMIT_VERIFY_MS = 1_000;
+/** Bound on the submit-verification loop — 15 ticks ≈ 15s past the paste.
+ *  If the JSONL still hasn't appeared by then, the loop hands the failure
+ *  back to the boot JSONL wait, which reports the pane content as usual. */
+const PASTE_SUBMIT_VERIFY_ATTEMPTS = 15;
+/** A composer line still holding an unsubmitted paste placeholder:
+ *  claude renders the prompt char `❯` followed by `[Pasted text #N +M
+ *  lines]` until the paste is actually submitted (a SUBMITTED paste shows
+ *  in the transcript with a different prefix). Exported for tests. */
+export const UNSUBMITTED_PASTE_RE = /❯[^\n]*\[Pasted text/;
 
 /**
  * Start a new claude tmux session for the task. Two delivery modes for the
@@ -4445,6 +4465,14 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // never become an unhandled rejection (mirrors the boot-dialog poller's
   // posture a few lines down) — this must never affect the JSONL boot wait
   // itself.
+  // True once the deferred-paste flow has fully settled (prompt pasted,
+  // submit verified or given up) — or immediately for the argv-prompt path,
+  // which has no paste to wait for. The boot JSONL wait below re-arms its
+  // window while this is false, so the paste flow and the boot timeout can
+  // never race each other: the 2DOT2DOT children died to exactly that race
+  // (both clocks started together at 30s; the boot wait killed a healthy
+  // session whose paste hadn't submitted yet).
+  let deferredPasteSettled = !opts.deferredPrompt;
   if (opts.deferredPrompt) {
     const deferredPrompt = opts.deferredPrompt;
     opts.onChunk(
@@ -4500,7 +4528,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
         // run yet at this point — `rearmPollTimerFast` would no-op — so only
         // the idle-clock bump applies here.
         bumpActivity(state);
-        void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
+        await queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
           bracketed: true,
           onPasteFailure: () => {
             // Mirror `sendTurn`'s onPasteFailure idiom exactly: guard against
@@ -4517,7 +4545,37 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
             reject(new Error("paste failed"));
           },
         });
+        // Submit verification: the paste + Enter above only proves tmux
+        // delivered keystrokes, not that claude SUBMITTED the turn — during
+        // boot, the trailing `\r` can be absorbed by the still-rendering TUI
+        // and the prompt parks in the composer as `[Pasted text #N +M
+        // lines]` forever. Claude creates its session JSONL when the first
+        // turn actually starts, so JSONL-exists is the deterministic
+        // "submitted" signal; while it's absent and the placeholder is
+        // visibly parked in the composer, re-send Enter and check again.
+        let resendAnnounced = false;
+        for (let i = 0; i < PASTE_SUBMIT_VERIFY_ATTEMPTS; i++) {
+          await Bun.sleep(PASTE_SUBMIT_VERIFY_MS);
+          if (existsSync(jsonlPath)) return; // submitted — boot wait takes it from here
+          if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
+          if (sessions.get(opts.taskId) !== state) return;
+          if (!slotLive()) return;
+          const pane = tmux(["capture-pane", "-p", "-t", sessionName]).stdout;
+          if (UNSUBMITTED_PASTE_RE.test(pane)) {
+            if (!resendAnnounced) {
+              opts.onChunk("status", "pasted prompt still unsubmitted — re-sending Enter until claude accepts it");
+              resendAnnounced = true;
+            }
+            tmux(["send-keys", "-t", sessionName, "Enter"]);
+          }
+        }
       } catch { /* never let the deferred-paste poller crash the spawn */ }
+      finally {
+        // Always release the boot JSONL wait, on every exit path — a paste
+        // flow that bailed (session died, superseded, cancelled) must not
+        // hold the boot window open forever.
+        deferredPasteSettled = true;
+      }
     })();
   }
 
@@ -4659,8 +4717,17 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
       sawStartupPromptThisWindow = false;
       found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
       if (found) break;
+      // Re-arm while the deferred-paste flow hasn't settled, exactly like an
+      // unanswered startup prompt: on the deferred path the JSONL only
+      // appears AFTER the paste submits, so this window is measuring paste
+      // latency, not boot — expiring it would kill a healthy session out
+      // from under its own prompt delivery (the 2DOT2DOT child-death race).
+      // The paste flow is itself bounded (readiness windows + the submit
+      // verification loop), so this can't re-arm forever on its account.
       const blockedOnUser =
-        sawStartupPromptThisWindow || activeTmuxPromptsForTask(opts.taskId).length > 0;
+        sawStartupPromptThisWindow
+        || activeTmuxPromptsForTask(opts.taskId).length > 0
+        || !deferredPasteSettled;
       if (blockedOnUser && tmux(["has-session", "-t", "=" + sessionName]).ok) continue;
       break;
     }

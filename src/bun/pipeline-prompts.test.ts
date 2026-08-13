@@ -306,22 +306,36 @@ test("childBuildPrompt: folds in the subtask's own prompt, points at PLAN.md, re
   );
   expect(p).toContain("Add a toggle component to settings.");
   expect(p).toContain(PIPELINE_PLAN_FILE);
-  expect(p).toContain("Add dark mode"); // parent ticket folded in for context
+  // The raw ticket is deliberately NOT folded in — PLAN.md supersedes it by
+  // this stage, and every fixed byte pushes the prompt toward the fragile
+  // deferred-paste path (see the childBuildPrompt doc comment).
+  expect(p).not.toContain("Add dark mode");
   expect(p.toLowerCase()).toContain("commit");
   expect(p.toLowerCase()).toContain("do not push");
   expect(p.toLowerCase()).toContain("do not open a pull request");
   expect(p).toContain('"feature:');
 });
 
-test("childBuildPrompt: inlines AC text from specAcMap when the subtask owns ACs", () => {
+test("childBuildPrompt: references owned ACs by id and points at SPEC.md for their text", () => {
   const p = childBuildPrompt(
     task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
     { id: "toggle", title: "Add the toggle", prompt: "Do the thing.", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2"] },
-    { "AC-1": "The toggle persists across reloads.", "AC-2": "The toggle is accessible." },
   );
-  expect(p).toContain("AC-1: The toggle persists across reloads.");
-  expect(p).toContain("AC-2: The toggle is accessible.");
+  expect(p).toContain("AC-1");
+  expect(p).toContain("AC-2");
   expect(p).toContain(PIPELINE_SPEC_FILE);
+});
+
+test("childBuildPrompt: fixed overhead stays well inside the claude argv budget", () => {
+  // subtask.prompt is agent-authored and unbounded, but everything ELSE in
+  // the child prompt is ours — keep the fixed template comfortably under
+  // half of CLAUDE_PROMPT_ARGV_MAX_BYTES (4096) so a reasonably-sized
+  // subtask prompt still ships via argv instead of the deferred-paste path.
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "x".repeat(2000) }),
+    { id: "s", title: "T", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2", "AC-3"] },
+  );
+  expect(Buffer.byteLength(p, "utf8")).toBeLessThan(2048);
 });
 
 // --- parseSpecAcceptanceCriteria -----------------------------------------------

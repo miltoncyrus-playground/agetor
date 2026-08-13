@@ -292,6 +292,48 @@ export function gitWritableRootsSync(cwd: string): string[] {
 }
 
 /**
+ * Deterministic fingerprint of a working tree's full state: HEAD sha +
+ * `git status --porcelain` + `git diff HEAD` content, hashed together. Two
+ * calls return the same value iff nothing changed — no new commits, no
+ * staged/unstaged edits, no untracked-file churn. The dirty state is
+ * included deliberately: pipeline "building" fixup turns leave their work
+ * uncommitted (buildingPrompt forbids committing), so HEAD alone would call
+ * a productive fixup cycle a no-op.
+ *
+ * Sync (spawnSync, same posture as `gitWritableRootsSync`) because its one
+ * caller — the orchestrator's `bounceOrBlock` loop-breaker — runs inside the
+ * synchronous run-settlement path. Returns null when `dir` isn't a git repo
+ * or any git call fails, which callers treat as "can't compare, skip the
+ * check" (never a false block).
+ */
+export function treeFingerprintSync(dir: string): string | null {
+  const run = (args: string[]): string | null => {
+    try {
+      const res = spawnSync("git", args, {
+        cwd: dir,
+        encoding: "utf8",
+        timeout: 10_000,
+        maxBuffer: 128 * 1024 * 1024,
+      });
+      if (res.status !== 0 || typeof res.stdout !== "string") return null;
+      return res.stdout;
+    } catch {
+      return null;
+    }
+  };
+  const head = run(["rev-parse", "HEAD"]);
+  if (head == null) return null;
+  const status = run(["status", "--porcelain"]);
+  const diff = run(["diff", "HEAD"]);
+  if (status == null || diff == null) return null;
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(head);
+  hasher.update(status);
+  hasher.update(diff);
+  return hasher.digest("hex");
+}
+
+/**
  * Resolve a ref (branch name, tag, "HEAD", or partial sha) to a full 40-char sha
  * relative to `dir`. Returns null if `dir` isn't a git repo or the ref doesn't
  * exist — callers turn that into a user-facing error.

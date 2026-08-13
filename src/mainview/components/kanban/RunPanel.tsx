@@ -2559,6 +2559,7 @@ function RunPanelBody({
         <BlockedBanner
           task={task}
           onRetryStage={() => onStart(task)}
+          onOverrideGate={() => void api.overridePipelineGate(task.id).catch(() => {})}
           onRetryNudge={() => void send("Please continue from where you left off.")}
           onEditAndRetry={editAndRetry}
           onRetryAsIs={() => void send(lastUserMessageText)}
@@ -3033,6 +3034,7 @@ const UNKNOWN_BLOCK_COPY = {
 function BlockedBanner({
   task,
   onRetryStage,
+  onOverrideGate,
   onRetryNudge,
   onEditAndRetry,
   onRetryAsIs,
@@ -3040,6 +3042,7 @@ function BlockedBanner({
 }: {
   task: Task;
   onRetryStage: () => void;
+  onOverrideGate: () => void;
   onRetryNudge: () => void;
   onEditAndRetry: () => void;
   onRetryAsIs: () => void;
@@ -3047,12 +3050,23 @@ function BlockedBanner({
 }) {
   const copy = task.blockReason ? BLOCK_REASON_COPY[task.blockReason] : UNKNOWN_BLOCK_COPY;
   const isPipeline = task.pipelineStage != null;
+  // Gate-bearing stages only — the artifact stages (specify/clarify/
+  // planning/decompose) advance on their file gates and the server refuses
+  // to override them, so don't offer a button that 400s.
+  const canOverrideGate =
+    isPipeline
+    && ["plan-review", "building", "code-review", "testing"].includes(task.pipelineStage!);
 
   const actions: React.ReactNode = (() => {
     if (isPipeline) {
       return (
         <>
           <Button size="sm" onClick={onRetryStage}>Retry stage</Button>
+          {canOverrideGate && (
+            <Button size="sm" variant="outline" title="Force this gate through — advances one stage and records the override on the run log" onClick={onOverrideGate}>
+              Override gate
+            </Button>
+          )}
           <Button size="sm" variant="outline" onClick={onArchive}>Archive</Button>
         </>
       );

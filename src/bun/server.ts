@@ -18,7 +18,7 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, pausePipelineTask, reconcileTaskSession, resumePipelineTask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, overridePipelineGate, pausePipelineTask, reconcileTaskSession, resumePipelineTask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -3266,6 +3266,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         POST: authed(async (req) => {
           server.timeout(req, 0);
           const result = await resumePipelineTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+      // Explicit human override of the current pipeline gate — advances
+      // exactly one stage and records a durable audit status event. This is
+      // the ONLY way to force a gate: advancePipelineStage's provenance gate
+      // means a verdict line typed into a conversation turn no longer moves
+      // the pipeline. 400 on artifact-gated stages (nothing to overrule).
+      "/tasks/:id/pipeline-override": {
+        POST: authed((req) => {
+          const result = overridePipelineGate(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });

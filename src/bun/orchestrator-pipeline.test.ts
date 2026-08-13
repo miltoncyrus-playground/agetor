@@ -35,6 +35,32 @@ function writeTasksPlan(dir: string, plan: unknown) {
   writeFileSync(path.join(dir, "TASKS.json"), JSON.stringify(plan));
 }
 
+/**
+ * Satisfy a parent's build barrier: writes a one-subtask TASKS.json into its
+ * workdir and inserts a matching `childMergeStatus: "merged"` child row.
+ * Every exit from "building" (advance AND review/test bounce) now consults
+ * the barrier, so tests seeding a task directly at building/code-review/
+ * testing need this for the pre-barrier behaviors (advance to code-review,
+ * fixup-turn bounce) to remain reachable.
+ */
+async function seedSatisfiedBarrier(parentTaskId: string, workdir: string): Promise<void> {
+  const { tasks } = await import("./db.ts");
+  writeTasksPlan(workdir, { subtasks: [{ id: "s1", title: "S1", prompt: "do s1", dependsOn: [], acceptanceCriteria: [] }] });
+  const now = Date.now();
+  tasks.insert({
+    id: crypto.randomUUID(), title: "child s1", prompt: "do s1", column: "building", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
+    parentTaskId, planSubtaskId: "s1", childMergeStatus: "merged",
+  });
+}
+
 /** Start (or restart) a pipeline task's current stage and return the run id
  *  synchronously, before the fake's own resolve timers have had a chance to
  *  fire — matching the pattern orchestrator-gemini.test.ts already relies
@@ -411,7 +437,7 @@ test("pipeline: revise past the revision cap blocks instead of looping again", a
   expect(task.blockReason).toBe("revision-cap");
 });
 
-test("pipeline: building success (not verdict-bearing) advances straight to code-review", async () => {
+test("pipeline: building success with a satisfied barrier advances to code-review", async () => {
   const { startTask } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");
 
@@ -429,6 +455,7 @@ test("pipeline: building success (not verdict-bearing) advances straight to code
     pipelineStage: "building", planApproved: true, implementationApproved: false,
     revisionCount: 0, pipelineFeedback: "prior tester feedback", pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
+  await seedSatisfiedBarrier(taskId, workdir);
 
   await startAndGetRunId(startTask, taskId);
   await settle();
@@ -441,6 +468,73 @@ test("pipeline: building success (not verdict-bearing) advances straight to code
   expect(task.pipelineStage).toBe("code-review");
   expect(task.pipelineFeedback).toBeNull(); // consumed on the building->code-review hop
   expect(runs.listForTask(taskId).length).toBe(2); // building's run + the auto-spawned code-review run
+});
+
+test("pipeline: building success with UNMET barrier stays in building instead of advancing (the 2DOT2DOT regression)", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  // Two subtasks declared, ZERO children merged — the exact state the
+  // 2DOT2DOT parent was in when a stray run success advanced it to
+  // code-review over an empty branch.
+  writeTasksPlan(workdir, {
+    subtasks: [
+      { id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: [] },
+      { id: "b", title: "B", prompt: "do b", dependsOn: [], acceptanceCriteria: [] },
+    ],
+  });
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p6-unmet", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "building", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  await startAndGetRunId(startTask, taskId);
+  await settle(300); // the run's success hands off to tickBuild, which spawns children
+
+  const task = tasks.get(taskId)!;
+  // NOT code-review — the barrier held. tickBuild took over and spawned the
+  // two dep-free subtasks as real children instead.
+  expect(task.pipelineStage).toBe("building");
+  const children = tasks.list().filter((t) => t.parentTaskId === taskId);
+  expect(children.map((c) => c.planSubtaskId).sort()).toEqual(["a", "b"]);
+});
+
+test("pipeline: building success with NO TASKS.json blocks instead of advancing", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true); // SPEC+PLAN, no TASKS.json
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p6-nojson", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "building", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  await startAndGetRunId(startTask, taskId);
+  await settle();
+
+  const task = tasks.get(taskId)!;
+  expect(task.column).toBe("blocked");
+  expect(task.pipelineStage).toBe("building"); // stays put so a human sees where it died
+  expect(task.pipelineFeedback).toContain("TASKS.json");
 });
 
 test("pipeline: code-review approve advances to testing", async () => {
@@ -493,6 +587,7 @@ test("pipeline: code-review revise under the cap bounces to building with feedba
     // below must draw from the SAME counter, not a fresh one.
     revisionCount: 2, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
+  await seedSatisfiedBarrier(taskId, workdir); // barrier met → the bounce is a fixup turn
 
   const runId = await startAndGetRunId(startTask, taskId);
   runs.appendEvent(runId, "assistant", "PIPELINE_VERDICT: revise the error handling swallows the exception silently");
@@ -502,10 +597,13 @@ test("pipeline: code-review revise under the cap bounces to building with feedba
   expect(task.pipelineStage).toBe("building");
   expect(task.column).toBe("building");
   expect(task.revisionCount).toBe(3); // shared counter incremented, not a separate code-review counter
-  expect(task.pipelineFeedback).toBe("the error handling swallows the exception silently");
-  // No children spawned — this is the BOUNCE-entry (plain single-agent
-  // fixup), not a fresh decompose-then-build kick-off.
-  expect(tasks.list().filter((t) => t.parentTaskId === taskId).length).toBe(0);
+  // The originating gate is named in the feedback so the Builder knows
+  // which review it is answering (buildingPrompt is stage-neutral now).
+  expect(task.pipelineFeedback).toBe("code review: the error handling swallows the exception silently");
+  // No NEW children spawned — this is the BOUNCE-entry (plain single-agent
+  // fixup), not a fresh decompose-then-build kick-off. (The one merged
+  // child is the barrier fixture seeded above.)
+  expect(tasks.list().filter((t) => t.parentTaskId === taskId).length).toBe(1);
 });
 
 test("pipeline: specify through decompose chains correctly across real auto-advances (not directly-seeded stages)", async () => {
@@ -605,6 +703,7 @@ test("pipeline: testing fail under the cap bounces to building (not planning)", 
     pipelineStage: "testing", planApproved: true, implementationApproved: false,
     revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
+  await seedSatisfiedBarrier(taskId, workdir); // barrier met → the bounce is a fixup turn
 
   const runId = await startAndGetRunId(startTask, taskId);
   runs.appendEvent(runId, "assistant", "PIPELINE_VERDICT: fail 2 type errors remain");
@@ -615,7 +714,7 @@ test("pipeline: testing fail under the cap bounces to building (not planning)", 
   expect(task.column).toBe("building");
   expect(task.implementationApproved).toBe(false);
   expect(task.revisionCount).toBe(1);
-  expect(task.pipelineFeedback).toBe("2 type errors remain");
+  expect(task.pipelineFeedback).toBe("testing: 2 type errors remain");
 });
 
 test("pipeline: no PIPELINE_VERDICT in the response blocks rather than guessing", async () => {
@@ -665,6 +764,7 @@ test("pipeline: pause lands the column on the next stage but does not spawn a ru
     revisionCount: 0, pipelineFeedback: null,
     pausedAt: Date.now(), blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, // paused before this stage's run even started
   });
+  await seedSatisfiedBarrier(taskId, workdir);
 
   await startAndGetRunId(startTask, taskId);
   await settle();
@@ -780,6 +880,7 @@ test("pipeline: pause skips the auto-spawn of the NEXT stage, resume continues i
     pipelineStage: "building", planApproved: true, implementationApproved: false,
     revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
   });
+  await seedSatisfiedBarrier(taskId, workdir);
 
   // Start building's own run, then pause WHILE it's still in flight — the
   // pause must not affect this run (it's already spawned), only the
@@ -990,4 +1091,38 @@ test("resolveRunModel: verdict stages on codex/gemini are NOT overridden", async
   };
   expect(resolveRunModel({ ...base, agent: "codex" }, "codex")).toBe("gpt-5.5");
   expect(resolveRunModel({ ...base, agent: "gemini", model: "gemini-3-pro-preview" }, "gemini")).toBe("gemini-3-pro-preview");
+});
+
+test("pipeline: restarting a revision-capped task blocks again WITHOUT growing the counter past cap+1", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const { PIPELINE_REVISION_CAP } = await import("../shared/types.ts");
+
+  const workdir = await makeWorkdir(true);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "p-clamp", prompt: "x", column: "blocked", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "testing", planApproved: true, implementationApproved: false,
+    // Already over the cap — the 2DOT2DOT task was restarted seventeen
+    // times from this exact state and counted up to 23.
+    revisionCount: PIPELINE_REVISION_CAP + 1, pipelineFeedback: null, pausedAt: null,
+    blockReason: "revision-cap", parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+  await seedSatisfiedBarrier(taskId, workdir);
+
+  const runId = await startAndGetRunId(startTask, taskId);
+  runs.appendEvent(runId, "assistant", "PIPELINE_VERDICT: fail still broken");
+  await settle();
+
+  const task = tasks.get(taskId)!;
+  expect(task.column).toBe("blocked");
+  expect(task.blockReason).toBe("revision-cap");
+  expect(task.revisionCount).toBe(PIPELINE_REVISION_CAP + 1); // clamped, not 8, 9, …23
 });
