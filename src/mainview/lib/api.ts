@@ -386,6 +386,15 @@ export const api = {
     }),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  /** Clone a GitHub repo and register it as a project. `dest` defaults
+   *  server-side to ~/<repo>. Unless `eli5` is false, the server also creates
+   *  and starts a task that writes an ELI5.md explainer at the clone's root;
+   *  `eli5Error` carries a non-fatal failure of that step. */
+  cloneProject: (url: string, dest?: string, eli5?: boolean) =>
+    j<{ project: Project; eli5TaskId: string | null; eli5Error: string | null }>(
+      "/projects/clone",
+      { method: "POST", body: JSON.stringify({ url, dest, eli5 }) },
+    ),
   renameProject: (p: string, name: string) =>
     j<Project>("/projects", { method: "PATCH", body: JSON.stringify({ path: p, name }) }),
   /** Per-project branch nomenclature. GET resolves to built-in defaults when the

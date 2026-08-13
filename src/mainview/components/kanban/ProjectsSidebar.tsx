@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { ChevronLeft, ChevronRight, GitBranch, Pencil, Plus, Trash2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, DownloadCloud, GitBranch, Pencil, Plus, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useConfirm } from "@/components/ui/confirm";
 import { cn } from "@/lib/utils";
 import { BranchNamingDialog } from "@/components/settings/BranchNamingDialog";
+import { CloneProjectDialog } from "@/components/kanban/CloneProjectDialog";
 import {
   PROJECTS_PANEL_COLLAPSED_KEY,
   readCollapsed,
@@ -49,6 +50,7 @@ export function ProjectsSidebar({ projects, onChanged }: Props) {
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
   const [renameText, setRenameText] = useState("");
   const [branchProjectPath, setBranchProjectPath] = useState<string | null>(null);
+  const [cloneOpen, setCloneOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const onAdd = async () => {
@@ -143,17 +145,30 @@ export function ProjectsSidebar({ projects, onChanged }: Props) {
           <div className="flex h-full w-72 flex-col">
             <div className="flex shrink-0 items-center justify-between border-b border-border/60 px-4 py-3">
               <span className="text-sm font-semibold">Projects</span>
-              <Button
-                size="icon"
-                variant="ghost"
-                onClick={() => void onAdd()}
-                disabled={busy}
-                title="Add a project (opens the folder picker)"
-                aria-label="Add project"
-                className="size-7"
-              >
-                <Plus className="size-4" />
-              </Button>
+              <div className="flex items-center gap-0.5">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={() => setCloneOpen(true)}
+                  disabled={busy}
+                  title="Checkout an existing GitHub repo"
+                  aria-label="Checkout from GitHub"
+                  className="size-7"
+                >
+                  <DownloadCloud className="size-4" />
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={() => void onAdd()}
+                  disabled={busy}
+                  title="Add a local folder (opens the folder picker)"
+                  aria-label="Add project"
+                  className="size-7"
+                >
+                  <Plus className="size-4" />
+                </Button>
+              </div>
             </div>
 
             <div className="flex-1 space-y-1 overflow-y-auto px-2 py-2 text-xs">
@@ -169,6 +184,16 @@ export function ProjectsSidebar({ projects, onChanged }: Props) {
                   >
                     <Plus className="mr-1 size-3.5" />
                     Add project
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setCloneOpen(true)}
+                    disabled={busy}
+                    className="w-full justify-start"
+                  >
+                    <DownloadCloud className="mr-1 size-3.5" />
+                    Checkout from GitHub
                   </Button>
                 </div>
               ) : (
@@ -244,6 +269,12 @@ export function ProjectsSidebar({ projects, onChanged }: Props) {
           </div>
         )}
       </div>
+
+      <CloneProjectDialog
+        open={cloneOpen}
+        onClose={() => setCloneOpen(false)}
+        onCloned={onChanged}
+      />
 
       <BranchNamingDialog
         open={branchProjectPath !== null}
