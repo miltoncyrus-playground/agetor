@@ -29,10 +29,11 @@ interface Props {
 }
 
 /**
- * Right-side Projects sidebar: add (native folder dialog), inline-rename, edit
+ * Left-side Projects sidebar: add (native folder dialog), inline-rename, edit
  * branch naming, and delete registered projects. Mirrors the New Task
- * sidebar's collapse-to-rail chrome, but with the border on the LEFT edge and
- * the straddle toggle overhanging into the board's left gutter.
+ * sidebar's collapse-to-rail chrome, but with the border on the RIGHT edge and
+ * the straddle toggle overhanging into the gutter between it and the New Task
+ * sidebar.
  */
 export function ProjectsSidebar({ projects, onChanged }: Props) {
   const confirm = useConfirm();
@@ -101,25 +102,25 @@ export function ProjectsSidebar({ projects, onChanged }: Props) {
         // Width is the only animated property — <main> next door is flex-1,
         // so the board reclaims the space in the same frame with no resize
         // logic on that side.
-        "relative flex h-full shrink-0 flex-col border-l border-border/60 bg-card text-card-foreground",
+        "relative flex h-full shrink-0 flex-col border-r border-border/60 bg-card text-card-foreground",
         "transition-[width] duration-200 ease-out motion-reduce:transition-none",
         collapsed ? "w-11" : "w-72",
       )}
     >
-      {/* Collapse control straddling the LEFT border (overhangs into the
-          board's p-4 gutter). Collapsed → ChevronLeft to expand leftward;
-          expanded → ChevronRight to collapse rightward. */}
+      {/* Collapse control straddling the RIGHT border (overhangs into the
+          gutter between it and the New Task sidebar). Collapsed → ChevronRight
+          to expand rightward; expanded → ChevronLeft to collapse leftward. */}
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
         aria-expanded={!collapsed}
         aria-label={collapsed ? "Expand projects panel" : "Collapse projects panel"}
         title={collapsed ? "Expand projects panel" : "Collapse projects panel"}
-        className="absolute -left-2.5 top-1/2 z-20 flex size-5 -translate-y-1/2 items-center justify-center rounded-full border border-border/60 bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
+        className="absolute -right-2.5 top-1/2 z-20 flex size-5 -translate-y-1/2 items-center justify-center rounded-full border border-border/60 bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
       >
         {collapsed
-          ? <ChevronLeft className="size-3.5" />
-          : <ChevronRight className="size-3.5" />}
+          ? <ChevronRight className="size-3.5" />
+          : <ChevronLeft className="size-3.5" />}
       </button>
 
       {/* Clip layer: contents keep their natural width and get cut off while
