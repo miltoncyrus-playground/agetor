@@ -45,6 +45,7 @@ import m036 from "./036_prebuilder_children.sql" with { type: "text" };
 import m037 from "./037_block_reason.sql" with { type: "text" };
 import m038 from "./038_sdd_pipeline_stages.sql" with { type: "text" };
 import m039 from "./039_pipeline_bounce_fingerprint.sql" with { type: "text" };
+import m040 from "./040_account_usage.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -88,4 +89,5 @@ export const migrations: Migration[] = [
   { id: "037_block_reason", sql: m037 },
   { id: "038_sdd_pipeline_stages", sql: m038 },
   { id: "039_pipeline_bounce_fingerprint", sql: m039 },
+  { id: "040_account_usage", sql: m040 },
 ];

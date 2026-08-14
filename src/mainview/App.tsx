@@ -4,7 +4,7 @@ import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-r
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { isActiveColumn, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
-import { DISPLAY_COLUMNS, toDisplayColumn, type DisplayColumnId } from "./lib/display-columns.ts";
+import { DISPLAY_COLUMNS, filterLaneColumns, toDisplayColumn, type DisplayColumnId } from "./lib/display-columns.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
@@ -549,10 +549,12 @@ export default function App() {
   // zero currently-visible tasks — an empty lane is noise), then any workdir
   // present in tasks but not a registered project (ad-hoc/typed-in
   // workdirs), alphabetically. Each lane also gets its OWN visible-column
-  // list: `visibleDisplayColumns` filtered down to buckets that actually
-  // have a task in THIS lane — a column with zero tasks in a given project
-  // simply doesn't render in that project's row, even if another project's
-  // row does show it (the confirmed "auto-hide, per lane" behavior).
+  // list via `filterLaneColumns`: the four working columns (backlog / ready /
+  // in-progress / blocked) always render, empty or not — an empty column is
+  // a valid drop target — while `review` / `done` keep the original per-lane
+  // auto-hide (zero tasks in THIS lane → not rendered in this row, even if
+  // another project's row shows it). The user's explicit status filter still
+  // wins for all six: it's applied upstream in `visibleDisplayColumns`.
   // No stability trick needed for `tasksByDisplayColumn`'s per-cell arrays
   // beyond what `visibleTasks.filter(...)` already relied on for the flat
   // board — `Column`'s memo comparator (Column.tsx) compares elements, not
@@ -578,8 +580,9 @@ export default function App() {
         if (arr) arr.push(t); else tasksByDisplayColumn.set(dc, [t]);
       }
       const project = projects.find((p) => p.path === workdir);
-      const laneVisibleColumns = visibleDisplayColumns.filter(
-        (c) => (tasksByDisplayColumn.get(c.id)?.length ?? 0) > 0,
+      const laneVisibleColumns = filterLaneColumns(
+        visibleDisplayColumns,
+        (id) => (tasksByDisplayColumn.get(id)?.length ?? 0) > 0,
       );
       return {
         workdir,

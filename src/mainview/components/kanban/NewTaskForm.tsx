@@ -7,7 +7,7 @@ import { Select } from "@/components/ui/select";
 import { SearchSelect } from "@/components/ui/search-select";
 import { InfoTip } from "@/components/ui/info-tip";
 import { Textarea } from "@/components/ui/textarea";
-import { cn } from "@/lib/utils";
+import { cn, formatTokens } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { branchFieldState } from "@/lib/branch-field";
 import {
@@ -800,8 +800,18 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                         size="sm"
                         variant={agent === h.id ? "default" : "outline"}
                         onClick={() => switchAgent(h.id)}
+                        // Account email + today's token burn come first: with
+                        // two claude harnesses, "which account is this and
+                        // does it have headroom" is the decision being made.
                         title={
-                          [status?.reason, status?.path, status?.version]
+                          [
+                            status?.account?.email,
+                            status?.usage &&
+                              `today ${formatTokens(status.usage.today.inputTokens + status.usage.today.outputTokens)} tok`,
+                            status?.reason,
+                            status?.path,
+                            status?.version,
+                          ]
                             .filter(Boolean)
                             .join(" — ") || h.id
                         }

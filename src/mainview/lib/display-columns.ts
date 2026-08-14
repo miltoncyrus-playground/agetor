@@ -26,6 +26,30 @@ export const DISPLAY_COLUMNS: { id: DisplayColumnId; label: string; dotClass: st
   { id: "done", label: "Done", dotClass: "bg-slate-400" },
 ];
 
+/**
+ * The four working columns every lane renders even when empty. `review` and
+ * `done` are outcome buckets and keep the original auto-hide; these four are
+ * the ones whose absence disorients ("where did Ready go?") and whose empty
+ * state is a useful drop target (you couldn't drag a card into a column that
+ * wasn't rendered).
+ */
+export const ALWAYS_VISIBLE_DISPLAY_COLUMNS: ReadonlySet<DisplayColumnId> =
+  new Set(["backlog", "ready", "in-progress", "blocked"]);
+
+/**
+ * Per-lane column visibility: keep a column when it's one of the four
+ * always-visible working columns OR it has at least one task in this lane.
+ * `visible` must already have the user's explicit status filter applied
+ * (App.tsx's `visibleDisplayColumns`) — that's what makes the filter win
+ * over always-visible: a status the user filtered out never reaches here.
+ */
+export function filterLaneColumns<T extends { id: DisplayColumnId }>(
+  visible: T[],
+  hasTasks: (id: DisplayColumnId) => boolean,
+): T[] {
+  return visible.filter((c) => ALWAYS_VISIBLE_DISPLAY_COLUMNS.has(c.id) || hasTasks(c.id));
+}
+
 const DISPLAY_COLUMN_BY_ID = new Map(DISPLAY_COLUMNS.map((c) => [c.id, c]));
 
 export function displayColumnMeta(id: DisplayColumnId) {

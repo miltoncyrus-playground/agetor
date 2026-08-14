@@ -10,11 +10,11 @@ import { Column } from "./Column";
 interface Props {
   workdir: string;
   label: string;
-  /** The columns to render, in board order — already filtered down to this
-   *  lane's OWN non-empty display columns by the caller (App.tsx's `lanes`
-   *  useMemo): a column with zero tasks in THIS project doesn't appear in
-   *  its row, even if another project's row still shows it (auto-hide is
-   *  per-lane, not board-wide). */
+  /** The columns to render, in board order — filtered by the caller
+   *  (App.tsx's `lanes` useMemo via `filterLaneColumns`): the four working
+   *  columns (backlog/ready/in-progress/blocked) always appear, while
+   *  review/done auto-hide when THIS lane has zero tasks in them (per-lane,
+   *  not board-wide). */
   visibleColumns: { id: DisplayColumnId; label: string }[];
   tasksByColumn: Map<DisplayColumnId, Task[]>;
   taskCount: number;

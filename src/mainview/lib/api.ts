@@ -5,6 +5,7 @@ import type {
   BranchInfo,
   BranchNamingConfig,
   ColumnId,
+  DiscoveredAccount,
   GlobalEvent,
   GitHubItemKind,
   GitHubItemState,
@@ -325,6 +326,17 @@ export interface TaskEventsPage {
 }
 
 export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
+/** One day × model row of an account's local token rollup. */
+export interface AccountUsageDay {
+  day: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  messageCount: number;
+}
+export interface AccountUsagePayload { configDir: string; days: AccountUsageDay[] }
 export interface HarnessInput {
   id: string;
   kind: AgentKind;
@@ -372,6 +384,12 @@ export const api = {
     }),
   getHarnessUsage: (id: string) =>
     j<HarnessUsage>(`/harnesses/${encodeURIComponent(id)}/usage`),
+  /** Existing logged-in Claude config dirs no harness points at yet —
+   *  rendered by the Add-harness picker as one-click account entries. */
+  discoverAccounts: () => j<{ accounts: DiscoveredAccount[] }>("/harness-discovery"),
+  /** Daily per-model token rollup for a claude-code harness's account. */
+  getAccountUsage: (id: string) =>
+    j<AccountUsagePayload>(`/harnesses/${encodeURIComponent(id)}/account-usage`),
   openHarnessTerminal: (id: string) =>
     j<{ ok: true }>(`/harnesses/${encodeURIComponent(id)}/open-terminal`, {
       method: "POST",

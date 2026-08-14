@@ -276,7 +276,7 @@ function safeReadJson(p: string): any {
  * key invalidates the entry; an unreadable/missing file caches `null`.
  */
 const jsonStatCache = new Map<string, { mtimeMs: number; size: number; value: any }>();
-function safeReadJsonCached(p: string): any {
+export function safeReadJsonCached(p: string): any {
   let mtimeMs: number, size: number;
   try { ({ mtimeMs, size } = statSync(p)); }
   catch { jsonStatCache.delete(p); return null; }

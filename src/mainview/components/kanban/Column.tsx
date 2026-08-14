@@ -65,7 +65,10 @@ function ColumnImpl({ id, droppableId, label, droppable = true, tasks, tasksById
         </h2>
         <Badge variant="outline" className="h-4 px-1.5 text-[10px]">{tasks.length}</Badge>
       </div>
-      <div className="flex flex-col gap-1">
+      {/* min-h keeps an empty always-visible column a comfortable drop
+          target — without it the card list collapses to zero height and the
+          droppable area is just the header strip. */}
+      <div className="flex min-h-10 flex-col gap-1">
         {tasks.map((t) => (
           <TaskCard
             key={t.id}

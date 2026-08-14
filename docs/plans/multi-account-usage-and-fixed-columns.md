@@ -6,7 +6,7 @@
 | Source | User request: switch between two Claude accounts (`~/.claude` and `~/.claude-adevinta`) inside agetor; per-account usage/quota display; stop auto-hiding the Backlog / Ready / In Progress / Blocked columns. Design only — this document is the deliverable |
 | Scope decision | Three workstreams: W1 account discovery + identity (claude-code only), W2 per-account usage/quota, W3 board column visibility. Codex/gemini account identity is explicitly out of scope (same pattern, separate plan) |
 | Key finding | Multi-account support already exists end-to-end via harness aliases (`home` → `CLAUDE_CONFIG_DIR`). W1/W2 close the discoverability and observability gaps; nothing in the spawn/tail path changes |
-| Status | **Design only. No code, no migration written yet.** |
+| Status | **Phase 1 implemented** (W1, W2 plane A, W3) — see §10. Phase 2 (plane B live quota) remains gated on the §4.2 credentials decision. |
 
 ## 1. Objective & success criteria
 
@@ -150,3 +150,12 @@ Gate tests only; no latent-space component in any workstream, so no eval suite a
 1. **Phase 1** (no open questions): W3, W1, W2 plane A + UI. Independent surfaces (`mainview` lib/App vs new bun modules) — parallel-session safe per the services rule.
 2. **Phase 2** (gated on Milton's credentials decision, §4.2): plane B quota client + opt-in toggle + picker badge.
 3. **Later, separate plans**: codex (`~/.codex/auth.json`) and gemini account identity; usage charts.
+
+## 10. As-built deltas (Phase 1 implementation)
+
+Two deliberate additions beyond the design, both forced by verified realities:
+
+- **`usage_seen` table** (migration `040_account_usage.sql`): the design said "dedupe makes re-reads idempotent" — that requires the dedupe keys to be *durable*, because rollups are additive and reattach/truncation re-reads files from offset 0. One `(config_dir, key)` row per counted API response; `INSERT OR IGNORE` gates every rollup increment.
+- **Per-pass scan budget** (16MB, `SCAN_BUDGET_BYTES`): the real `~/.claude/projects` on the dev machine is 109MB / 178 files. Bun.serve is single-threaded and the scan is synchronous, so an unbounded first pass would stall every request for seconds. Measured as-built: 7 passes × ~430ms to fully ingest the 109MB history via the 15s `/harnesses` poll, near-zero steady state. `ScanResult.budgetExhausted` reports truncation (no silent caps); cursors resume mid-file.
+
+Everything else landed as designed: `src/bun/harness-discovery.ts`, `src/bun/account-usage.ts`, `HarnessStatus.account`/`.usage`, `GET /harness-discovery`, `GET /harnesses/:id/account-usage`, detected-accounts section + per-row identity/usage + drill-down table in `SettingsDialog.tsx`, picker tooltip in `NewTaskForm.tsx`, `ALWAYS_VISIBLE_DISPLAY_COLUMNS` + `filterLaneColumns` in `display-columns.ts` wired through `App.tsx`/`SwimLane.tsx`/`Column.tsx`. Gate tests: `harness-discovery.test.ts` (10), `account-usage.test.ts` (12), `display-columns.test.ts` (+6). No eval suite — no latent-space component (stated per the test plan, not skipped).
