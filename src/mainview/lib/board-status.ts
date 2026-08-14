@@ -9,13 +9,21 @@ import { COLUMNS, isActiveColumn, type ColumnId, type Task } from "../../shared/
  * clock.
  */
 
+/** One predicate for "this card is waiting on the human", shared by the
+ *  attention strip's waiting count, the waiting-first column sort, and the
+ *  card's amber ring: a pending interaction (question/approval) or a build
+ *  child whose finished work awaits an explicit hand-back to the pipeline. */
+export function isWaitingOnHuman(t: Pick<Task, "pendingInteractionCount" | "awaitingHandBack">): boolean {
+  return t.pendingInteractionCount > 0 || t.awaitingHandBack === true;
+}
+
 export interface AttentionSummary {
   /** Agent actively working: plain `running` or any pipeline-stage column. */
   running: number;
   blocked: number;
   review: number;
-  /** Tasks with a pending interaction (a question waiting on the human) —
-   *  orthogonal to column, so counted independently of the three above. */
+  /** Tasks waiting on the human (see `isWaitingOnHuman`) — orthogonal to
+   *  column, so counted independently of the three above. */
   waiting: number;
 }
 
@@ -27,7 +35,7 @@ export function attentionSummary(tasks: Task[]): AttentionSummary {
     if (isActiveColumn(t.column)) s.running++;
     else if (t.column === "blocked") s.blocked++;
     else if (t.column === "review") s.review++;
-    if (t.pendingInteractionCount > 0) s.waiting++;
+    if (isWaitingOnHuman(t)) s.waiting++;
   }
   return s;
 }
@@ -82,15 +90,15 @@ export function sortWaitingFirst(tasks: Task[]): Task[] {
   let seenNonWaiting = false;
   let needsSort = false;
   for (const t of tasks) {
-    if (t.pendingInteractionCount > 0) {
+    if (isWaitingOnHuman(t)) {
       if (seenNonWaiting) { needsSort = true; break; }
     } else {
       seenNonWaiting = true;
     }
   }
   if (!needsSort) return tasks;
-  const waiting = tasks.filter((t) => t.pendingInteractionCount > 0);
-  const rest = tasks.filter((t) => t.pendingInteractionCount <= 0);
+  const waiting = tasks.filter((t) => isWaitingOnHuman(t));
+  const rest = tasks.filter((t) => !isWaitingOnHuman(t));
   return [...waiting, ...rest];
 }
 

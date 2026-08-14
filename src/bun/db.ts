@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
 import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import { isAwaitingHandBack } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -86,6 +87,10 @@ type TaskRow = {
   parent_task_id: string | null;
   plan_subtask_id: string | null;
   child_merge_status: string | null;
+  /** Status of the run `run_id` points at (correlated subquery in
+   *  TASKS_SELECT) — feeds the derived `awaitingHandBack`. Missing on
+   *  code paths that don't join (insert fallback). */
+  current_run_status?: string | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
    *  a correlated subquery in `list` / `get` — see those for the full SQL. */
   has_openable_run?: number;
@@ -214,6 +219,14 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   parentTaskId: r.parent_task_id,
   planSubtaskId: r.plan_subtask_id,
   childMergeStatus: r.child_merge_status as Task["childMergeStatus"],
+  awaitingHandBack: isAwaitingHandBack(
+    {
+      parentTaskId: r.parent_task_id,
+      childMergeStatus: r.child_merge_status as Task["childMergeStatus"],
+      archivedAt: r.archived_at,
+    },
+    r.current_run_status ?? null,
+  ),
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -221,7 +234,8 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
 // exists for the task, 0 otherwise (NULL coalesces to 0 via COALESCE).
 const TASKS_SELECT = `
   SELECT tasks.*,
-         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run
+         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run,
+         (SELECT status FROM runs WHERE runs.id = tasks.run_id) AS current_run_status
     FROM tasks
     LEFT JOIN runs ON runs.task_id = tasks.id
 `;

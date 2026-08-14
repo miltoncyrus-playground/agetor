@@ -2567,6 +2567,10 @@ function RunPanelBody({
         />
       )}
 
+      {!archived && task.awaitingHandBack && (
+        <HandBackBanner task={task} onRerun={() => onStart(task)} />
+      )}
+
       <FileMentions task={task} events={events} />
 
       {/* Task details. Editable inline when the task is idle — agent / mode /
@@ -2994,6 +2998,58 @@ function RunPanelBody({
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * Banner for a build child whose latest run SUCCEEDED but whose work was
+ * never handed back to the pipeline (`task.awaitingHandBack`, the state the
+ * RC-6 provenance gate deliberately leaves behind when a follow-up chat turn
+ * — not the child's own build run — finished the work). Two exits:
+ *   - "Hand back & merge": POST /tasks/:id/hand-back — a deterministic
+ *     merge via the scheduler's merge-deferred path, no new agent turn. The
+ *     human's click IS the "this work is done" judgment RC-6 refuses to
+ *     infer from a turn ending cleanly.
+ *   - "Re-run build turn": the pre-existing path — restart the child's own
+ *     pipeline run so the AGENT re-verifies before the merge fires.
+ * A 409 means the state went stale between poll and click (someone else
+ * handed it back, or a new turn started) — surface it and let the next poll
+ * redraw.
+ */
+function HandBackBanner({ task, onRerun }: { task: Task; onRerun: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const handBack = async () => {
+    setBusy(true);
+    try {
+      await api.handBackChild(task.id);
+    } catch (e) {
+      toast.error("Couldn't hand back to the pipeline", {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="flex items-start gap-2.5 border-b border-amber-500/30 bg-amber-500/[0.06] px-3 py-2.5">
+      <GitMerge className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-foreground">Finished, but not handed back</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          This subtask's last run succeeded outside the pipeline (a follow-up conversation, not its own
+          build run), so its branch hasn't been merged into the parent build. Hand it back when the work
+          is done, or re-run the build turn to let the agent verify first.
+        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <Button size="sm" disabled={busy} onClick={() => void handBack()}>
+            Hand back &amp; merge
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy} onClick={onRerun}>
+            Re-run build turn
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
 

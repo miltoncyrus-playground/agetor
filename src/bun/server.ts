@@ -18,7 +18,7 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, overridePipelineGate, pausePipelineTask, reconcileTaskSession, resumePipelineTask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, handBackChild, listWorktrees, startTask, cancelRun, overridePipelineGate, pausePipelineTask, reconcileTaskSession, resumePipelineTask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
@@ -3315,6 +3315,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Explicit hand-back of a build child's finished work: parks the child
+      // as merge-deferred and ticks the parent's build so the deterministic
+      // merge (and, if that was the last subtask, the stage advance) runs.
+      // 409 on guard failures — the button-visible state may have gone stale
+      // between the poll and the click.
+      "/tasks/:id/hand-back": {
+        POST: authed(async (req) => {
+          const result = await handBackChild(req.params.id);
+          return "error" in result
+            ? json(result, { status: 409, headers: corsHeaders(req) })
+            : json(tasks.get(req.params.id), { headers: corsHeaders(req) });
         }),
       },
 

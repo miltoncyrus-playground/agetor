@@ -390,6 +390,12 @@ export const api = {
     }),
   getHarnessUsage: (id: string) =>
     j<HarnessUsage>(`/harnesses/${encodeURIComponent(id)}/usage`),
+  /** Hand a build child's finished work back to the pipeline: parks it
+   *  merge-deferred and ticks the parent's build (deterministic merge, no
+   *  new agent turn). 409s when the child isn't in the awaiting-hand-back
+   *  state anymore. Returns the updated Task. */
+  handBackChild: (id: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(id)}/hand-back`, { method: "POST" }),
   /** Existing logged-in Claude config dirs no harness points at yet —
    *  rendered by the Add-harness picker as one-click account entries. */
   discoverAccounts: () => j<{ accounts: DiscoveredAccount[] }>("/harness-discovery"),

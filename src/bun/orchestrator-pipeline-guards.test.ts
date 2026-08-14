@@ -282,3 +282,105 @@ test("bounce: a testing fail with an INCOMPLETE barrier re-enters the DAG (child
   // …and NO parent fixup run spawned (only the testing run exists).
   expect(runs.listForTask(taskId).length).toBe(1);
 });
+
+// ─── Hand-back: the explicit human counterpart of the RC-6 gate ──────────────
+// (2DOT2DOT stuck-tasks incident 2026-08-14: children finished via follow-up
+// turns sat on column "running" / merge "pending" forever, invisibly.)
+
+async function markSucceeded(runId: string): Promise<void> {
+  const { runs } = await import("./db.ts");
+  runs.update(runId, { status: "succeeded", endedAt: Date.now(), exitCode: 0 });
+}
+
+test("awaitingHandBack derives true only for a pending child with a succeeded latest run", async () => {
+  const { tasks } = await import("./db.ts");
+
+  const parentId = await seedTask({ pipelineStage: "building", column: "blocked" });
+  const childId = await seedTask({ parentTaskId: parentId, planSubtaskId: "s1", childMergeStatus: "pending", column: "running" });
+
+  // No run yet → false.
+  expect(tasks.get(childId)!.awaitingHandBack).toBe(false);
+  // Run in flight → false (the turn may still be working).
+  const runId = await seedRun(childId, null);
+  expect(tasks.get(childId)!.awaitingHandBack).toBe(false);
+  // Run succeeded → true. THE stuck state.
+  await markSucceeded(runId);
+  expect(tasks.get(childId)!.awaitingHandBack).toBe(true);
+  // Merged child → false, even with a succeeded run.
+  tasks.update(childId, { childMergeStatus: "merged" });
+  expect(tasks.get(childId)!.awaitingHandBack).toBe(false);
+  // A non-child task never derives true.
+  const plainId = await seedTask({});
+  await markSucceeded(await seedRun(plainId, null));
+  expect(tasks.get(plainId)!.awaitingHandBack).toBe(false);
+});
+
+test("handBackChild guards: non-child, wrong merge status, in-flight run, failed run", async () => {
+  const { handBackChild } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const plainId = await seedTask({});
+  expect(await handBackChild(plainId)).toEqual({ error: "not a build subtask" });
+
+  const parentId = await seedTask({ pipelineStage: "building", column: "blocked" });
+  const mergedId = await seedTask({ parentTaskId: parentId, planSubtaskId: "m", childMergeStatus: "merged" });
+  expect((await handBackChild(mergedId)) as { error: string }).toMatchObject({ error: expect.stringContaining("merged") });
+
+  const inFlightId = await seedTask({ parentTaskId: parentId, planSubtaskId: "f", childMergeStatus: "pending" });
+  await seedRun(inFlightId, null); // status stays "running"
+  expect((await handBackChild(inFlightId)) as { error: string }).toMatchObject({ error: expect.stringContaining("in flight") });
+
+  const failedId = await seedTask({ parentTaskId: parentId, planSubtaskId: "x", childMergeStatus: "pending" });
+  const failedRun = await seedRun(failedId, null);
+  runs.update(failedRun, { status: "failed", endedAt: Date.now(), exitCode: 1 });
+  expect((await handBackChild(failedId)) as { error: string }).toMatchObject({ error: expect.stringContaining("didn't succeed") });
+
+  // None of the guard paths mutated anything.
+  expect(tasks.get(failedId)!.childMergeStatus).toBe("pending");
+});
+
+test("handBackChild parks the work as merge-deferred + review when the parent isn't actively building", async () => {
+  const { handBackChild } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  // Parent blocked (the build aborted earlier) — exactly the 2DOT2DOT shape.
+  const parentId = await seedTask({ pipelineStage: "building", column: "blocked" });
+  const childId = await seedTask({ parentTaskId: parentId, planSubtaskId: "s1", childMergeStatus: "pending", column: "running" });
+  const runId = await seedRun(childId, "continuation");
+  await markSucceeded(runId);
+
+  expect(await handBackChild(childId)).toEqual({ ok: true });
+  await settle();
+
+  const child = tasks.get(childId)!;
+  expect(child.childMergeStatus).toBe("merge-deferred"); // tickBuild's pickup state
+  expect(child.column).toBe("review");
+  expect(child.awaitingHandBack).toBe(false); // the badge clears with the state
+  const status = runs.events(runId).filter((e) => e.stream === "status");
+  expect(status.some((e) => e.data.includes("handed back"))).toBe(true);
+  // Parent untouched: still blocked, no tick resurrection.
+  expect(tasks.get(parentId)!.column).toBe("blocked");
+});
+
+test("handBackChild on an actively-building parent ticks the build (merge semantics apply immediately)", async () => {
+  const { handBackChild } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const parentId = await seedTask({ pipelineStage: "building", column: "building", planApproved: true });
+  const workdir = tasks.get(parentId)!.workdir;
+  writeTasksPlan(workdir, { subtasks: [{ id: "s1", title: "S1", prompt: "p", dependsOn: [], acceptanceCriteria: [] }] });
+  const childId = await seedTask({ parentTaskId: parentId, planSubtaskId: "s1", childMergeStatus: "pending", column: "running", workdir });
+  const runId = await seedRun(childId, "continuation");
+  await markSucceeded(runId);
+
+  expect(await handBackChild(childId)).toEqual({ ok: true });
+  await settle(200);
+
+  // isolation:"none" children have no worktree/branch, so the immediate tick
+  // resolves the merge as merge-failed and aborts the build — proving the
+  // hand-back handed off to the scheduler's REAL merge path (the happy-path
+  // merge with real git is covered by orchestrator-pipeline-merge.test.ts's
+  // deferred-pickup tests, which this state feeds into).
+  expect(tasks.get(childId)!.childMergeStatus).toBe("merge-failed");
+  expect(tasks.get(parentId)!.column).toBe("blocked");
+});

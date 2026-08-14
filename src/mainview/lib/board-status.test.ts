@@ -4,6 +4,7 @@ import {
   AGE_BADGE_MIN_MS,
   attentionSummary,
   formatAge,
+  isWaitingOnHuman,
   partitionRecentDone,
   sortWaitingFirst,
   stageBreakdown,
@@ -102,6 +103,24 @@ test("sortWaitingFirst returns the input reference when already ordered (memo co
   expect(sortWaitingFirst(prefix)).toBe(prefix);
   const empty: Task[] = [];
   expect(sortWaitingFirst(empty)).toBe(empty);
+});
+
+// --- isWaitingOnHuman ----------------------------------------------------------
+
+test("isWaitingOnHuman covers pending interactions AND awaiting hand-back", () => {
+  expect(isWaitingOnHuman(task({}))).toBe(false);
+  expect(isWaitingOnHuman(task({ pendingInteractionCount: 1 }))).toBe(true);
+  expect(isWaitingOnHuman(task({ awaitingHandBack: true }))).toBe(true);
+});
+
+test("attentionSummary counts an awaiting-hand-back child as waiting on you", () => {
+  const s = attentionSummary([task({ column: "running", awaitingHandBack: true })]);
+  expect(s.waiting).toBe(1);
+});
+
+test("sortWaitingFirst floats an awaiting-hand-back card like a pending question", () => {
+  const a = task({}); const b = task({ awaitingHandBack: true });
+  expect(sortWaitingFirst([a, b])).toEqual([b, a]);
 });
 
 // --- formatAge ---------------------------------------------------------------

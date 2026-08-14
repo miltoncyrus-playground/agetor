@@ -978,6 +978,35 @@ export interface Task {
    * exit) merges deferred children FIRST, before deciding anything else.
    */
   childMergeStatus: "pending" | "merged" | "merge-failed" | "merge-deferred" | null;
+  /**
+   * Derived (never persisted, like `pendingInteractionCount`): true for a
+   * build child whose latest run SUCCEEDED but whose work hasn't been handed
+   * back to the pipeline (`childMergeStatus: "pending"`). This is the state
+   * the RC-6 provenance gate deliberately leaves behind when a non-pipeline
+   * conversation turn finishes a child's work — correct, but previously
+   * invisible (the card just said "Running" forever, 2DOT2DOT stuck-tasks
+   * incident 2026-08-14). Drives the card's "awaiting hand-back" state and
+   * RunPanel's hand-back banner. Optional so the many test fixtures that
+   * build full Task literals don't churn; absent means false.
+   */
+  awaitingHandBack?: boolean;
+}
+
+/**
+ * The predicate behind {@link Task.awaitingHandBack} — pure so it's
+ * gate-testable. `currentRunStatus` is the status of the run `task.runId`
+ * points at (null when the task never ran): requiring `"succeeded"` both
+ * proves the work exists AND rules out an in-flight turn (which would be
+ * `"running"`).
+ */
+export function isAwaitingHandBack(
+  t: Pick<Task, "parentTaskId" | "childMergeStatus" | "archivedAt">,
+  currentRunStatus: string | null,
+): boolean {
+  return t.parentTaskId != null
+    && t.childMergeStatus === "pending"
+    && t.archivedAt == null
+    && currentRunStatus === "succeeded";
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can

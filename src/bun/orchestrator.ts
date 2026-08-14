@@ -1527,6 +1527,48 @@ function pipelineStatus(runId: string, taskId: string, data: string): void {
   emit({ runId, taskId, stream: "status", data, ts: Date.now() });
 }
 
+/**
+ * Explicit human hand-back of a build child's finished work to the pipeline
+ * — the deliberate counterpart of the RC-6 provenance gate below. The gate
+ * refuses to INFER "this work is done" from a chat turn ending cleanly; this
+ * route is the human SAYING it, so no inference (and no fresh agent turn) is
+ * needed. Deterministic from here: park the child as `merge-deferred` (the
+ * exact state `tickBuild` already merges first) and, if the parent is
+ * actively building, tick it — the merge, barrier check, and stage advance
+ * all reuse the scheduler's existing, tested paths.
+ *
+ * Guards mirror the derived `awaitingHandBack` flag that renders the button:
+ * only a build child, only `childMergeStatus: "pending"`, and only off a
+ * SUCCEEDED latest run (which also rules out an in-flight turn — a live run
+ * is `"running"`). A failed/cancelled run keeps Run-to-restart as the path.
+ */
+export async function handBackChild(taskId: string): Promise<{ ok: true } | { error: string }> {
+  const task = tasks.get(taskId);
+  if (!task || !task.parentTaskId) return { error: "not a build subtask" };
+  if (task.archivedAt != null) return { error: "task is archived" };
+  if (task.childMergeStatus !== "pending") {
+    return { error: `nothing to hand back — merge status is "${task.childMergeStatus}"` };
+  }
+  const run = task.runId ? runs.get(task.runId) : null;
+  if (!run || run.status !== "succeeded") {
+    return {
+      error: run?.status === "running"
+        ? "a turn is still in flight — wait for it to finish first"
+        : "the latest run didn't succeed — press Run to restart the build turn instead",
+    };
+  }
+  tasks.update(taskId, { childMergeStatus: "merge-deferred" });
+  updateColumn(taskId, run.id, "review");
+  pipelineStatus(run.id, taskId, "handed back to the pipeline — merge queued");
+  const parent = tasks.get(task.parentTaskId);
+  if (parent && parent.pipelineStage === "building" && parent.column === "building") {
+    void tickBuild(parent.id).catch((err) => {
+      console.error(`[agetor] hand-back: tickBuild failed for parent ${parent.id}:`, err);
+    });
+  }
+  return { ok: true };
+}
+
 // Exported for unit tests (orchestrator-pipeline-guards.test.ts) — production
 // callers are attachDoneHandler + maybeReleaseHeldTask only.
 export function settleChildRun(taskId: string, runId: string, outcome: PipelineOutcome): void {
@@ -1537,7 +1579,7 @@ export function settleChildRun(taskId: string, runId: string, outcome: PipelineO
     if (outcome.kind === "success") {
       pipelineStatus(
         runId, taskId,
-        "conversation turn ended — child build state unchanged (only the child's own build run hands work back to the pipeline; press Run to restart it)",
+        "conversation turn ended — child build state unchanged (only the child's own build run hands work back to the pipeline; use \"Hand back & merge\" when the work is done, or press Run to restart the build turn)",
       );
     }
     return;

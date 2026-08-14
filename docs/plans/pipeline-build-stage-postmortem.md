@@ -148,3 +148,43 @@ A re-run of the same SDD on `~/2DOT2DOT` after F-1..F-6 must produce: all 7 subt
 1. **`merge-deferred` vs. auto-resume:** when a deferred child's merge lands via F-3, should a parent sitting in `blocked` auto-resume the build, or wait for a human click? Leaning human-click (blocked means a human should look), but auto-resume is defensible when the block reason was itself the missing work.
 2. **Child retry budget:** F-1.4 proposes exactly one automatic boot-flake retry. Enough? A per-child cap of 2 with exponential spacing costs little; more risks masking a real environment break across the whole fleet of children.
 3. **Should `building` fixup turns be allowed to commit?** `buildingPrompt` currently forbids committing ("a later stage handles that") but no later stage commits fixup work either — a fixup turn's changes reach code-review as a dirty tree. Works, but the no-diff detection in F-5 must hash the dirty tree, not just HEAD, precisely because of this. Pinning down who commits fixup work would simplify F-5.
+
+## 8. F-7 — Make the RC-6 gate's leftover state visible and actionable (added 2026-08-14)
+
+The second 2DOT2DOT incident: after the F-fixes shipped, a build aborted on an
+api-error (F-2's cascade worked), the children's work was then finished via
+follow-up conversation turns and auto-continuations — and the RC-6 provenance
+gate correctly refused to merge on those settles. Correct, but invisible: four
+children sat on `column: "running"` / `childMergeStatus: "pending"` with a
+green dot, the parent waited in `building` forever, and the only trace was one
+status line inside each child's stream. The user's read was "everything is
+done, why is it stuck". The gate needs a visible state and an explicit exit.
+
+As-built (same day):
+
+- **Derived `Task.awaitingHandBack`** (`isAwaitingHandBack` in
+  `shared/types.ts`, computed in `db.ts`'s `toTask` off a
+  `current_run_status` correlated subquery): a build child, merge `pending`,
+  not archived, whose CURRENT run `succeeded`. Never persisted.
+- **Card + board honesty**: the card's state reads "awaiting hand-back" (not
+  the column label) and joins the amber waiting-ring; the attention strip's
+  "waiting on you" count and the waiting-first column sort share one
+  `isWaitingOnHuman` predicate (`board-status.ts`).
+- **Explicit hand-back** (`orchestrator.ts`'s `handBackChild`, route
+  `POST /tasks/:id/hand-back`, RunPanel's `HandBackBanner`): the human's
+  click supplies the "this work is done" judgment RC-6 refuses to infer from
+  a turn ending cleanly. Deterministic from there — park as `merge-deferred`
+  (F-3's pickup state) and `tickBuild` the parent if it's actively building;
+  merge, barrier, advance, and conflict-abort all reuse the scheduler's
+  existing paths. No fresh agent turn needed ("Re-run build turn" stays as
+  the agent-verifies-first alternative).
+- **Guards mirror the flag**: only a pending child off a succeeded run;
+  in-flight and failed runs are rejected with pointed reasons (409 at the
+  route — the state can go stale between poll and click).
+
+Gate tests: 4 in `orchestrator-pipeline-guards.test.ts` (flag derivation,
+guards, blocked-parent parking, building-parent tick handoff incl. the
+merge-failed abort path), 3 in `board-status.test.ts` (predicate, strip,
+sort). Measurable outcome: the stuck state now renders as an amber
+"awaiting hand-back" card with a one-click recovery instead of a permanent
+green "Running".

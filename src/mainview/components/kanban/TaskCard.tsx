@@ -53,7 +53,10 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
 
   const pendingCount = task.pendingInteractionCount;
   const blocked = task.column === "blocked";
-  const awaiting = pendingCount > 0 || blocked;
+  // awaitingHandBack joins the amber-ring club: a build child whose work is
+  // done but not handed back is waiting on the human exactly like a pending
+  // question is (2DOT2DOT incident: these cards read as green "Running").
+  const awaiting = pendingCount > 0 || blocked || task.awaitingHandBack === true;
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
 
@@ -64,7 +67,12 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
   // running-subagents) into one line — those secondary counts are still
   // visible in RunPanel (terminal count) or were never load-bearing enough
   // to justify face space (running-subagents has its own tabs in RunPanel).
-  const stageLabel = task.pipelineStage
+  const stageLabel = task.awaitingHandBack
+    // Override the column label outright — the column is usually "running"
+    // here, which is exactly the lie this state existed as. The hand-back
+    // action itself lives in RunPanel's banner (cards carry no buttons).
+    ? "awaiting hand-back"
+    : task.pipelineStage
     ? (COLUMNS.find((c) => c.id === task.pipelineStage)?.label ?? task.pipelineStage)
     : (COLUMNS.find((c) => c.id === task.column)?.label ?? task.column);
   const stateSuffix = [
