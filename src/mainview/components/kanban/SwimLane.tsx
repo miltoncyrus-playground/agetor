@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, FolderGit2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { readCollapsed, writeCollapsed } from "@/lib/panel-collapse";
+import { stageBreakdown } from "@/lib/board-status";
 import { displayColumnMeta, type DisplayColumnId } from "@/lib/display-columns";
 import type { Task } from "../../../shared/types.ts";
 import { Column } from "./Column";
@@ -81,6 +82,19 @@ export function SwimLane({
               </span>
             );
           })}
+          {/* The In Progress chip above merges 6 pipeline stages + plain
+              running into one number — spell out which stages it's hiding
+              ("2 building · 1 testing") so pipeline position reads from the
+              lane header without expanding the lane. */}
+          {(() => {
+            const stages = stageBreakdown(tasksByColumn.get("in-progress") ?? []);
+            if (stages.length === 0) return null;
+            return (
+              <span className="truncate text-[10px] text-muted-foreground/70">
+                ({stages.map((s) => `${s.count} ${s.label.toLowerCase()}`).join(" · ")})
+              </span>
+            );
+          })()}
         </div>
       </button>
       {!collapsed && (

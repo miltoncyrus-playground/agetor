@@ -6,6 +6,8 @@ import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { COLUMNS, PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { displayColumnMeta, toDisplayColumn } from "@/lib/display-columns";
+import { AGE_BADGE_MIN_MS, formatAge } from "@/lib/board-status";
+import { useMinuteNow } from "@/lib/minute-tick";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
@@ -70,6 +72,14 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
     childProgress ? `${childProgress.merged}/${childProgress.total} sub-tasks` : null,
   ].filter(Boolean).join(" · ");
   const isActivelyMidStage = task.pipelineStage != null && PIPELINE_STAGE_COLUMNS.includes(task.column);
+  // Time-in-column rot signal, only where dwell time means "a human hasn't
+  // acted": review and blocked. Hidden for the first hour (sub-hour dwell is
+  // normal flow) and on archived cards. `updatedAt` is bumped by the column
+  // transition, so "since last update" is "since it landed here" unless the
+  // user actively touched the task — in which case resetting is the point.
+  const now = useMinuteNow();
+  const ageMs = now - task.updatedAt;
+  const showAge = !archived && (task.column === "review" || task.column === "blocked") && ageMs >= AGE_BADGE_MIN_MS;
   // Static state-color dot, shown for every card so a task's place in the
   // (now-merged) display-column taxonomy reads without opening it. Skipped
   // only when the pulsing dot below already covers the exact same signal
@@ -121,6 +131,14 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
           {stageLabel}
           {stateSuffix && ` · ${stateSuffix}`}
         </span>
+        {showAge && (
+          <span
+            className="ml-auto shrink-0 rounded bg-muted px-1 text-[9px] tabular-nums"
+            title={`In ${stageLabel.toLowerCase()} for ${formatAge(ageMs)}`}
+          >
+            {formatAge(ageMs)}
+          </span>
+        )}
       </div>
     </Card>
   );

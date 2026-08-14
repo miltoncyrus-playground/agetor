@@ -68,29 +68,14 @@ const has = (...ids: DisplayColumnId[]) => {
   return (id: DisplayColumnId) => s.has(id);
 };
 
-test("the four working columns are exactly the always-visible set", () => {
+test("every display column is in the always-visible set — nothing auto-hides anymore", () => {
   expect([...ALWAYS_VISIBLE_DISPLAY_COLUMNS].sort()).toEqual(
-    ["backlog", "blocked", "in-progress", "ready"],
+    ["backlog", "blocked", "done", "in-progress", "ready", "review"],
   );
 });
 
-test("an empty lane still renders the four working columns, in board order", () => {
+test("an empty lane still renders all six columns, in board order", () => {
   expect(filterLaneColumns(DISPLAY_COLUMNS, NONE).map((c) => c.id)).toEqual([
-    "backlog", "ready", "in-progress", "blocked",
-  ]);
-});
-
-test("review and done stay auto-hidden when empty", () => {
-  const ids = filterLaneColumns(DISPLAY_COLUMNS, NONE).map((c) => c.id);
-  expect(ids).not.toContain("review");
-  expect(ids).not.toContain("done");
-});
-
-test("review and done render once the lane has a task in them", () => {
-  expect(filterLaneColumns(DISPLAY_COLUMNS, has("done")).map((c) => c.id)).toEqual([
-    "backlog", "ready", "in-progress", "blocked", "done",
-  ]);
-  expect(filterLaneColumns(DISPLAY_COLUMNS, has("review", "done")).map((c) => c.id)).toEqual([
     "backlog", "ready", "in-progress", "blocked", "review", "done",
   ]);
 });
@@ -100,10 +85,10 @@ test("the user's status filter wins over always-visible (pre-filtered input is r
   // the helper never re-adds a column that isn't in its input.
   const withoutBacklog = DISPLAY_COLUMNS.filter((c) => c.id !== "backlog");
   const ids = filterLaneColumns(withoutBacklog, has("backlog", "done")).map((c) => c.id);
-  expect(ids).toEqual(["ready", "in-progress", "blocked", "done"]);
+  expect(ids).toEqual(["ready", "in-progress", "blocked", "review", "done"]);
 });
 
-test("a populated working column is kept (not duplicated) by both rules", () => {
+test("a populated column is kept exactly once (not duplicated) by both rules", () => {
   const ids = filterLaneColumns(DISPLAY_COLUMNS, has("ready")).map((c) => c.id);
-  expect(ids).toEqual(["backlog", "ready", "in-progress", "blocked"]);
+  expect(ids).toEqual(["backlog", "ready", "in-progress", "blocked", "review", "done"]);
 });

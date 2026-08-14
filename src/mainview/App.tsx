@@ -5,7 +5,9 @@ import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { isActiveColumn, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { DISPLAY_COLUMNS, filterLaneColumns, toDisplayColumn, type DisplayColumnId } from "./lib/display-columns.ts";
+import { sortWaitingFirst } from "./lib/board-status.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { AttentionStrip } from "@/components/kanban/AttentionStrip";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { KanbanFilters, basename } from "@/components/kanban/KanbanFilters";
@@ -579,6 +581,13 @@ export default function App() {
         const arr = tasksByDisplayColumn.get(dc);
         if (arr) arr.push(t); else tasksByDisplayColumn.set(dc, [t]);
       }
+      // Cards waiting on a human float to the top of their column. Stable
+      // (relative order preserved within both groups) and identity-preserving
+      // (returns the same array when nothing is waiting), so Column's
+      // element-wise memo comparator keeps bailing out across polls.
+      for (const [dc, arr] of tasksByDisplayColumn) {
+        tasksByDisplayColumn.set(dc, sortWaitingFirst(arr));
+      }
       const project = projects.find((p) => p.path === workdir);
       const laneVisibleColumns = filterLaneColumns(
         visibleDisplayColumns,
@@ -600,6 +609,13 @@ export default function App() {
     () => Array.from(new Set(tasks.map((t) => t.agent))),
     [tasks],
   );
+
+  // Attention-strip chip click: focus the board on that one status; clicking
+  // the already-focused chip clears the filter. Drives the same statusFilter
+  // state as KanbanFilters, so the two surfaces can't disagree.
+  const toggleStatusChip = useCallback((id: DisplayColumnId) => {
+    setStatusFilter((cur) => (cur.length === 1 && cur[0] === id ? [] : [id]));
+  }, []);
 
   // Every handler below is wrapped in `useCallback` so it keeps a stable
   // identity across App re-renders (poll ticks, unrelated state changes,
@@ -927,6 +943,11 @@ export default function App() {
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />
+          <AttentionStrip
+            tasks={visibleTasks}
+            statusFilter={statusFilter}
+            onToggleStatus={toggleStatusChip}
+          />
           {/* One swimlane per project, each independently horizontally
               scrolling; the lane list itself scrolls vertically for the
               remaining space — the bottom bar stays anchored regardless of

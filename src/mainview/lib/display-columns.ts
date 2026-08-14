@@ -27,21 +27,22 @@ export const DISPLAY_COLUMNS: { id: DisplayColumnId; label: string; dotClass: st
 ];
 
 /**
- * The four working columns every lane renders even when empty. `review` and
- * `done` are outcome buckets and keep the original auto-hide; these four are
- * the ones whose absence disorients ("where did Ready go?") and whose empty
- * state is a useful drop target (you couldn't drag a card into a column that
- * wasn't rendered).
+ * All six display columns render on every lane, empty or not — an empty
+ * column shrinks to a slim stub (Column.tsx) instead of disappearing, so
+ * the board geometry is stable and every column is always a drop target.
+ * Kept as a set (rather than deleting the auto-hide seam entirely) so a
+ * future column can opt back into auto-hide by omission.
  */
 export const ALWAYS_VISIBLE_DISPLAY_COLUMNS: ReadonlySet<DisplayColumnId> =
-  new Set(["backlog", "ready", "in-progress", "blocked"]);
+  new Set(["backlog", "ready", "in-progress", "blocked", "review", "done"]);
 
 /**
- * Per-lane column visibility: keep a column when it's one of the four
- * always-visible working columns OR it has at least one task in this lane.
+ * Per-lane column visibility: keep a column when it's always-visible OR it
+ * has at least one task in this lane. With every column currently in the
+ * always-visible set this passes its input through — the seam stays because
  * `visible` must already have the user's explicit status filter applied
- * (App.tsx's `visibleDisplayColumns`) — that's what makes the filter win
- * over always-visible: a status the user filtered out never reaches here.
+ * (App.tsx's `visibleDisplayColumns`), which is what makes the filter win:
+ * a status the user filtered out never reaches here.
  */
 export function filterLaneColumns<T extends { id: DisplayColumnId }>(
   visible: T[],

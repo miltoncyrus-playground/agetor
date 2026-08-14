@@ -1,9 +1,11 @@
-import { memo } from "react";
+import { memo, useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import type { Task } from "../../../shared/types.ts";
 import type { DisplayColumnId } from "@/lib/display-columns";
+import { partitionRecentDone } from "@/lib/board-status";
+import { useMinuteNow } from "@/lib/minute-tick";
 import { TaskCard } from "./TaskCard";
 
 interface Props {
@@ -51,6 +53,38 @@ function sameTasks(a: Task[], b: Task[]): boolean {
 
 function ColumnImpl({ id, droppableId, label, droppable = true, tasks, tasksById, childCountsByParent, onOpen }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id: droppableId, disabled: !droppable });
+  const now = useMinuteNow();
+  // Done is the one column that grows forever — show only recent finishes,
+  // collapse the rest behind a "+N older" toggle. Other columns pass through.
+  const { recent, olderCount } = id === "done"
+    ? partitionRecentDone(tasks, now)
+    : { recent: tasks, olderCount: 0 };
+  const [showAllDone, setShowAllDone] = useState(false);
+  const shown = showAllDone ? tasks : recent;
+
+  // Empty column → slim stub. It keeps its droppable registration (drops
+  // land normally; isOver highlights it) but shrinks to a vertical strip so
+  // an idle lane doesn't spend 224px per empty column. Deliberately NOT
+  // expanded on drag-hover: growing a column mid-drag shifts every sibling
+  // droppable's cached rect and misaligns the rest of the drag. The stub
+  // expands the natural way — by gaining a card.
+  if (tasks.length === 0) {
+    return (
+      <div
+        ref={setNodeRef}
+        className={cn(
+          "flex w-9 shrink-0 flex-col items-center gap-2 rounded-lg border border-border/40 bg-muted/20 px-1.5 py-2",
+          isOver && "border-primary/60 bg-muted/60",
+        )}
+      >
+        <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground [writing-mode:vertical-rl]">
+          {label}
+        </h2>
+        <Badge variant="outline" className="h-4 px-1 text-[10px] opacity-60">0</Badge>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={setNodeRef}
@@ -63,13 +97,13 @@ function ColumnImpl({ id, droppableId, label, droppable = true, tasks, tasksById
         <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
           {label}
         </h2>
+        {/* Total count, not the windowed count — the badge answers "how many
+            are done", the window only limits what's painted. */}
         <Badge variant="outline" className="h-4 px-1.5 text-[10px]">{tasks.length}</Badge>
       </div>
-      {/* min-h keeps an empty always-visible column a comfortable drop
-          target — without it the card list collapses to zero height and the
-          droppable area is just the header strip. */}
+      {/* min-h keeps a nearly-empty column a comfortable drop target. */}
       <div className="flex min-h-10 flex-col gap-1">
-        {tasks.map((t) => (
+        {shown.map((t) => (
           <TaskCard
             key={t.id}
             task={t}
@@ -78,6 +112,15 @@ function ColumnImpl({ id, droppableId, label, droppable = true, tasks, tasksById
             onOpen={onOpen}
           />
         ))}
+        {olderCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowAllDone((v) => !v)}
+            className="rounded-md px-2 py-1 text-left text-[10px] text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+          >
+            {showAllDone ? "Show recent only" : `+${olderCount} older`}
+          </button>
+        )}
       </div>
     </div>
   );
