@@ -278,7 +278,10 @@ export function accountUsageSummary(configDir: string): AccountUsageSummary {
     configDir,
     today: totalsSince(configDir, utcDay(0)),
     last7d: totalsSince(configDir, utcDay(6)),
+    // Live quota is a separate, opt-in, networked concern — the caller
+    // (agent-status) overlays it via quota.ts when the harness opted in.
     quota: null,
+    quotaReason: null,
   };
 }
 

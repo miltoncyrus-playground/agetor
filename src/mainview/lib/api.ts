@@ -382,6 +382,12 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ enabled }),
     }),
+  /** Live-quota opt-in (claude-code only; toggleable on built-ins too). */
+  setHarnessQuotaEnabled: (id: string, quotaEnabled: boolean) =>
+    j<Harness>(`/harnesses/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ quotaEnabled }),
+    }),
   getHarnessUsage: (id: string) =>
     j<HarnessUsage>(`/harnesses/${encodeURIComponent(id)}/usage`),
   /** Existing logged-in Claude config dirs no harness points at yet —

@@ -6,7 +6,7 @@
 | Source | User request: switch between two Claude accounts (`~/.claude` and `~/.claude-adevinta`) inside agetor; per-account usage/quota display; stop auto-hiding the Backlog / Ready / In Progress / Blocked columns. Design only — this document is the deliverable |
 | Scope decision | Three workstreams: W1 account discovery + identity (claude-code only), W2 per-account usage/quota, W3 board column visibility. Codex/gemini account identity is explicitly out of scope (same pattern, separate plan) |
 | Key finding | Multi-account support already exists end-to-end via harness aliases (`home` → `CLAUDE_CONFIG_DIR`). W1/W2 close the discoverability and observability gaps; nothing in the spawn/tail path changes |
-| Status | **Phase 1 implemented** (W1, W2 plane A, W3) — see §10. Phase 2 (plane B live quota) remains gated on the §4.2 credentials decision. |
+| Status | **Phases 1 and 2 implemented** (W1, W2 planes A+B, W3 + §11 follow-up). Milton approved the §4.2 credentials decision on 2026-08-14; plane B as-built in §12. |
 
 ## 1. Objective & success criteria
 
@@ -172,3 +172,17 @@ User decision after Phase 1 shipped: un-hide Review and Done too, using "Option 
 - **Waiting-first ordering** (`sortWaitingFirst`): amber-ringed cards float to the top of their column. Stable, and returns the input array reference when already ordered so the element-wise memo bailouts survive.
 
 All helpers are pure and clock-injected, in `src/mainview/lib/board-status.ts` with gate tests (`board-status.test.ts`, 10 tests); `display-columns.test.ts` updated for the all-six set. No server or schema changes in this round.
+
+## 12. Plane B as-built (live quota, opt-in)
+
+Milton approved the §4.2 gate. The mandated spike ran first, against both real accounts:
+
+- **Endpoint confirmed**: `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer <accessToken>` + `anthropic-beta: oauth-2025-04-20` → 200 with `five_hour.utilization` / `seven_day.utilization` (0–100) and ISO `resets_at`. Credentials shape confirmed: `<configDir>/.credentials.json` → `claudeAiOauth.{accessToken, expiresAt}` (epoch ms).
+- **Real-world edge captured**: an enterprise/team-plan account answers 200 with `five_hour: null, seven_day: null, limits: []` — no rate-limit windows exist for it. Mapped to an honest reason ("this account reports no usage limits"), not shape drift.
+
+Implementation:
+
+- **Opt-in flag**: migration `041_harness_quota.sql` adds `harnesses.quota_enabled` (default 0) → `Harness.quotaEnabled`. Toggleable on built-ins (second carve-out after `enabled`, and claude-code-only at the PATCH route). UI toggle lives in the expanded usage panel (`QuotaToggleRow`) with the full consent copy; agetor never reads credentials without this flag.
+- **Client** (`src/bun/quota.ts`): token read at request time, held in a local, sent only to api.anthropic.com, never persisted/logged/cached, never in a reason string (gate-tested). Strict schema validation (`parseQuotaResponse`); 5s timeout; TTL cache 60s ok / 30s error so the 15s `/harnesses` poll can't hammer the endpoint; degrade paths: missing creds, expired token ("run /login"), 401/403 ("re-login needed"), 5xx, drift, network — all `{ quota: null, reason }`, never a throw into the route. Expired tokens are the user's cue to run claude; agetor deliberately never writes/refreshes credentials.
+- **Wiring**: `checkHarness` overlays `usage.quota`/`usage.quotaReason` only when `quotaEnabled`; `AccountUsageSummary` gained `quotaReason`. UI: "5h N% · wk N%" on the Settings row (amber ≥80%), reason in amber when degraded; New Task picker shows the worst window inline when ≥80% and full numbers + reason in the tooltip.
+- **Verified end-to-end** on both real accounts: default account returned `fiveHourPct: 100, weeklyPct: 49` (live), enterprise account returned the no-limits reason. Gate tests: `quota.test.ts` (10 — recorded real fixtures, degrade paths, cache TTLs, token-leak assertions, built-in toggle roundtrip).

@@ -190,6 +190,13 @@ export interface Harness {
    *  in-flight runs are unaffected. Built-ins are toggleable too — this
    *  is the one carve-out from the built-in immutability rule. */
   enabled: boolean;
+  /** Live-quota opt-in (claude-code only; meaningless for other kinds).
+   *  When true, agetor reads the account's `.credentials.json` access token
+   *  at request time and queries Anthropic's (unofficial) OAuth usage
+   *  endpoint to show 5-hour/weekly limit utilization. Off by default —
+   *  nothing leaves the machine until the user flips it. Toggleable on
+   *  built-ins too, same carve-out as `enabled`. */
+  quotaEnabled: boolean;
 }
 
 export interface HarnessUsage {
@@ -251,7 +258,13 @@ export interface AccountUsageSummary {
   configDir: string;
   today: TokenTotals;
   last7d: TokenTotals;
+  /** Live limit utilization from Anthropic's OAuth usage endpoint. Null
+   *  when the harness hasn't opted in (`Harness.quotaEnabled`) or the fetch
+   *  degraded — `quotaReason` says which. */
   quota: { fiveHourPct: number; weeklyPct: number; resetsAt: string | null } | null;
+  /** Why `quota` is null despite the opt-in ("re-login needed", "quota
+   *  unavailable"…). Null when quota is present or the opt-in is off. */
+  quotaReason: string | null;
 }
 
 export interface HarnessStatus {

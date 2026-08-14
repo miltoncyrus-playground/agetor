@@ -273,6 +273,20 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
       return rest;
     });
 
+  const onToggleQuota = async (h: Harness, next: boolean) => {
+    try {
+      await api.setHarnessQuotaEnabled(h.id, next);
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      toast.error(`Couldn't ${next ? "enable" : "disable"} live quota for "${h.label}"`, {
+        description: message,
+        duration: Infinity,
+      });
+    }
+  };
+
   const onToggleEnabled = async (h: Harness) => {
     const next = !h.enabled;
     // Flip the optimistic value first so the Switch animates immediately.
@@ -390,6 +404,7 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
           }
           onDelete={onDeleteHarness}
           onToggleEnabled={onToggleEnabled}
+          onToggleQuota={onToggleQuota}
           onOpenTerminal={onOpenTerminal}
           pendingToggle={pendingToggle}
         />
@@ -460,6 +475,7 @@ function ListView({
   onEdit,
   onDelete,
   onToggleEnabled,
+  onToggleQuota,
   onOpenTerminal,
   pendingToggle,
 }: {
@@ -479,6 +495,8 @@ function ListView({
   onEdit: (h: Harness) => void;
   onDelete: (h: Harness) => void;
   onToggleEnabled: (h: Harness) => void;
+  /** Live-quota opt-in toggle (claude-code rows only). */
+  onToggleQuota: (h: Harness, next: boolean) => void;
   /** Open a new Terminal.app window with this harness's env loaded so the
    *  user can authenticate or inspect it (e.g. `claude /login`). */
   onOpenTerminal: (h: Harness) => void;
@@ -595,6 +613,17 @@ function ListView({
                       today {formatTokens(status.usage.today.inputTokens + status.usage.today.outputTokens)} tok
                       {" "}· 7d {formatTokens(status.usage.last7d.inputTokens + status.usage.last7d.outputTokens)} tok
                       {" "}({formatTokens(status.usage.last7d.outputTokens)} out)
+                      {status.usage.quota && (
+                        <>
+                          {" "}·{" "}
+                          <span className={cn(Math.max(status.usage.quota.fiveHourPct, status.usage.quota.weeklyPct) >= 80 && "font-medium text-amber-500")}>
+                            5h {Math.round(status.usage.quota.fiveHourPct)}% · wk {Math.round(status.usage.quota.weeklyPct)}%
+                          </span>
+                        </>
+                      )}
+                      {h.quotaEnabled && !status.usage.quota && status.usage.quotaReason && (
+                        <> · <span className="text-amber-500">{status.usage.quotaReason}</span></>
+                      )}
                     </div>
                   )}
                 </div>
@@ -639,12 +668,43 @@ function ListView({
                   </>
                 )}
               </div>
-              {usageOpenFor === h.id && <AccountUsageTable harnessId={h.id} />}
+              {usageOpenFor === h.id && (
+                <div className="space-y-1.5">
+                  <QuotaToggleRow harness={h} onToggle={onToggleQuota} />
+                  <AccountUsageTable harnessId={h.id} />
+                </div>
+              )}
               </div>
             );
           })}
         </div>
       </section>
+    </div>
+  );
+}
+
+/**
+ * The live-quota opt-in, rendered inside the expanded usage panel so the
+ * consent copy has room. The copy states exactly what flipping it on does —
+ * reading the account's credentials file and calling an Anthropic endpoint
+ * is a line agetor never crosses silently.
+ */
+function QuotaToggleRow({ harness, onToggle }: { harness: Harness; onToggle: (h: Harness, next: boolean) => void }) {
+  return (
+    <div className="flex items-start gap-3 rounded-md border border-border/40 bg-muted/20 px-3 py-2">
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-medium">Live quota (5-hour / weekly limits)</div>
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          When on, agetor reads this account's <code className="font-mono">.credentials.json</code> access
+          token at request time and queries Anthropic's usage endpoint to show limit utilization. The token
+          is never stored or logged and is sent only to api.anthropic.com. When off, nothing leaves this machine.
+        </p>
+      </div>
+      <Switch
+        checked={harness.quotaEnabled}
+        onCheckedChange={() => onToggle(harness, !harness.quotaEnabled)}
+        aria-label={`${harness.quotaEnabled ? "Disable" : "Enable"} live quota for ${harness.label}`}
+      />
     </div>
   );
 }

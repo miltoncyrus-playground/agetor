@@ -317,7 +317,7 @@ test("gitWritableRootsSync returns [] for a non-git directory", async () => {
 // exist) locks the cwd→sandbox contract without standing up tmux.
 const codexHarness = {
   id: "codex", kind: "codex" as const, label: "codex",
-  isBuiltin: true, home: null, bin: null, env: {}, enabled: true,
+  isBuiltin: true, home: null, bin: null, env: {}, enabled: true, quotaEnabled: false,
 };
 const codexOpts = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
 

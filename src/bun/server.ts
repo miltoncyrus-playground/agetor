@@ -2866,6 +2866,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.enabled === "boolean") {
             harnesses.setEnabled(req.params.id, body.enabled);
           }
+          // `quotaEnabled` is the second carve-out (same rationale as
+          // `enabled`): the live-quota opt-in must be togglable on the
+          // built-in claude-code harness — the default account is exactly
+          // the one most users want to watch. claude-code only; the flag is
+          // meaningless for other kinds and accepting it would imply support.
+          if (typeof body.quotaEnabled === "boolean") {
+            if (current.kind !== "claude-code") {
+              return json(
+                { error: "quotaEnabled is only supported on claude-code harnesses" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            harnesses.setQuotaEnabled(req.params.id, body.quotaEnabled);
+          }
           if (!hasConfigPatch) {
             return json(harnesses.get(req.params.id), { headers: corsHeaders(req) });
           }

@@ -806,8 +806,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                         title={
                           [
                             status?.account?.email,
+                            status?.usage?.quota &&
+                              `5h ${Math.round(status.usage.quota.fiveHourPct)}% · wk ${Math.round(status.usage.quota.weeklyPct)}%`,
                             status?.usage &&
                               `today ${formatTokens(status.usage.today.inputTokens + status.usage.today.outputTokens)} tok`,
+                            status?.usage?.quotaReason,
                             status?.reason,
                             status?.path,
                             status?.version,
@@ -819,6 +822,15 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                       >
                         <AgentIcon kind={h.kind} className="mr-1" />
                         <span className="truncate">{h.label}</span>
+                        {/* Low-headroom warning at the decision point: the
+                            worst of the two quota windows, shown only when
+                            it matters (≥80%). Full numbers in the tooltip. */}
+                        {status?.usage?.quota &&
+                          Math.max(status.usage.quota.fiveHourPct, status.usage.quota.weeklyPct) >= 80 && (
+                            <span className="ml-1 shrink-0 text-[9px] font-medium text-amber-500 tabular-nums">
+                              {Math.round(Math.max(status.usage.quota.fiveHourPct, status.usage.quota.weeklyPct))}%
+                            </span>
+                          )}
                         <span
                           className={cn(
                             "ml-auto inline-block size-1.5 rounded-full",

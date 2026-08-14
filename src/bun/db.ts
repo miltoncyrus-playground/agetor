@@ -519,6 +519,7 @@ type HarnessRow = {
   bin: string | null;
   env_json: string;
   enabled: number;
+  quota_enabled: number;
   created_at: number;
   updated_at: number;
 };
@@ -542,6 +543,7 @@ const toHarness = (r: HarnessRow): Harness => {
     bin: r.bin,
     env,
     enabled: r.enabled === 1,
+    quotaEnabled: r.quota_enabled === 1,
   };
 };
 
@@ -614,6 +616,7 @@ export const harnesses = {
         bin: null,
         env: {},
         enabled: true,
+        quotaEnabled: false,
       } satisfies Harness;
     }
     return null;
@@ -695,6 +698,19 @@ export const harnesses = {
     db.run(
       `UPDATE harnesses SET enabled = ?, updated_at = ? WHERE id = ?`,
       [enabled ? 1 : 0, Date.now(), id],
+    );
+    return this.get(id) as Harness;
+  },
+  /**
+   * Live-quota opt-in toggle. Same built-in carve-out as `setEnabled` — the
+   * default account is exactly the one most users want quota for.
+   */
+  setQuotaEnabled(id: string, quotaEnabled: boolean): Harness {
+    const current = this.get(id);
+    if (!current) throw new Error(`harness not found: ${id}`);
+    db.run(
+      `UPDATE harnesses SET quota_enabled = ?, updated_at = ? WHERE id = ?`,
+      [quotaEnabled ? 1 : 0, Date.now(), id],
     );
     return this.get(id) as Harness;
   },
