@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
+import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import {
@@ -14,6 +15,8 @@ import {
   IDLE_SESSION_REAP_MS,
   MODEL_EFFORT_SUPPORT,
   SESSION_DIED_STATUS_PREFIX,
+  TURN_STALLED_STATUS_PREFIX,
+  TURN_STALL_RESUMED_STATUS_PREFIX,
   TASK_TYPES,
   branchPattern,
   renderBranchTemplate,
@@ -1140,6 +1143,19 @@ function makeChunkHandler(
         }
       }
     }
+    // Turn-stall watchdog path (claude-code only today — codex/gemini turns
+    // are headless one-shots with no TUI to wedge on): the driver flags an
+    // in-flight turn whose transcript has gone silent past the stall
+    // threshold. Soft signal only — the session is alive, so no column flip,
+    // no handle flag, no settle; just mark/unmark the task so the API can
+    // decorate `stalledSince` and the board can show "may be stuck".
+    if (stream === "status" && data.startsWith(TURN_STALLED_STATUS_PREFIX)) {
+      const task = tasks.get(taskId);
+      if (task && task.runId === runId) markStalled(taskId, Date.now());
+    }
+    if (stream === "status" && data.startsWith(TURN_STALL_RESUMED_STATUS_PREFIX)) {
+      clearStalled(taskId);
+    }
     // Unknown-slash-command path (claude-code only): claude's TUI rejected
     // the pasted message as an unknown slash command — no JSONL line was
     // ever written for it, so claude-tmux's pane scraper is the only source
@@ -1199,6 +1215,10 @@ function attachDoneHandler(
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
+      // A settled turn is no longer stalled, whatever the outcome — the
+      // driver's own "clear-silent" tick unlatches its side without an
+      // event, so this is the only clear for the turn-ends-while-marked case.
+      clearStalled(taskId);
 
       // API error / session-death / unknown-command override the exit-code
       // mapping: the driver resolves the turn with code 0 (a clean end_turn
@@ -1314,6 +1334,10 @@ function attachDoneHandler(
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
+      // A settled turn is no longer stalled, whatever the outcome — the
+      // driver's own "clear-silent" tick unlatches its side without an
+      // event, so this is the only clear for the turn-ends-while-marked case.
+      clearStalled(taskId);
       const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
       const task = tasks.get(taskId);

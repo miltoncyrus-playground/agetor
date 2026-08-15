@@ -35,6 +35,7 @@ import {
   supportedModes,
   type AgentKind,
   type AgentStatus,
+  GATE_BEARING_STAGES,
   type BlockReason,
   type Harness,
   type BacklogMessage,
@@ -2571,6 +2572,28 @@ function RunPanelBody({
         <HandBackBanner task={task} onRerun={() => onStart(task)} />
       )}
 
+      {/* Parent-side twin of the hand-back banner: a pipeline task parked on
+          its gate column because a conversation turn (not a stage run) ended
+          there. Before this banner the state was invisible — the "use Retry
+          stage or the gate override" breadcrumb pointed at BlockedBanner
+          buttons that only render for a blocked task. */}
+      {!archived && task.gateParked && (
+        <GateParkedBanner
+          task={task}
+          onRetryStage={() => onStart(task)}
+          onOverrideGate={() => void api.overridePipelineGate(task.id).catch(() => {})}
+        />
+      )}
+
+      {/* Turn-stall watchdog surface: the agent's transcript went silent
+          mid-turn past the stall threshold — usually an interactive TUI
+          dialog agetor has no matcher for. Informational (the session is
+          alive); the paired status event in the stream carries the last
+          visible pane lines. */}
+      {!archived && task.stalledSince != null && (
+        <StalledBanner task={task} />
+      )}
+
       <FileMentions task={task} events={events} />
 
       {/* Task details. Editable inline when the task is idle — agent / mode /
@@ -3053,6 +3076,82 @@ function HandBackBanner({ task, onRerun }: { task: Task; onRerun: () => void }) 
   );
 }
 
+/**
+ * Parent-pipeline twin of {@link HandBackBanner}: rendered when
+ * `task.gateParked` — the RC-6 provenance gate refused to advance because
+ * the turn that just ended was a conversation, not a stage run. Retry stage
+ * re-runs the CURRENT stage fresh from its prompt template (the stage run's
+ * verdict then advances or bounces normally — the right move when a verdict
+ * needs to be re-derived, e.g. after a `revise`). Override gate forces one
+ * stage forward without re-running anything — offered only for the
+ * gate-bearing stages the server will accept it for.
+ */
+function GateParkedBanner({
+  task,
+  onRetryStage,
+  onOverrideGate,
+}: {
+  task: Task;
+  onRetryStage: () => void;
+  onOverrideGate: () => void;
+}) {
+  const canOverrideGate = task.pipelineStage != null && GATE_BEARING_STAGES.includes(task.pipelineStage);
+  const stageLabel = task.pipelineStage ?? "stage";
+  return (
+    <div className="flex items-start gap-2.5 border-b border-amber-500/30 bg-amber-500/[0.06] px-3 py-2.5">
+      <Pause className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-foreground">Pipeline gate waiting on you</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          The last turn on this task was a conversation, not a stage run, so the {stageLabel} gate didn't
+          move — only stage runs advance the pipeline. Re-run the {stageLabel} stage to get a fresh verdict
+          (it bounces or advances on its own), or force this gate one stage forward.
+        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <Button size="sm" onClick={onRetryStage}>Retry stage</Button>
+          {canOverrideGate && (
+            <Button
+              size="sm"
+              variant="outline"
+              title="Force this gate through — advances one stage and records the override on the run log"
+              onClick={onOverrideGate}
+            >
+              Override gate
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Rendered while `task.stalledSince` is set: the turn-stall watchdog saw the
+ * in-flight turn's transcript go silent past the threshold with no subagent
+ * activity — the signature of an interactive TUI dialog agetor has no
+ * matcher for. Informational only (the session is alive and the mark
+ * self-clears when activity resumes); the paired "turn stalled" status event
+ * in the stream below carries the last visible pane lines so the user can
+ * see WHAT it's stuck on without attaching.
+ */
+function StalledBanner({ task }: { task: Task }) {
+  const sessionName = `agetor-${task.id.slice(0, 12)}`;
+  return (
+    <div className="flex items-start gap-2.5 border-b border-amber-500/30 bg-amber-500/[0.06] px-3 py-2.5">
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-foreground">Agent may be stuck</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          No transcript activity since the turn went quiet — an interactive dialog may be open in the
+          agent's terminal. The "turn stalled" event below shows the last visible screen; to intervene,
+          attach with <code className="rounded bg-muted px-1 py-0.5">tmux attach -t {sessionName}</code>.
+          This clears itself if the agent resumes.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 /** Copy for a `blocked` task whose `blockReason` is null — a pre-migration
  *  row, or (defensively) any future block path that hasn't been taught to
  *  set the field. Falls back to the universally-safe "start it again"
@@ -3111,7 +3210,7 @@ function BlockedBanner({
   // to override them, so don't offer a button that 400s.
   const canOverrideGate =
     isPipeline
-    && ["plan-review", "building", "code-review", "testing"].includes(task.pipelineStage!);
+    && GATE_BEARING_STAGES.includes(task.pipelineStage!);
 
   const actions: React.ReactNode = (() => {
     if (isPipeline) {

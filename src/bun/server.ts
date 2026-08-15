@@ -20,6 +20,7 @@ import {
 } from "./db.ts";
 import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, handBackChild, listWorktrees, startTask, cancelRun, overridePipelineGate, pausePipelineTask, reconcileTaskSession, resumePipelineTask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { stalledSince } from "./stall-registry.ts";
 import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import { buildEli5Prompt, cloneRepo, defaultCloneDest, eli5TaskTitle, parseGitHubRepo } from "./clone.ts";
@@ -224,7 +225,10 @@ const PREVIEW_CONTENT_TYPES: Record<string, string> = {
 // query instead of calling this per row.
 function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   const runningSubagents = subagents.listForTask(t.id).filter((s) => s.status === "running").length;
-  return { ...t, runningSubagents };
+  // `stalledSince` rides the same decoration: transient in-memory server
+  // state (the turn-stall watchdog's mark) that the DB-derived Task can't
+  // carry — see stall-registry.ts.
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -3142,7 +3146,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const counts = subagents.runningCountsByTask();
           return json(
-            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0 })),
+            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0, stalledSince: stalledSince(t.id) })),
             { headers: corsHeaders(req) },
           );
         }),

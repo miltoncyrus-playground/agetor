@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tasks } from "./db.ts";
-import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, type SubagentWatcherHandle } from "./claude-subagents.ts";
+import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, subagentActivityWithin, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
   activeTmuxPromptsForTask,
@@ -46,7 +46,7 @@ import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type Pa
  */
 
 import type { RunEventStream } from "../shared/types.ts";
-import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { SESSION_DIED_STATUS_PREFIX, TURN_STALLED_STATUS_PREFIX, TURN_STALL_RESUMED_STATUS_PREFIX } from "../shared/types.ts";
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 
 /**
@@ -1351,6 +1351,107 @@ export function deathTickOutcome(
   return args.misses + 1 < args.threshold ? "wait" : "fire";
 }
 
+/** Default turn-stall threshold — 10 minutes, matching the subagent
+ *  staleness backstop (`AGETOR_SUBAGENT_STALE_MS`). Deliberately generous: a
+ *  long tool call (a full test suite, a big build) writes NO JSONL between
+ *  its `tool_use` and `tool_result` lines, so anything much shorter would
+ *  false-positive on real work. The mark is soft (an amber "may be stuck",
+ *  never a settle) and self-clears, so an occasional slow-tool trip is
+ *  cosmetic. */
+export const TURN_STALL_DEFAULT_MS = 600_000;
+
+/** Env-tunable stall threshold (`AGETOR_TURN_STALL_MS`), read per-call so
+ *  tests can flip it without a module reload. */
+function turnStallMs(): number {
+  const raw = Number(process.env.AGETOR_TURN_STALL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : TURN_STALL_DEFAULT_MS;
+}
+
+export type StallTickOutcome = "none" | "fire" | "clear-live" | "clear-silent";
+
+/**
+ * One turn-stall watchdog tick, pure (mirrors `deathTickOutcome`). The
+ * watchdog catches the failure mode the pane scraper's known-modal matchers
+ * can't: an interactive TUI dialog agetor has no signature for (a setup
+ * wizard, a new claude prompt) freezing an in-flight turn while the card
+ * shows a healthy "running" (2dot2dot code-review incident 2026-08-15,
+ * 13 minutes invisible behind an `/auto-mode-setup` wizard).
+ *
+ * `quietMs` is transcript silence (`now - max(lastJsonlAppendAt,
+ * stallFloorAt)`) — pane activity deliberately does NOT count, because a
+ * frozen TUI still animates its spinner. `subagentsFresh` is a thunk (one
+ * statSync per running subagent row) consulted only once quiet has crossed
+ * the threshold — a parent turn quietly waiting on live background agents is
+ * normal, not a wedge.
+ *
+ *   - "fire": emit the stalled sentinel, latch.
+ *   - "clear-live": activity returned mid-turn — emit the resumed sentinel,
+ *     unlatch.
+ *   - "clear-silent": the turn is over — unlatch without an event (the done
+ *     handler clears the orchestrator-side mark; a resume banner after the
+ *     turn already completed would just be noise).
+ */
+export function stallTickOutcome(args: {
+  turnInFlight: boolean;
+  quietMs: number;
+  thresholdMs: number;
+  fired: boolean;
+  subagentsFresh: () => boolean;
+}): StallTickOutcome {
+  if (!args.turnInFlight) return args.fired ? "clear-silent" : "none";
+  if (args.quietMs < args.thresholdMs || args.subagentsFresh()) {
+    return args.fired ? "clear-live" : "none";
+  }
+  return args.fired ? "none" : "fire";
+}
+
+/** Reset the stall clock + latch — called at every prompt-delivery point
+ *  (embedded-prompt spawn, deferred paste, `sendTurn`, `pasteFollowUp`) so a
+ *  turn started after a long idle gap measures its own silence, not the
+ *  gap's. */
+function resetStallClock(state: SessionState): void {
+  state.stallFloorAt = Date.now();
+  state.stallFired = false;
+}
+
+/** Run one watchdog tick against a session — called from the JSONL backstop
+ *  poll chain (`armPollTimer`), which never fully stops while the session is
+ *  alive, so the check keeps running even when fs.watch goes quiet. Emits on
+ *  the active turn's chunk handler (falling back to the last known one), the
+ *  same routing `signalSessionDeath` uses. */
+function checkTurnStall(state: SessionState): void {
+  const thresholdMs = turnStallMs();
+  const quietMs = Date.now() - Math.max(state.lastJsonlAppendAt, state.stallFloorAt);
+  const outcome = stallTickOutcome({
+    turnInFlight: turnInFlight(state),
+    quietMs,
+    thresholdMs,
+    fired: state.stallFired,
+    subagentsFresh: () => subagentActivityWithin(state.taskId, thresholdMs),
+  });
+  if (outcome === "none") return;
+  if (outcome === "clear-silent") {
+    state.stallFired = false;
+    return;
+  }
+  const onChunk = state.turnQueue[0]?.onChunk ?? state.lastChunk;
+  if (outcome === "clear-live") {
+    state.stallFired = false;
+    onChunk?.("status", `${TURN_STALL_RESUMED_STATUS_PREFIX}transcript activity picked back up`);
+    return;
+  }
+  state.stallFired = true;
+  // Include the last visible pane lines so the run log answers "stuck on
+  // WHAT?" without the user having to attach to tmux themselves.
+  const pane = (state.scrapeLastPaneText ?? "").split("\n").slice(-12).join("\n").trim();
+  onChunk?.(
+    "status",
+    `${TURN_STALLED_STATUS_PREFIX}no transcript activity for ${Math.round(quietMs / 60_000)}m while a turn is in flight — `
+    + `an interactive dialog may be open in the agent's terminal (check with: tmux attach -t ${state.sessionName})`
+    + (pane ? `\nlast screen:\n${pane}` : ""),
+  );
+}
+
 /** Kill any tmux session for the given task. Idempotent / silent on miss.
  *  Exact-match `=` prefix — see `sessionExists`; without it a kill for an
  *  absent exact name can prefix-match and kill an unrelated live session. */
@@ -1821,6 +1922,18 @@ interface SessionState {
    *  and (b) cheaply detect a truly idle session so the 1s scrape
    *  tick can self-throttle. 0 means "no append observed yet". */
   lastJsonlAppendAt: number;
+  /** Floor for the stall watchdog's quiet clock: `Date.now()` of the most
+   *  recent prompt delivery (spawn with embedded prompt, deferred paste,
+   *  `sendTurn`, `pasteFollowUp`). The watchdog measures quiet as
+   *  `now - max(lastJsonlAppendAt, stallFloorAt)` — without the floor, a
+   *  turn started after a long idle gap would inherit a stale
+   *  `lastJsonlAppendAt` and trip the threshold on its first tick. */
+  stallFloorAt: number;
+  /** Latch: the stall sentinel for the current quiet period has been emitted.
+   *  Cleared (with a resume sentinel if a turn is still in flight) by
+   *  `checkTurnStall` once activity returns, and reset at every prompt
+   *  delivery alongside `stallFloorAt`. */
+  stallFired: boolean;
   /** `Date.now()` of the last pane capture taken while the session was
    *  JSONL-idle (no turn in flight, no recent append). A native modal —
    *  AskUserQuestion or a permission dialog — can appear with NO JSONL
@@ -2034,6 +2147,8 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     scrapeLastPaneText: null,
     scrapeLastFingerprint: null,
     lastJsonlAppendAt: 0,
+    stallFloorAt: Date.now(),
+    stallFired: false,
     lastIdleScrapeAt: 0,
     recentlyAnsweredFingerprints: new Map(),
     askCardId: null,
@@ -4216,6 +4331,11 @@ function armPollTimer(state: SessionState, delayMs: number = POLL_FAST_MS): void
     // stale — don't run its flush.
     if (state.pollTimer !== handle) return;
     void flush(state).finally(() => {
+      // Watchdog tick before the superseded-chain guard: a stalled session's
+      // stall/resume transitions must not depend on which poll chain
+      // survives a rearm race. Cheap when nothing is wrong (pure arithmetic;
+      // the subagent statSync probe only runs past the threshold).
+      checkTurnStall(state);
       if (state.pollTimer !== handle) return;
       const idleMs = Date.now() - state.lastActivityAt;
       armPollTimer(state, idleMs >= POLL_IDLE_AFTER_MS ? POLL_SLOW_MS : POLL_FAST_MS);
@@ -4445,6 +4565,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
       ? argv[argv.length - 1]
       : undefined;
     state.pendingSlashToken = embeddedPrompt ? slashTokenOf(embeddedPrompt) : null;
+    if (embeddedPrompt) resetStallClock(state);
   }
 
   // Large-prompt delivery: `buildCommand` (agents.ts) omits any prompt over
@@ -4521,6 +4642,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
         // "paste" already happened via the launch argv before this function
         // even returned.)
         state.pendingSlashToken = slashTokenOf(deferredPrompt);
+        resetStallClock(state);
         // Prompt paste is a life signal — matters here specifically because
         // boot (and the readiness wait above) can take up to
         // DEFERRED_PROMPT_TIMEOUT_MS, well past the construction-time stamp
@@ -4920,6 +5042,7 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
   // must happen after flushSync (which may itself clear a stale token left
   // over from the previous turn) so the new value sticks.
   state.pendingSlashToken = slashTokenOf(prompt);
+  resetStallClock(state);
   // Keep a handle on the pushed slot (rather than only closing over
   // resolve/reject) so a paste failure below can settle *this specific*
   // slot in-process instead of leaving the run stuck `running` until the
@@ -5002,6 +5125,7 @@ export function pasteFollowUp(taskId: string, prompt: string): boolean {
   // has already gone JSONL-quiet before claude replays it (plan limitation
   // L1 in docs/plans/catch-unknown-command-error.md).
   state.pendingSlashToken = slashTokenOf(prompt);
+  resetStallClock(state);
   void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
   return true;
 }
@@ -5458,6 +5582,9 @@ export const __forTest = {
   flush,
   dispatchLine,
   firePendingEndTurn,
+  /** Turn-stall watchdog tick — exposed so the stall test can drive it
+   *  against a synthetic session without waiting out real poll timers. */
+  checkTurnStall,
   /** Death-watch settlement — exposed so the death test can drive it against a
    *  synthetic session without a real tmux server. */
   signalSessionDeath,

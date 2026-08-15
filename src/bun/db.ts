@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
 import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
-import { isAwaitingHandBack } from "../shared/types.ts";
+import { isAwaitingHandBack, isGateParked } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -91,6 +91,10 @@ type TaskRow = {
    *  TASKS_SELECT) — feeds the derived `awaitingHandBack`. Missing on
    *  code paths that don't join (insert fallback). */
   current_run_status?: string | null;
+  /** Origin of the run `run_id` points at (same correlated subquery shape as
+   *  `current_run_status`) — feeds the derived `gateParked`, whose predicate
+   *  needs to distinguish a stage run from a conversation turn. */
+  current_run_origin?: string | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
    *  a correlated subquery in `list` / `get` — see those for the full SQL. */
   has_openable_run?: number;
@@ -227,6 +231,17 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
     },
     r.current_run_status ?? null,
   ),
+  gateParked: isGateParked(
+    {
+      parentTaskId: r.parent_task_id,
+      pipelineStage: r.pipeline_stage as Task["pipelineStage"],
+      archivedAt: r.archived_at,
+      pausedAt: r.paused_at,
+      column: r.column as Task["column"],
+    },
+    r.current_run_status ?? null,
+    r.current_run_origin ?? null,
+  ),
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -235,7 +250,8 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
 const TASKS_SELECT = `
   SELECT tasks.*,
          COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run,
-         (SELECT status FROM runs WHERE runs.id = tasks.run_id) AS current_run_status
+         (SELECT status FROM runs WHERE runs.id = tasks.run_id) AS current_run_status,
+         (SELECT origin FROM runs WHERE runs.id = tasks.run_id) AS current_run_origin
     FROM tasks
     LEFT JOIN runs ON runs.task_id = tasks.id
 `;

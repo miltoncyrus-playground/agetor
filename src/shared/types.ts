@@ -20,6 +20,28 @@ export const TMUX_MISSING_REASON = "tmux is required to drive claude-code intera
 export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
 
 /**
+ * Sentinel prefix for the `status` chunk claude-tmux's turn-stall watchdog
+ * emits when a turn is in flight but the session's JSONL transcript has been
+ * silent past `AGETOR_TURN_STALL_MS` (default 10 min) with no subagent
+ * activity either — the signature of an interactive TUI dialog the pane
+ * scraper's matchers don't know (2dot2dot incident 2026-08-15: an
+ * `/auto-mode-setup` wizard froze a code-review turn for 13 minutes while
+ * the card showed a healthy green "running"). Unlike the death/API-error
+ * sentinels this does NOT settle the turn or move the card — the session is
+ * alive, just possibly wedged — it only marks the task "may be stuck"
+ * (orchestrator's stall registry → `Task.stalledSince` → amber card state)
+ * until activity resumes or the turn ends. */
+export const TURN_STALLED_STATUS_PREFIX = "turn stalled: ";
+
+/**
+ * Companion sentinel to {@link TURN_STALLED_STATUS_PREFIX}: emitted when
+ * transcript activity resumes while the same turn is still in flight, so the
+ * orchestrator clears the stall mark without waiting for the turn to end.
+ * (A turn that ends while marked is cleared by the done handler instead —
+ * no resume event is emitted after the fact.) */
+export const TURN_STALL_RESUMED_STATUS_PREFIX = "turn resumed: ";
+
+/**
  * The Settings section name where per-host git credentials live, interpolated
  * into the server-side credential-error hints (github.ts `privateRepoHint`,
  * gitlab.ts `authHint`, bitbucket.ts `bitbucketAccessHint` and friends) as
@@ -68,6 +90,16 @@ export const PIPELINE_STAGE_COLUMNS: readonly ColumnId[] =
  *  but still counts, so the cap needs room). Hitting the cap routes the
  *  task to `blocked` (reason "revision-cap") instead of looping again. */
 export const PIPELINE_REVISION_CAP = 6;
+
+/** The pipeline stages whose advance is decided by a gate (a parsed verdict
+ *  or the building barrier) rather than by an artifact file landing on disk —
+ *  exactly the stages `overridePipelineGate` will force through. The artifact
+ *  stages (specify/clarify/planning/decompose/analyze) advance on their file
+ *  gates and the server refuses to override them. Shared so the two RunPanel
+ *  banners that offer "Override gate" (blocked, and gate-parked) can't drift
+ *  from the server's switch. */
+export const GATE_BEARING_STAGES: readonly ColumnId[] =
+  ["plan-review", "building", "code-review", "testing"];
 
 /** True when a task's column means "an agent is actively occupying this row
  *  right now" — the plain `running` column for an ordinary task, or any of
@@ -990,6 +1022,30 @@ export interface Task {
    * build full Task literals don't churn; absent means false.
    */
   awaitingHandBack?: boolean;
+  /**
+   * Derived (never persisted): true for a PARENT pipeline task parked on its
+   * gate column because the latest run to touch it was a conversation turn,
+   * not a stage run — the parent-side twin of `awaitingHandBack`. The RC-6
+   * provenance gate correctly refuses to advance on such a run, but until
+   * this flag the resulting state was invisible: the card sat on its stage
+   * column with the "use Retry stage or the gate override" breadcrumb
+   * pointing at buttons that only render for a `blocked` task (2dot2dot
+   * code-review incident 2026-08-15). Drives the card's "gate parked" state
+   * and RunPanel's GateParkedBanner. Optional so test fixtures don't churn;
+   * absent means false.
+   */
+  gateParked?: boolean;
+  /**
+   * Transient (in-memory on the server, decorated onto API responses — never
+   * persisted): `Date.now()` when the turn-stall watchdog flagged this
+   * task's in-flight turn as possibly stuck (see
+   * {@link TURN_STALLED_STATUS_PREFIX}). Cleared when transcript activity
+   * resumes, the turn settles, or the run is cancelled. Null/absent means
+   * not stalled. Resets on server restart by design — the watchdog re-fires
+   * within one threshold window if the session is still wedged after a
+   * reattach.
+   */
+  stalledSince?: number | null;
 }
 
 /**
@@ -1007,6 +1063,37 @@ export function isAwaitingHandBack(
     && t.childMergeStatus === "pending"
     && t.archivedAt == null
     && currentRunStatus === "succeeded";
+}
+
+/**
+ * The predicate behind {@link Task.gateParked} — pure so it's gate-testable.
+ * True when a PARENT pipeline task is parked on its own stage column with a
+ * settled, successful latest run that was NOT a stage run (`origin !==
+ * "pipeline-stage"`): the exact state advancePipelineStage's RC-6 provenance
+ * gate leaves behind after a conversation turn. The origin check is what
+ * makes the flag race-free — during a normal auto-advance the settled run IS
+ * a stage run, so the flag never flickers on in the async gap before the
+ * next stage's run row appears. Paused tasks are excluded (pause has its own
+ * resume affordance); children are excluded (they get `awaitingHandBack`).
+ *
+ * `currentRunStatus`/`currentRunOrigin` are the status/origin of the run
+ * `task.runId` points at (null when the task never ran). Requiring
+ * `"succeeded"` both proves a turn actually finished AND rules out an
+ * in-flight one; a failed conversation turn lands on the blocked path, which
+ * already renders the gate controls.
+ */
+export function isGateParked(
+  t: Pick<Task, "parentTaskId" | "pipelineStage" | "archivedAt" | "pausedAt" | "column">,
+  currentRunStatus: string | null,
+  currentRunOrigin: string | null,
+): boolean {
+  return t.parentTaskId == null
+    && t.pipelineStage != null
+    && t.archivedAt == null
+    && t.pausedAt == null
+    && t.column === t.pipelineStage
+    && currentRunStatus === "succeeded"
+    && currentRunOrigin !== "pipeline-stage";
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can

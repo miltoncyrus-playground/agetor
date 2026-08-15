@@ -56,7 +56,13 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
   // awaitingHandBack joins the amber-ring club: a build child whose work is
   // done but not handed back is waiting on the human exactly like a pending
   // question is (2DOT2DOT incident: these cards read as green "Running").
-  const awaiting = pendingCount > 0 || blocked || task.awaitingHandBack === true;
+  // gateParked (a parent pipeline task parked at its gate by a conversation
+  // turn) and stalledSince (the turn-stall watchdog's "may be stuck" mark)
+  // join for the same reason: both are states where the human is the only
+  // thing that moves the task forward, previously invisible behind a healthy
+  // looking card.
+  const awaiting = pendingCount > 0 || blocked || task.awaitingHandBack === true
+    || task.gateParked === true || task.stalledSince != null;
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
 
@@ -72,6 +78,14 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
     // here, which is exactly the lie this state existed as. The hand-back
     // action itself lives in RunPanel's banner (cards carry no buttons).
     ? "awaiting hand-back"
+    // Same override rationale for the other two attention states: the stage
+    // label alone reads as healthy progress. stalled wins over gateParked in
+    // priority but they're mutually exclusive in practice (stalled implies a
+    // run in flight, gateParked implies none).
+    : task.stalledSince != null
+    ? "may be stuck"
+    : task.gateParked
+    ? "gate parked"
     : task.pipelineStage
     ? (COLUMNS.find((c) => c.id === task.pipelineStage)?.label ?? task.pipelineStage)
     : (COLUMNS.find((c) => c.id === task.column)?.label ?? task.column);
@@ -79,7 +93,10 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
     task.pipelineStage && task.revisionCount > 0 ? `rev ${task.revisionCount}` : null,
     childProgress ? `${childProgress.merged}/${childProgress.total} sub-tasks` : null,
   ].filter(Boolean).join(" · ");
-  const isActivelyMidStage = task.pipelineStage != null && PIPELINE_STAGE_COLUMNS.includes(task.column);
+  // A gate-parked card sits on a stage column with nothing running — the
+  // pulsing "actively mid-stage" dot would be a lie there.
+  const isActivelyMidStage = task.pipelineStage != null && PIPELINE_STAGE_COLUMNS.includes(task.column)
+    && !task.gateParked;
   // Time-in-column rot signal, only where dwell time means "a human hasn't
   // acted": review and blocked. Hidden for the first hour (sub-hour dwell is
   // normal flow) and on archived cards. `updatedAt` is bumped by the column
