@@ -4,7 +4,8 @@ import { CSS } from "@dnd-kit/utilities";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
-import { COLUMNS, PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { cardStateLabel } from "@/lib/card-state";
 import { displayColumnMeta, toDisplayColumn } from "@/lib/display-columns";
 import { AGE_BADGE_MIN_MS, formatAge } from "@/lib/board-status";
 import { useMinuteNow } from "@/lib/minute-tick";
@@ -66,29 +67,13 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
 
-  // The single "state" string: pipeline stage (+ pulsing dot while actively
-  // mid-stage, + revision count, + sub-task progress) for a pipeline task,
-  // else just the plain column label. Collapses what used to be up to 4
-  // separate badges (pipeline-stage, revision suffix, terminal count,
-  // running-subagents) into one line — those secondary counts are still
-  // visible in RunPanel (terminal count) or were never load-bearing enough
-  // to justify face space (running-subagents has its own tabs in RunPanel).
-  const stageLabel = task.awaitingHandBack
-    // Override the column label outright — the column is usually "running"
-    // here, which is exactly the lie this state existed as. The hand-back
-    // action itself lives in RunPanel's banner (cards carry no buttons).
-    ? "awaiting hand-back"
-    // Same override rationale for the other two attention states: the stage
-    // label alone reads as healthy progress. stalled wins over gateParked in
-    // priority but they're mutually exclusive in practice (stalled implies a
-    // run in flight, gateParked implies none).
-    : task.stalledSince != null
-    ? "may be stuck"
-    : task.gateParked
-    ? "gate parked"
-    : task.pipelineStage
-    ? (COLUMNS.find((c) => c.id === task.pipelineStage)?.label ?? task.pipelineStage)
-    : (COLUMNS.find((c) => c.id === task.column)?.label ?? task.column);
+  // The single "state" string (priority + wording in lib/card-state.ts).
+  // Collapses what used to be up to 4 separate badges (pipeline-stage,
+  // revision suffix, terminal count, running-subagents) into one line —
+  // those secondary counts are still visible in RunPanel (terminal count)
+  // or were never load-bearing enough to justify face space
+  // (running-subagents has its own tabs in RunPanel).
+  const stageLabel = cardStateLabel(task);
   const stateSuffix = [
     task.pipelineStage && task.revisionCount > 0 ? `rev ${task.revisionCount}` : null,
     childProgress ? `${childProgress.merged}/${childProgress.total} sub-tasks` : null,
