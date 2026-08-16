@@ -114,7 +114,13 @@ async function mergeChildIntoParent(child: Task, parent: Task): Promise<boolean>
     cancelSiblingChildren(parent.id);
     return false;
   }
-  tasks.update(child.id, { childMergeStatus: "merged" });
+  // "done", not "running": the child's work now lives in the parent branch,
+  // so the card is finished even if the build later aborts before the
+  // barrier-completion archive sweep runs. Leaving it on "running" is the
+  // 2dot2dot-redesign stranded-cards incident (2026-08-16) — four merged
+  // children sat in the in-progress lane for hours after a sibling's
+  // cancellation aborted the build.
+  tasks.update(child.id, { childMergeStatus: "merged", column: "done" });
   return true;
 }
 

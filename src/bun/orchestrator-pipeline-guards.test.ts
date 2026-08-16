@@ -384,3 +384,53 @@ test("handBackChild on an actively-building parent ticks the build (merge semant
   expect(tasks.get(childId)!.childMergeStatus).toBe("merge-failed");
   expect(tasks.get(parentId)!.column).toBe("blocked");
 });
+
+// ─── card honesty: non-stage child runs that DON'T succeed ───────────────────
+
+test("settleChildRun: a cancelled conversation turn moves the child card to ready (build state untouched, parent untouched)", async () => {
+  const { settleChildRun } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  // The 2dot2dot-redesign puzzle-canvas zombie (2026-08-16): a continuation
+  // run adopted the card back to "running", then its cancellation hit the
+  // non-stage early-return and the card sat in the in-progress lane forever
+  // with no run in flight and no derived badge.
+  const parentId = await seedTask({ pipelineStage: "building", column: "blocked", blockReason: "pipeline-failed" });
+  const childId = await seedTask({ parentTaskId: parentId, planSubtaskId: "s1", childMergeStatus: "pending", column: "running" });
+  const runId = await seedRun(childId, "continuation");
+  runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+
+  settleChildRun(childId, runId, { kind: "cancelled" });
+  await settle();
+
+  const child = tasks.get(childId)!;
+  expect(child.column).toBe("ready"); // honest, re-runnable — not a running zombie
+  expect(child.childMergeStatus).toBe("pending"); // build state untouched (RC-6)
+  const status = runs.events(runId).filter((e) => e.stream === "status");
+  expect(status.some((e) => e.data.includes("cancelled") && e.data.includes("press Run"))).toBe(true);
+  // Parent untouched — a conversation-turn cancel must not (re)escalate.
+  const parent = tasks.get(parentId)!;
+  expect(parent.column).toBe("blocked");
+  expect(parent.blockReason).toBe("pipeline-failed");
+});
+
+test("settleChildRun: a hard-failed conversation turn moves the child card to blocked with the reason (build state untouched)", async () => {
+  const { settleChildRun } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const parentId = await seedTask({ pipelineStage: "building", column: "building" });
+  const childId = await seedTask({ parentTaskId: parentId, planSubtaskId: "s1", childMergeStatus: "pending", column: "running" });
+  const runId = await seedRun(childId, null); // unstamped user follow-up
+  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: 0 });
+
+  settleChildRun(childId, runId, { kind: "hard-failure", reason: "api-error" });
+  await settle();
+
+  const child = tasks.get(childId)!;
+  expect(child.column).toBe("blocked");
+  expect(child.blockReason).toBe("api-error");
+  expect(child.childMergeStatus).toBe("pending"); // no merge, no escalate
+  // Parent NOT blocked by a non-stage failure — only the child's own build
+  // run may abort the build.
+  expect(tasks.get(parentId)!.column).toBe("building");
+});

@@ -1605,6 +1605,32 @@ export function settleChildRun(taskId: string, runId: string, outcome: PipelineO
         runId, taskId,
         "conversation turn ended — child build state unchanged (only the child's own build run hands work back to the pipeline; use \"Hand back & merge\" when the work is done, or press Run to restart the build turn)",
       );
+      return;
+    }
+    // A cancelled/failed conversation (or continuation) turn must still land
+    // the CARD somewhere honest — build state stays untouched (RC-6), but a
+    // bare return here left the child parked on "running" forever with no
+    // in-flight run and no derived badge (awaitingHandBack requires a
+    // succeeded run). That's the 2dot2dot-redesign puzzle-canvas zombie
+    // (2026-08-16): a user interrupt settled the build turn, an
+    // auto-continuation run adopted the card back to "running", then ITS
+    // cancellation hit this branch and vanished. Mirror the ordinary-task
+    // ternary in attachDoneHandler: cancelled → "ready" (Run restarts the
+    // build turn, exactly what the success-path breadcrumb tells the user),
+    // hard-failure → "blocked" with the reason. The parent is deliberately
+    // NOT escalated — only the child's own build run may abort the build.
+    if (outcome.kind === "cancelled") {
+      updateColumn(taskId, runId, "ready");
+      pipelineStatus(
+        runId, taskId,
+        "conversation turn cancelled — child build state unchanged (press Run to restart the build turn)",
+      );
+    } else {
+      updateColumn(taskId, runId, "blocked", outcome.reason);
+      pipelineStatus(
+        runId, taskId,
+        `conversation turn failed (${outcome.reason}) — child build state unchanged (press Run to restart the build turn)`,
+      );
     }
     return;
   }

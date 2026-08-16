@@ -416,3 +416,83 @@ test("pipeline: a no-progress bounce blocks immediately; a progressing bounce pr
     expect(task.pipelineBounceFingerprint).toBe(`building:${fp}`);
   }
 });
+
+test("pipeline: a merged child's card leaves the running lane immediately (column done), even while the barrier is still incomplete", async () => {
+  // Manual setup, same style as the F-3 deferred-pickup test above, but with
+  // a SECOND (still-pending) subtask so the barrier does NOT complete and no
+  // archive sweep races the assertion. Before this fix the merged child kept
+  // `column: "running"` until the barrier's archive sweep — which never runs
+  // if the build later aborts, stranding finished-looking cards in the
+  // in-progress lane (2dot2dot-redesign incident, 2026-08-16).
+  const { createTask } = await import("./orchestrator.ts");
+  const { tickBuild } = await import("./build-scheduler.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { tasks } = await import("./db.ts");
+
+  const repo = await makeGitRepo();
+
+  const parentCreated = await createTask({
+    title: "p3done", prompt: "x", agent: "claude-code",
+    workdir: repo, isolation: "worktree", taskType: "task",
+    mode: "auto", model: "opus-4.7", effort: "high",
+  });
+  if ("error" in parentCreated) throw new Error(parentCreated.error);
+  const parentId = parentCreated.task.id;
+  const parentPrepared = await prepareWorkdir(tasks.get(parentId)!);
+  if ("error" in parentPrepared) throw new Error(parentPrepared.error);
+  tasks.update(parentId, {
+    branch: parentPrepared.branch, worktreePath: parentPrepared.worktreePath,
+    pipelineStage: "building", column: "building",
+    planApproved: true, implementationApproved: false, revisionCount: 0, pipelineFeedback: null,
+  });
+  const parentWorktree = parentPrepared.worktreePath!;
+  const parentBranch = parentPrepared.branch!;
+  await commitFile(
+    parentWorktree, "TASKS.json",
+    JSON.stringify({ subtasks: [
+      { id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: [] },
+      { id: "b", title: "B", prompt: "do b", dependsOn: [], acceptanceCriteria: [] },
+    ] }),
+  );
+
+  // Child for "a": finished late, parked merge-deferred with real committed work.
+  const childACreated = await createTask({
+    title: "p3done — A", prompt: "do a", agent: "claude-code",
+    workdir: repo, isolation: "worktree", taskType: "task",
+    baseRef: parentBranch, mode: "auto", model: "opus-4.7", effort: "high",
+    parentTaskId: parentId, planSubtaskId: "a", column: "building",
+  });
+  if ("error" in childACreated) throw new Error(childACreated.error);
+  const childAId = childACreated.task.id;
+  const childAPrepared = await prepareWorkdir(tasks.get(childAId)!);
+  if ("error" in childAPrepared) throw new Error(childAPrepared.error);
+  await commitFile(childAPrepared.worktreePath!, "a.txt", "work a\n");
+  tasks.update(childAId, {
+    branch: childAPrepared.branch, worktreePath: childAPrepared.worktreePath,
+    childMergeStatus: "merge-deferred", column: "review",
+  });
+
+  // Child for "b": exists but is still pending — keeps the barrier incomplete
+  // and stops tickBuild from spawning anything.
+  const childBCreated = await createTask({
+    title: "p3done — B", prompt: "do b", agent: "claude-code",
+    workdir: repo, isolation: "worktree", taskType: "task",
+    baseRef: parentBranch, mode: "auto", model: "opus-4.7", effort: "high",
+    parentTaskId: parentId, planSubtaskId: "b", column: "building",
+  });
+  if ("error" in childBCreated) throw new Error(childBCreated.error);
+  tasks.update(childBCreated.task.id, { childMergeStatus: "pending" });
+
+  await tickBuild(parentId);
+
+  const childA = tasks.get(childAId)!;
+  // The merge landed and the card moved straight to "done" — no waiting for
+  // the barrier's archive sweep.
+  expect(childA.childMergeStatus).toBe("merged");
+  expect(childA.column).toBe("done");
+  expect(childA.archivedAt).toBeNull(); // barrier incomplete — no archive yet
+  // Parent still building on the unfinished subtask, untouched otherwise.
+  const parent = tasks.get(parentId)!;
+  expect(parent.pipelineStage).toBe("building");
+  expect(parent.column).toBe("building");
+});
