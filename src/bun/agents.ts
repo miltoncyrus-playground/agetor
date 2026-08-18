@@ -349,11 +349,11 @@ export function buildCommand(
     //     the legacy flag is what users see in claude's own docs — keep
     //     parity with that.
     //
-    //   - `ask` → emit nothing; claude lands in its built-in `default`
-    //     mode, which is exactly the "ask before each action" posture we
-    //     want for this id. Setting `--permission-mode default`
-    //     explicitly works too, but omitting it matches the prior
-    //     behavior so the launch transcript is unchanged.
+    //   - `ask` → emit `--permission-mode default` EXPLICITLY. Omitting
+    //     the flag does NOT land claude in `default`: it inherits the
+    //     user-level `defaultMode` from ~/.claude/settings.json (e.g.
+    //     `auto`), silently running the task in a looser mode than the
+    //     one stored on it.
     //
     // agetor installs no PreToolUse hook and no MCP server, so the mode
     // only drives these launch flags — claude's own permission engine and
