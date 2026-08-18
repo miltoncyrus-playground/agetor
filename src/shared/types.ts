@@ -1325,10 +1325,11 @@ export interface AgentOptions {
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // Default to Opus 5 — the most-capable Opus, priced identically to Opus 4.8
-  // ($5/$25 per MTok). Fable 5 sits above it in the picker but costs 2x the
-  // usage, so the default stays on the most-capable non-premium tier.
+  // ($5/$25 per MTok). Mythos 5 and Fable 5 sit above it in the picker but
+  // cost 2x the usage, so the default stays on the most-capable non-premium
+  // tier.
   "claude-code": "opus-5",
-  "codex": "gpt-5.5",
+  "codex": "gpt-5.6-sol",
   // gemini-3-pro-preview is the current flagship per google-gemini/gemini-cli
   // docs (verified 2026-08-06). Deliberately NOT the "auto" alias — a spike
   // showed "auto" internally routes across mixed pro/flash-lite models even
@@ -1428,6 +1429,8 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   "claude-code": {
     // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
     "fable-5": ["max", "xhigh", "high", "medium", "low"],
+    // Mythos 5 shares Fable 5's request surface (same underlying model).
+    "mythos-5": ["max", "xhigh", "high", "medium", "low"],
     // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
     "opus-5": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
@@ -1441,6 +1444,13 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "haiku-4.5": [],
   },
   codex: {
+    // GPT-5.6 family → none/low/medium/high/xhigh/max (upstream #151; Cyber's
+    // own model page doesn't enumerate efforts — assume the family surface
+    // Sol documents, revisit if codex rejects none/max).
+    "gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-terra": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-cyber": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.5": ["xhigh", "high", "medium", "low"],
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
@@ -1453,6 +1463,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gemini-3-pro-preview": [],
     "gemini-3.1-pro-preview": [],
     "gemini-2.5-pro": [],
+    "gemini-3.7-flash": [],
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
   },
@@ -1488,6 +1499,7 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
 const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   "claude-code": {
     "fable-5": [],
+    "mythos-5": [],
     "opus-5": [],
     "opus-4.8": [],
     "opus-4.7": [],
@@ -1514,6 +1526,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   "claude-code": {
     models: [
       { id: "fable-5", label: "Fable 5", hint: "Most powerful tier — above Opus. Uses 2x the usage of Opus." },
+      { id: "mythos-5", label: "Mythos 5", hint: "Fable 5's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
       { id: "opus-5", label: "Opus 5", hint: "Most capable Opus; same usage cost as 4.8." },
       { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
@@ -1537,7 +1550,11 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Recommended default — works on ChatGPT plans." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Recommended default — flagship GPT-5.6 capability." },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
+      { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous recommended default — works on ChatGPT plans." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
@@ -1552,8 +1569,9 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "gemini-3-pro-preview", label: "Gemini 3 Pro (preview)", hint: "Recommended default — current flagship." },
       { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Newer preview tier." },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
-      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost." },
-      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, prior generation." },
+      { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Latest and most capable Flash — strong on coding and agentic work at Flash cost." },
+      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — prior Flash generation." },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earlier generation." },
     ],
     modes: [
       { id: "auto", label: "Auto (yolo)", hint: "Edit files without approval prompts (--yolo)." },

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { DEFAULT_MODEL, supportedEfforts } from "../shared/types.ts";
+import { AGENT_OPTIONS, DEFAULT_MODEL, supportedEfforts } from "../shared/types.ts";
 
 test("claude opus-5 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
@@ -82,11 +82,39 @@ test("codex gpt-5 supports xhigh but not max", () => {
   expect(ids).not.toContain("max");
 });
 
+test("codex DEFAULT_MODEL is GPT-5.6 Sol", () => {
+  expect(DEFAULT_MODEL.codex).toBe("gpt-5.6-sol");
+});
+
+test("codex GPT-5.6 family supports none through max", () => {
+  for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-cyber"]) {
+    const ids = supportedEfforts("codex", model).map((o) => o.id);
+    expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "none"]);
+  }
+});
+
+test("codex model picker includes the GPT-5.6 family", () => {
+  const ids = AGENT_OPTIONS.codex.models.map((m) => m.id);
+  expect(ids.slice(0, 4)).toEqual(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-cyber"]);
+});
+
+test("claude model picker includes Mythos 5 with Fable 5's effort range", () => {
+  expect(AGENT_OPTIONS["claude-code"].models.map((m) => m.id)).toContain("mythos-5");
+  expect(supportedEfforts("claude-code", "mythos-5").map((o) => o.id))
+    .toEqual(supportedEfforts("claude-code", "fable-5").map((o) => o.id));
+});
+
+test("gemini model picker includes 3.7 Flash (no effort flag, like all gemini)", () => {
+  expect(AGENT_OPTIONS.gemini.models.map((m) => m.id)).toContain("gemini-3.7-flash");
+  expect(supportedEfforts("gemini", "gemini-3.7-flash")).toEqual([]);
+});
+
 test("unknown model falls back to the agent's DEFAULT_MODEL support set", () => {
-  // codex's default is gpt-5.5 which has the same set as gpt-5.
+  // codex's default is gpt-5.6-sol, so pasted future ids inherit its range.
   const ids = supportedEfforts("codex", "future-codex-9000").map((o) => o.id);
   expect(ids).toContain("xhigh");
-  expect(ids).not.toContain("max");
+  expect(ids).toContain("max");
+  expect(ids).toContain("none");
 });
 
 test("ordered highest → lowest (no placeholder at the top)", () => {
