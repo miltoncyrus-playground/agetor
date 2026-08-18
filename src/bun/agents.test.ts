@@ -45,7 +45,7 @@ function builtin(kind: AgentKind): Harness {
     home: null,
     bin: null,
     env: {},
-    enabled: true,
+    enabled: true, quotaEnabled: false,
   };
 }
 
@@ -59,7 +59,7 @@ function alias(kind: AgentKind, opts: { home?: string; bin?: string; env?: Recor
     home: opts.home ?? null,
     bin: opts.bin ?? null,
     env: opts.env ?? {},
-    enabled: true,
+    enabled: true, quotaEnabled: false,
   };
 }
 

@@ -4,8 +4,11 @@ import { CSS } from "@dnd-kit/utilities";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
-import { COLUMNS, PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { cardStateLabel } from "@/lib/card-state";
 import { displayColumnMeta, toDisplayColumn } from "@/lib/display-columns";
+import { AGE_BADGE_MIN_MS, formatAge } from "@/lib/board-status";
+import { useMinuteNow } from "@/lib/minute-tick";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
@@ -51,25 +54,42 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
 
   const pendingCount = task.pendingInteractionCount;
   const blocked = task.column === "blocked";
-  const awaiting = pendingCount > 0 || blocked;
+  // awaitingHandBack joins the amber-ring club: a build child whose work is
+  // done but not handed back is waiting on the human exactly like a pending
+  // question is (2DOT2DOT incident: these cards read as green "Running").
+  // gateParked (a parent pipeline task parked at its gate by a conversation
+  // turn) and stalledSince (the turn-stall watchdog's "may be stuck" mark)
+  // join for the same reason: both are states where the human is the only
+  // thing that moves the task forward, previously invisible behind a healthy
+  // looking card.
+  const awaiting = pendingCount > 0 || blocked || task.awaitingHandBack === true
+    || task.gateParked === true || task.stalledSince != null;
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
 
-  // The single "state" string: pipeline stage (+ pulsing dot while actively
-  // mid-stage, + revision count, + sub-task progress) for a pipeline task,
-  // else just the plain column label. Collapses what used to be up to 4
-  // separate badges (pipeline-stage, revision suffix, terminal count,
-  // running-subagents) into one line — those secondary counts are still
-  // visible in RunPanel (terminal count) or were never load-bearing enough
-  // to justify face space (running-subagents has its own tabs in RunPanel).
-  const stageLabel = task.pipelineStage
-    ? (COLUMNS.find((c) => c.id === task.pipelineStage)?.label ?? task.pipelineStage)
-    : (COLUMNS.find((c) => c.id === task.column)?.label ?? task.column);
+  // The single "state" string (priority + wording in lib/card-state.ts).
+  // Collapses what used to be up to 4 separate badges (pipeline-stage,
+  // revision suffix, terminal count, running-subagents) into one line —
+  // those secondary counts are still visible in RunPanel (terminal count)
+  // or were never load-bearing enough to justify face space
+  // (running-subagents has its own tabs in RunPanel).
+  const stageLabel = cardStateLabel(task);
   const stateSuffix = [
     task.pipelineStage && task.revisionCount > 0 ? `rev ${task.revisionCount}` : null,
     childProgress ? `${childProgress.merged}/${childProgress.total} sub-tasks` : null,
   ].filter(Boolean).join(" · ");
-  const isActivelyMidStage = task.pipelineStage != null && PIPELINE_STAGE_COLUMNS.includes(task.column);
+  // A gate-parked card sits on a stage column with nothing running — the
+  // pulsing "actively mid-stage" dot would be a lie there.
+  const isActivelyMidStage = task.pipelineStage != null && PIPELINE_STAGE_COLUMNS.includes(task.column)
+    && !task.gateParked;
+  // Time-in-column rot signal, only where dwell time means "a human hasn't
+  // acted": review and blocked. Hidden for the first hour (sub-hour dwell is
+  // normal flow) and on archived cards. `updatedAt` is bumped by the column
+  // transition, so "since last update" is "since it landed here" unless the
+  // user actively touched the task — in which case resetting is the point.
+  const now = useMinuteNow();
+  const ageMs = now - task.updatedAt;
+  const showAge = !archived && (task.column === "review" || task.column === "blocked") && ageMs >= AGE_BADGE_MIN_MS;
   // Static state-color dot, shown for every card so a task's place in the
   // (now-merged) display-column taxonomy reads without opening it. Skipped
   // only when the pulsing dot below already covers the exact same signal
@@ -121,6 +141,14 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen }: Props) {
           {stageLabel}
           {stateSuffix && ` · ${stateSuffix}`}
         </span>
+        {showAge && (
+          <span
+            className="ml-auto shrink-0 rounded bg-muted px-1 text-[9px] tabular-nums"
+            title={`In ${stageLabel.toLowerCase()} for ${formatAge(ageMs)}`}
+          >
+            {formatAge(ageMs)}
+          </span>
+        )}
       </div>
     </Card>
   );

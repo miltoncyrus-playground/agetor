@@ -7,7 +7,7 @@ import { Select } from "@/components/ui/select";
 import { SearchSelect } from "@/components/ui/search-select";
 import { InfoTip } from "@/components/ui/info-tip";
 import { Textarea } from "@/components/ui/textarea";
-import { cn } from "@/lib/utils";
+import { cn, formatTokens } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { branchFieldState } from "@/lib/branch-field";
 import {
@@ -463,12 +463,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   }, [isolate, isPipeline]);
 
   const pipelineTitle =
-    "Automatically walks this task through 4 stages with no click between "
-    + "them — Planning, Plan Review, Building, Testing — each running the "
-    + "same agent with a different prompt, looping revisions between "
-    + "Plan Review/Planning and Testing/Building until both approve or the "
-    + "revision budget runs out. Requires isolation (worktree) — the same "
-    + "worktree/branch has to persist across every stage.";
+    "Spec-driven pipeline: automatically walks this task through 9 stages "
+    + "— Specify, Clarify, Plan, Plan Review, Decompose, Analyze, Build, "
+    + "Code Review, Test — with no click between them. Writes a SPEC.md "
+    + "with numbered acceptance criteria, then designs and implements towards "
+    + "those criteria, looping revisions until all gates pass or the "
+    + "revision budget runs out. Requires isolation (worktree).";
 
   // Sidebar-wide drag/drop — anything dropped on the form (not just the
   // ReferencesPicker) gets added to the references list. The inner picker
@@ -800,8 +800,21 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                         size="sm"
                         variant={agent === h.id ? "default" : "outline"}
                         onClick={() => switchAgent(h.id)}
+                        // Account email + today's token burn come first: with
+                        // two claude harnesses, "which account is this and
+                        // does it have headroom" is the decision being made.
                         title={
-                          [status?.reason, status?.path, status?.version]
+                          [
+                            status?.account?.email,
+                            status?.usage?.quota &&
+                              `5h ${Math.round(status.usage.quota.fiveHourPct)}% · wk ${Math.round(status.usage.quota.weeklyPct)}%`,
+                            status?.usage &&
+                              `today ${formatTokens(status.usage.today.inputTokens + status.usage.today.outputTokens)} tok`,
+                            status?.usage?.quotaReason,
+                            status?.reason,
+                            status?.path,
+                            status?.version,
+                          ]
                             .filter(Boolean)
                             .join(" — ") || h.id
                         }
@@ -809,6 +822,15 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                       >
                         <AgentIcon kind={h.kind} className="mr-1" />
                         <span className="truncate">{h.label}</span>
+                        {/* Low-headroom warning at the decision point: the
+                            worst of the two quota windows, shown only when
+                            it matters (≥80%). Full numbers in the tooltip. */}
+                        {status?.usage?.quota &&
+                          Math.max(status.usage.quota.fiveHourPct, status.usage.quota.weeklyPct) >= 80 && (
+                            <span className="ml-1 shrink-0 text-[9px] font-medium text-amber-500 tabular-nums">
+                              {Math.round(Math.max(status.usage.quota.fiveHourPct, status.usage.quota.weeklyPct))}%
+                            </span>
+                          )}
                         <span
                           className={cn(
                             "ml-auto inline-block size-1.5 rounded-full",

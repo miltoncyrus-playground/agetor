@@ -4,8 +4,10 @@ import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-r
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { isActiveColumn, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
-import { DISPLAY_COLUMNS, toDisplayColumn, type DisplayColumnId } from "./lib/display-columns.ts";
+import { DISPLAY_COLUMNS, filterLaneColumns, toDisplayColumn, type DisplayColumnId } from "./lib/display-columns.ts";
+import { sortWaitingFirst } from "./lib/board-status.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { AttentionStrip } from "@/components/kanban/AttentionStrip";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { KanbanFilters, basename } from "@/components/kanban/KanbanFilters";
@@ -549,10 +551,12 @@ export default function App() {
   // zero currently-visible tasks — an empty lane is noise), then any workdir
   // present in tasks but not a registered project (ad-hoc/typed-in
   // workdirs), alphabetically. Each lane also gets its OWN visible-column
-  // list: `visibleDisplayColumns` filtered down to buckets that actually
-  // have a task in THIS lane — a column with zero tasks in a given project
-  // simply doesn't render in that project's row, even if another project's
-  // row does show it (the confirmed "auto-hide, per lane" behavior).
+  // list via `filterLaneColumns`: the four working columns (backlog / ready /
+  // in-progress / blocked) always render, empty or not — an empty column is
+  // a valid drop target — while `review` / `done` keep the original per-lane
+  // auto-hide (zero tasks in THIS lane → not rendered in this row, even if
+  // another project's row shows it). The user's explicit status filter still
+  // wins for all six: it's applied upstream in `visibleDisplayColumns`.
   // No stability trick needed for `tasksByDisplayColumn`'s per-cell arrays
   // beyond what `visibleTasks.filter(...)` already relied on for the flat
   // board — `Column`'s memo comparator (Column.tsx) compares elements, not
@@ -577,9 +581,17 @@ export default function App() {
         const arr = tasksByDisplayColumn.get(dc);
         if (arr) arr.push(t); else tasksByDisplayColumn.set(dc, [t]);
       }
+      // Cards waiting on a human float to the top of their column. Stable
+      // (relative order preserved within both groups) and identity-preserving
+      // (returns the same array when nothing is waiting), so Column's
+      // element-wise memo comparator keeps bailing out across polls.
+      for (const [dc, arr] of tasksByDisplayColumn) {
+        tasksByDisplayColumn.set(dc, sortWaitingFirst(arr));
+      }
       const project = projects.find((p) => p.path === workdir);
-      const laneVisibleColumns = visibleDisplayColumns.filter(
-        (c) => (tasksByDisplayColumn.get(c.id)?.length ?? 0) > 0,
+      const laneVisibleColumns = filterLaneColumns(
+        visibleDisplayColumns,
+        (id) => (tasksByDisplayColumn.get(id)?.length ?? 0) > 0,
       );
       return {
         workdir,
@@ -597,6 +609,13 @@ export default function App() {
     () => Array.from(new Set(tasks.map((t) => t.agent))),
     [tasks],
   );
+
+  // Attention-strip chip click: focus the board on that one status; clicking
+  // the already-focused chip clears the filter. Drives the same statusFilter
+  // state as KanbanFilters, so the two surfaces can't disagree.
+  const toggleStatusChip = useCallback((id: DisplayColumnId) => {
+    setStatusFilter((cur) => (cur.length === 1 && cur[0] === id ? [] : [id]));
+  }, []);
 
   // Every handler below is wrapped in `useCallback` so it keeps a stable
   // identity across App re-renders (poll ticks, unrelated state changes,
@@ -924,6 +943,11 @@ export default function App() {
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />
+          <AttentionStrip
+            tasks={visibleTasks}
+            statusFilter={statusFilter}
+            onToggleStatus={toggleStatusChip}
+          />
           {/* One swimlane per project, each independently horizontally
               scrolling; the lane list itself scrolls vertically for the
               remaining space — the bottom bar stays anchored regardless of

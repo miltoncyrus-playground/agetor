@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronLeft, Plus, Terminal, Trash2, X } from "lucide-react";
+import { BarChart3, ChevronLeft, Plus, Terminal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
-import { ApiError, api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
+import { ApiError, api, type AccountUsageDay, type HarnessesPayload, type HarnessInput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -11,10 +11,11 @@ import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
-import { abbreviateHome, cn } from "@/lib/utils";
+import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
 import {
   HARNESS_TEMPLATES,
   type AgentKind,
+  type DiscoveredAccount,
   type Harness,
   type HarnessTemplate,
 } from "../../../shared/types.ts";
@@ -272,6 +273,20 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
       return rest;
     });
 
+  const onToggleQuota = async (h: Harness, next: boolean) => {
+    try {
+      await api.setHarnessQuotaEnabled(h.id, next);
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      toast.error(`Couldn't ${next ? "enable" : "disable"} live quota for "${h.label}"`, {
+        description: message,
+        duration: Infinity,
+      });
+    }
+  };
+
   const onToggleEnabled = async (h: Harness) => {
     const next = !h.enabled;
     // Flip the optimistic value first so the Switch animates immediately.
@@ -389,6 +404,7 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
           }
           onDelete={onDeleteHarness}
           onToggleEnabled={onToggleEnabled}
+          onToggleQuota={onToggleQuota}
           onOpenTerminal={onOpenTerminal}
           pendingToggle={pendingToggle}
         />
@@ -459,6 +475,7 @@ function ListView({
   onEdit,
   onDelete,
   onToggleEnabled,
+  onToggleQuota,
   onOpenTerminal,
   pendingToggle,
 }: {
@@ -478,6 +495,8 @@ function ListView({
   onEdit: (h: Harness) => void;
   onDelete: (h: Harness) => void;
   onToggleEnabled: (h: Harness) => void;
+  /** Live-quota opt-in toggle (claude-code rows only). */
+  onToggleQuota: (h: Harness, next: boolean) => void;
   /** Open a new Terminal.app window with this harness's env loaded so the
    *  user can authenticate or inspect it (e.g. `claude /login`). */
   onOpenTerminal: (h: Harness) => void;
@@ -489,6 +508,10 @@ function ListView({
   // Disabled harnesses are excluded from the default-harness picker so a
   // soft-deleted harness can't silently become the default for new tasks.
   const enabledHarnesses = payload.harnesses.filter((h) => h.enabled);
+  // Which harness's per-day usage table is expanded (one at a time — the
+  // table is tall and the dialog is small).
+  const [usageOpenFor, setUsageOpenFor] = useState<string | null>(null);
+  const onToggleUsage = (id: string) => setUsageOpenFor((cur) => (cur === id ? null : id));
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-1">
@@ -542,8 +565,8 @@ function ListView({
             const status = statusByHarness.get(h.id);
             const available = status?.available ?? false;
             return (
+              <div key={h.id} className="space-y-1">
               <div
-                key={h.id}
                 className={cn(
                   "flex items-center gap-2 rounded-md border border-border/60 px-3 py-2",
                   !h.enabled && "opacity-60",
@@ -580,8 +603,41 @@ function ListView({
                     {h.id} · {h.kind}
                     {h.home && <> · HOME={abbreviateHome(h.home, homeDir)}</>}
                     {status?.version && <> · {status.version}</>}
+                    {status?.account && <> · {status.account.email}</>}
+                    {h.kind === "claude-code" && status && !status.account && (
+                      <> · <span className="text-amber-500">not logged in</span></>
+                    )}
                   </div>
+                  {status?.usage && (
+                    <div className="truncate text-[11px] text-muted-foreground">
+                      today {formatTokens(status.usage.today.inputTokens + status.usage.today.outputTokens)} tok
+                      {" "}· 7d {formatTokens(status.usage.last7d.inputTokens + status.usage.last7d.outputTokens)} tok
+                      {" "}({formatTokens(status.usage.last7d.outputTokens)} out)
+                      {status.usage.quota && (
+                        <>
+                          {" "}·{" "}
+                          <span className={cn(Math.max(status.usage.quota.fiveHourPct, status.usage.quota.weeklyPct) >= 80 && "font-medium text-amber-500")}>
+                            5h {Math.round(status.usage.quota.fiveHourPct)}% · wk {Math.round(status.usage.quota.weeklyPct)}%
+                          </span>
+                        </>
+                      )}
+                      {h.quotaEnabled && !status.usage.quota && status.usage.quotaReason && (
+                        <> · <span className="text-amber-500">{status.usage.quotaReason}</span></>
+                      )}
+                    </div>
+                  )}
                 </div>
+                {h.kind === "claude-code" && (
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => onToggleUsage(h.id)}
+                    aria-label={`Token usage for ${h.label}`}
+                    title="Per-day token usage for this harness's account"
+                  >
+                    <BarChart3 className="size-4" />
+                  </Button>
+                )}
                 <Switch
                   checked={pendingToggle[h.id] ?? h.enabled}
                   onCheckedChange={() => onToggleEnabled(h)}
@@ -612,6 +668,13 @@ function ListView({
                   </>
                 )}
               </div>
+              {usageOpenFor === h.id && (
+                <div className="space-y-1.5">
+                  <QuotaToggleRow harness={h} onToggle={onToggleQuota} />
+                  <AccountUsageTable harnessId={h.id} />
+                </div>
+              )}
+              </div>
             );
           })}
         </div>
@@ -620,12 +683,154 @@ function ListView({
   );
 }
 
+/**
+ * The live-quota opt-in, rendered inside the expanded usage panel so the
+ * consent copy has room. The copy states exactly what flipping it on does —
+ * reading the account's credentials file and calling an Anthropic endpoint
+ * is a line agetor never crosses silently.
+ */
+function QuotaToggleRow({ harness, onToggle }: { harness: Harness; onToggle: (h: Harness, next: boolean) => void }) {
+  return (
+    <div className="flex items-start gap-3 rounded-md border border-border/40 bg-muted/20 px-3 py-2">
+      <div className="min-w-0 flex-1">
+        <div className="text-xs font-medium">Live quota (5-hour / weekly limits)</div>
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          When on, agetor reads this account's <code className="font-mono">.credentials.json</code> access
+          token at request time and queries Anthropic's usage endpoint to show limit utilization. The token
+          is never stored or logged and is sent only to api.anthropic.com. When off, nothing leaves this machine.
+        </p>
+      </div>
+      <Switch
+        checked={harness.quotaEnabled}
+        onCheckedChange={() => onToggle(harness, !harness.quotaEnabled)}
+        aria-label={`${harness.quotaEnabled ? "Disable" : "Enable"} live quota for ${harness.label}`}
+      />
+    </div>
+  );
+}
+
+/**
+ * Per-day, per-model token rollup for one harness's account — fetched on
+ * expand, not with the list, since the scan behind it stats every transcript
+ * file. Numbers come from the account's local JSONL history, so they include
+ * CLI sessions outside agetor (the budget shown is the account's).
+ */
+function AccountUsageTable({ harnessId }: { harnessId: string }) {
+  const [days, setDays] = useState<AccountUsageDay[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setDays(null);
+    setError(null);
+    api.getAccountUsage(harnessId)
+      .then((p) => { if (!cancelled) setDays(p.days); })
+      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)); });
+    return () => { cancelled = true; };
+  }, [harnessId]);
+
+  if (error) {
+    return <p className="px-3 text-[11px] text-destructive-foreground">{error}</p>;
+  }
+  if (days === null) {
+    return <p className="px-3 text-[11px] text-muted-foreground">Loading usage…</p>;
+  }
+  if (days.length === 0) {
+    return <p className="px-3 text-[11px] text-muted-foreground">No local usage history for this account (last 30 days).</p>;
+  }
+  return (
+    <div className="max-h-48 overflow-auto rounded-md border border-border/40 bg-muted/20">
+      <table className="w-full text-[11px]">
+        <thead className="sticky top-0 bg-muted/80 text-muted-foreground">
+          <tr>
+            <th className="px-2 py-1 text-left font-medium">Day</th>
+            <th className="px-2 py-1 text-left font-medium">Model</th>
+            <th className="px-2 py-1 text-right font-medium">In</th>
+            <th className="px-2 py-1 text-right font-medium">Out</th>
+            <th className="px-2 py-1 text-right font-medium">Cache w/r</th>
+            <th className="px-2 py-1 text-right font-medium">Msgs</th>
+          </tr>
+        </thead>
+        <tbody>
+          {days.map((d) => (
+            <tr key={`${d.day}:${d.model}`} className="border-t border-border/30">
+              <td className="px-2 py-1 font-mono">{d.day}</td>
+              <td className="max-w-40 truncate px-2 py-1">{d.model}</td>
+              <td className="px-2 py-1 text-right font-mono">{formatTokens(d.inputTokens)}</td>
+              <td className="px-2 py-1 text-right font-mono">{formatTokens(d.outputTokens)}</td>
+              <td className="px-2 py-1 text-right font-mono">
+                {formatTokens(d.cacheWriteTokens)}/{formatTokens(d.cacheReadTokens)}
+              </td>
+              <td className="px-2 py-1 text-right font-mono">{d.messageCount}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Turn a discovered account into a pre-filled editor template. The email
+ *  lands in the label so two claude harnesses stay distinguishable in every
+ *  picker; the config dir becomes the harness home verbatim. */
+function discoveredToTemplate(a: DiscoveredAccount): HarnessTemplate {
+  return {
+    id: `__discovered:${a.configDir}`,
+    label: `Claude (${a.email})`,
+    description: "",
+    kind: "claude-code",
+    suggestedHarnessId: a.suggestedHarnessId,
+    home: a.configDir,
+    bin: null,
+    env: {},
+  };
+}
+
 function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
+  // Existing logged-in Claude config dirs no harness points at yet. Loaded
+  // on open; a failed probe degrades to the static templates only.
+  const [discovered, setDiscovered] = useState<DiscoveredAccount[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    api.discoverAccounts()
+      .then((p) => { if (!cancelled) setDiscovered(p.accounts); })
+      .catch(() => { /* static templates still work */ });
+    return () => { cancelled = true; };
+  }, []);
   return (
     <div className="space-y-2 pt-3">
       <p className="text-xs text-muted-foreground">
         Pick a starting point. You can edit every field before saving.
       </p>
+      {discovered.length > 0 && (
+        <div className="space-y-1.5">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            Detected accounts
+          </p>
+          {discovered.map((a) => (
+            <button
+              key={a.configDir}
+              type="button"
+              onClick={() => onPick(discoveredToTemplate(a))}
+              className={cn(
+                "flex w-full items-start gap-3 rounded-md border border-border/60 px-3 py-2 text-left",
+                "hover:border-primary/60 hover:bg-accent/50",
+              )}
+            >
+              <AgentIcon kind="claude-code" className="mt-0.5 size-4 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium">
+                  Existing Claude account · {a.email}
+                </div>
+                <div className="truncate text-[11px] text-muted-foreground">
+                  {a.configDir}
+                  {a.billingType && <> · {a.billingType}</>}
+                  {" "}· already logged in, no setup needed
+                </div>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
       <div className="space-y-1.5">
         {HARNESS_TEMPLATES.map((t) => {
           const experimental = t.kind === "codex" || t.kind === "gemini";

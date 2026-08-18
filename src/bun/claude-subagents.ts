@@ -623,6 +623,32 @@ function emitLifecycleForRow(sub: Subagent, phase: "started" | "finished" = "fin
  * hold the task hostage forever. Safe to call with no watcher attached, no
  * rows to orphan, or mid-shutdown — this never touches tmux and never throws.
  */
+/**
+ * True when any of this task's still-`running` subagents has written to its
+ * transcript within the last `withinMs`. The turn-stall watchdog's veto: a
+ * main JSONL going quiet while background agents are actively working is
+ * normal (the parent turn is just waiting on them), not a wedge. Cheap —
+ * one `statSync` per running row, and only consulted once the main JSONL is
+ * already past the stall threshold (the rare tick). A row whose file/dir
+ * can't be stat'ed counts as not-fresh rather than throwing.
+ */
+export function subagentActivityWithin(taskId: string, withinMs: number): boolean {
+  let rows: Subagent[];
+  try {
+    rows = subagentsDb.listForTask(taskId);
+  } catch {
+    return false;
+  }
+  const now = Date.now();
+  for (const row of rows) {
+    if (row.status !== "running" || !row.sourcePath) continue;
+    try {
+      if (now - statSync(row.sourcePath).mtimeMs < withinMs) return true;
+    } catch { /* vanished / unreadable — not fresh */ }
+  }
+  return false;
+}
+
 export function orphanRunningSubagents(taskId: string): void {
   let rows: Subagent[];
   try {

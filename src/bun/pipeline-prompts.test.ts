@@ -2,10 +2,13 @@ import { test, expect } from "bun:test";
 import {
   parsePipelineVerdict,
   parseBuildPlan,
+  parseSpecAcceptanceCriteria,
+  analyzeCoverage,
   childBuildPrompt,
   stagePrompt,
   PIPELINE_PLAN_FILE,
-  PIPELINE_BUILD_PLAN_FILE,
+  PIPELINE_TASKS_FILE,
+  PIPELINE_SPEC_FILE,
   PIPELINE_VERDICT_PREFIX,
 } from "./pipeline-prompts.ts";
 import type { Task } from "../shared/types.ts";
@@ -179,15 +182,36 @@ test("stagePrompt: code-review instructs reviewing the actual diff against baseR
   expect(p.toLowerCase()).toContain("do not run the test suite");
 });
 
-test("stagePrompt: pre-builder shows the BUILD_PLAN.json schema and instructs a commit, no verdict instruction", () => {
-  const p = stagePrompt(task({ pipelineStage: "pre-builder" }), "pre-builder");
+test("stagePrompt: decompose shows the TASKS.json schema and instructs a commit, no verdict instruction", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
   expect(p).toContain(PIPELINE_PLAN_FILE);
-  expect(p).toContain(PIPELINE_BUILD_PLAN_FILE);
+  expect(p).toContain(PIPELINE_TASKS_FILE);
   expect(p).toContain("\"subtasks\"");
   expect(p).toContain("\"dependsOn\"");
   expect(p.toLowerCase()).toContain("commit");
   expect(p.toLowerCase()).toContain("do not push");
   expect(p).not.toContain(PIPELINE_VERDICT_PREFIX);
+});
+
+test("stagePrompt: decompose prohibits phantom AC ids", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
+  expect(p).toContain("Do NOT invent or guess AC ids");
+});
+
+test("stagePrompt: decompose on a fresh pass has no revision-context block", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose", revisionCount: 0, pipelineFeedback: null }), "decompose");
+  expect(p).not.toContain("revision pass");
+});
+
+test("stagePrompt: decompose on a revision pass injects the error and instructs targeted fix", () => {
+  const p = stagePrompt(
+    task({ pipelineStage: "decompose", revisionCount: 1, pipelineFeedback: '"AC-99" does not exist in SPEC.md' }),
+    "decompose",
+  );
+  expect(p).toContain("revision pass #1");
+  expect(p).toContain('"AC-99" does not exist in SPEC.md');
+  expect(p).toContain("Fix ONLY");
+  expect(p).toContain("Remove any id not in that list");
 });
 
 // --- parseBuildPlan -----------------------------------------------------------
@@ -278,13 +302,245 @@ test("parseBuildPlan: a subtask missing a prompt is rejected", () => {
 test("childBuildPrompt: folds in the subtask's own prompt, points at PLAN.md, requires a local commit, forbids push", () => {
   const p = childBuildPrompt(
     task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
-    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [] },
+    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [], acceptanceCriteria: [] },
   );
   expect(p).toContain("Add a toggle component to settings.");
   expect(p).toContain(PIPELINE_PLAN_FILE);
-  expect(p).toContain("Add dark mode"); // parent ticket folded in for context
+  // The raw ticket is deliberately NOT folded in — PLAN.md supersedes it by
+  // this stage, and every fixed byte pushes the prompt toward the fragile
+  // deferred-paste path (see the childBuildPrompt doc comment).
+  expect(p).not.toContain("Add dark mode");
   expect(p.toLowerCase()).toContain("commit");
   expect(p.toLowerCase()).toContain("do not push");
   expect(p.toLowerCase()).toContain("do not open a pull request");
   expect(p).toContain('"feature:');
+});
+
+test("childBuildPrompt: references owned ACs by id and points at SPEC.md for their text", () => {
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
+    { id: "toggle", title: "Add the toggle", prompt: "Do the thing.", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2"] },
+  );
+  expect(p).toContain("AC-1");
+  expect(p).toContain("AC-2");
+  expect(p).toContain(PIPELINE_SPEC_FILE);
+});
+
+test("childBuildPrompt: fixed overhead stays well inside the claude argv budget", () => {
+  // subtask.prompt is agent-authored and unbounded, but everything ELSE in
+  // the child prompt is ours — keep the fixed template comfortably under
+  // half of CLAUDE_PROMPT_ARGV_MAX_BYTES (4096) so a reasonably-sized
+  // subtask prompt still ships via argv instead of the deferred-paste path.
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "x".repeat(2000) }),
+    { id: "s", title: "T", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2", "AC-3"] },
+  );
+  expect(Buffer.byteLength(p, "utf8")).toBeLessThan(2048);
+});
+
+// --- parseSpecAcceptanceCriteria -----------------------------------------------
+
+test("parseSpecAcceptanceCriteria: extracts AC ids in order, deduplicating", () => {
+  const raw = "## Acceptance criteria\nAC-1: It works.\nAC-2: It's fast.\nAC-1: (duplicate — ignored)";
+  expect(parseSpecAcceptanceCriteria(raw)).toEqual(["AC-1", "AC-2"]);
+});
+
+test("parseSpecAcceptanceCriteria: returns empty array when no AC-N lines are present", () => {
+  expect(parseSpecAcceptanceCriteria("# Spec\n\nNo criteria here.")).toEqual([]);
+});
+
+test("parseSpecAcceptanceCriteria: sorts numerically (AC-10 after AC-9, not after AC-1)", () => {
+  const raw = "AC-10: x\nAC-2: y\nAC-1: z";
+  expect(parseSpecAcceptanceCriteria(raw)).toEqual(["AC-1", "AC-2", "AC-10"]);
+});
+
+test("parseSpecAcceptanceCriteria: leading whitespace is tolerated", () => {
+  expect(parseSpecAcceptanceCriteria("  AC-3: indented")).toEqual(["AC-3"]);
+});
+
+// --- analyzeCoverage -----------------------------------------------------------
+
+test("analyzeCoverage: all ACs covered returns ok", () => {
+  const plan = {
+    subtasks: [
+      { id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: ["AC-1"] },
+      { id: "b", title: "B", prompt: "do b", dependsOn: [], acceptanceCriteria: ["AC-2", "AC-3"] },
+    ],
+  };
+  expect(analyzeCoverage(["AC-1", "AC-2", "AC-3"], plan)).toEqual({ ok: true });
+});
+
+test("analyzeCoverage: an unclaimed AC id returns a gap error", () => {
+  const plan = {
+    subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-1"] }],
+  };
+  const result = analyzeCoverage(["AC-1", "AC-2"], plan);
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toContain("AC-2");
+});
+
+test("analyzeCoverage: a phantom AC id (in subtask but not in spec) returns a phantom error", () => {
+  const plan = {
+    subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-99"] }],
+  };
+  const result = analyzeCoverage(["AC-1"], plan);
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toContain("AC-99");
+    expect(result.reason).toContain("AC-1"); // also a gap
+  }
+});
+
+test("analyzeCoverage: empty spec ACs with empty subtask ACs returns ok", () => {
+  const plan = { subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: [] }] };
+  expect(analyzeCoverage([], plan)).toEqual({ ok: true });
+});
+
+// --- stagePrompt: new SDD stages -----------------------------------------------
+
+test("stagePrompt: specify mentions SPEC.md, AC format, and the ticket title", () => {
+  const p = stagePrompt(task({ pipelineStage: "specify" }), "specify");
+  expect(p).toContain(PIPELINE_SPEC_FILE);
+  expect(p).toContain("AC-1:");
+  expect(p).toContain("Add a dark mode toggle to settings."); // ticket prompt appears in the block
+  expect(p).not.toContain(PIPELINE_VERDICT_PREFIX);
+});
+
+test("stagePrompt: specify folds in the constitution when provided", () => {
+  const p = stagePrompt(task({ pipelineStage: "specify" }), "specify", "## Project principles\nAlways write tests.");
+  expect(p).toContain("Always write tests.");
+});
+
+test("stagePrompt: clarify mentions SPEC.md and the ask_user tool", () => {
+  const p = stagePrompt(task({ pipelineStage: "clarify" }), "clarify");
+  expect(p).toContain(PIPELINE_SPEC_FILE);
+  expect(p).toContain("ask_user");
+  expect(p).not.toContain(PIPELINE_VERDICT_PREFIX);
+});
+
+test("stagePrompt: analyze returns empty string (no agent turn)", () => {
+  const p = stagePrompt(task({ pipelineStage: "analyze" }), "analyze");
+  expect(p).toBe("");
+});
+
+// --- S3: ticket block only in early stages ------------------------------------
+
+test("stagePrompt: specify embeds ticket (early stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "specify" }), "specify");
+  expect(p).toContain("Add a dark mode toggle to settings.");
+});
+
+test("stagePrompt: clarify embeds ticket (early stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "clarify" }), "clarify");
+  expect(p).toContain("Add a dark mode toggle to settings.");
+});
+
+test("stagePrompt: planning embeds ticket (early stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "planning" }), "planning");
+  expect(p).toContain("Add a dark mode toggle to settings.");
+});
+
+test("stagePrompt: plan-review embeds ticket (early stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "plan-review" }), "plan-review");
+  expect(p).toContain("Add a dark mode toggle to settings.");
+});
+
+test("stagePrompt: decompose does NOT embed the raw ticket (late stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
+  expect(p).not.toContain("Add a dark mode toggle to settings.");
+  expect(p).not.toContain("## Original ticket");
+});
+
+test("stagePrompt: building does NOT embed the raw ticket (late stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "building" }), "building");
+  expect(p).not.toContain("Add a dark mode toggle to settings.");
+  expect(p).not.toContain("## Original ticket");
+});
+
+test("stagePrompt: code-review does NOT embed the raw ticket (late stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "code-review", baseRef: "abc123" }), "code-review");
+  expect(p).not.toContain("Add a dark mode toggle to settings.");
+  expect(p).not.toContain("## Original ticket");
+});
+
+test("stagePrompt: testing does NOT embed the raw ticket (late stage)", () => {
+  const p = stagePrompt(task({ pipelineStage: "testing", branch: "feature/dark-mode" }), "testing");
+  expect(p).not.toContain("Add a dark mode toggle to settings.");
+  expect(p).not.toContain("## Original ticket");
+});
+
+// --- S4: compact verdict prompts ----------------------------------------------
+
+test("stagePrompt: plan-review requests bullet-point output, not paragraphs", () => {
+  const p = stagePrompt(task({ pipelineStage: "plan-review" }), "plan-review");
+  expect(p).toContain("bullet");
+  expect(p.toLowerCase()).toContain("concise");
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} approve`);
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} revise`);
+});
+
+test("stagePrompt: code-review requests bullet-point output, not paragraphs", () => {
+  const p = stagePrompt(task({ pipelineStage: "code-review", baseRef: "abc123" }), "code-review");
+  expect(p).toContain("bullet");
+  expect(p.toLowerCase()).toContain("concise");
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} approve`);
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} revise`);
+});
+
+// --- revision-context injection (anti-moving-goalposts) -----------------------
+
+test("stagePrompt: plan-review on a fresh pass has no revision-context block", () => {
+  const p = stagePrompt(task({ pipelineStage: "plan-review", revisionCount: 0, pipelineFeedback: null }), "plan-review");
+  expect(p).not.toContain("revision pass");
+  expect(p).not.toContain("previous feedback");
+});
+
+test("stagePrompt: plan-review on a revision pass injects prior feedback and narrows scope", () => {
+  const p = stagePrompt(
+    task({ pipelineStage: "plan-review", revisionCount: 1, pipelineFeedback: "missing rollback plan" }),
+    "plan-review",
+  );
+  expect(p).toContain("revision pass #1");
+  expect(p).toContain("missing rollback plan");
+  expect(p).toContain("CHECK ONLY");
+  expect(p).toContain("Do NOT raise new concerns");
+});
+
+test("stagePrompt: plan-review with revisionCount>0 but null feedback produces no revision block (not a bounce)", () => {
+  const p = stagePrompt(task({ pipelineStage: "plan-review", revisionCount: 1, pipelineFeedback: null }), "plan-review");
+  expect(p).not.toContain("revision pass");
+});
+
+test("stagePrompt: code-review on a fresh pass has no revision-context block", () => {
+  const p = stagePrompt(task({ pipelineStage: "code-review", baseRef: "abc123", revisionCount: 0, pipelineFeedback: null }), "code-review");
+  expect(p).not.toContain("revision pass");
+  expect(p).not.toContain("previous feedback");
+});
+
+test("stagePrompt: code-review on a revision pass injects prior feedback and narrows scope", () => {
+  const p = stagePrompt(
+    task({ pipelineStage: "code-review", baseRef: "abc123", revisionCount: 2, pipelineFeedback: "error path swallows exception" }),
+    "code-review",
+  );
+  expect(p).toContain("revision pass #2");
+  expect(p).toContain("error path swallows exception");
+  expect(p).toContain("CHECK ONLY");
+  expect(p).toContain("Do NOT raise new concerns");
+});
+
+test("stagePrompt: testing on a fresh pass has no revision-context block", () => {
+  const p = stagePrompt(task({ pipelineStage: "testing", branch: "feature/x", revisionCount: 0, pipelineFeedback: null }), "testing");
+  expect(p).not.toContain("retry pass");
+  expect(p).not.toContain("previous failure");
+});
+
+test("stagePrompt: testing on a retry pass injects prior failure and narrows scope", () => {
+  const p = stagePrompt(
+    task({ pipelineStage: "testing", branch: "feature/x", revisionCount: 1, pipelineFeedback: "3 type errors in settings.ts" }),
+    "testing",
+  );
+  expect(p).toContain("retry pass #1");
+  expect(p).toContain("3 type errors in settings.ts");
+  expect(p).toContain("CHECK ONLY");
+  expect(p).toContain("Do NOT fail on new issues");
 });

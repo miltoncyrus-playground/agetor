@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
 import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import { isAwaitingHandBack, isGateParked } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -80,11 +81,20 @@ type TaskRow = {
   implementation_approved: number;
   revision_count: number;
   pipeline_feedback: string | null;
+  pipeline_bounce_fingerprint: string | null;
   paused_at: number | null;
   block_reason: string | null;
   parent_task_id: string | null;
   plan_subtask_id: string | null;
   child_merge_status: string | null;
+  /** Status of the run `run_id` points at (correlated subquery in
+   *  TASKS_SELECT) — feeds the derived `awaitingHandBack`. Missing on
+   *  code paths that don't join (insert fallback). */
+  current_run_status?: string | null;
+  /** Origin of the run `run_id` points at (same correlated subquery shape as
+   *  `current_run_status`) — feeds the derived `gateParked`, whose predicate
+   *  needs to distinguish a stage run from a conversation turn. */
+  current_run_origin?: string | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
    *  a correlated subquery in `list` / `get` — see those for the full SQL. */
   has_openable_run?: number;
@@ -207,11 +217,31 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   implementationApproved: r.implementation_approved === 1,
   revisionCount: r.revision_count,
   pipelineFeedback: r.pipeline_feedback,
+  pipelineBounceFingerprint: r.pipeline_bounce_fingerprint,
   pausedAt: r.paused_at,
   blockReason: r.block_reason as Task["blockReason"],
   parentTaskId: r.parent_task_id,
   planSubtaskId: r.plan_subtask_id,
   childMergeStatus: r.child_merge_status as Task["childMergeStatus"],
+  awaitingHandBack: isAwaitingHandBack(
+    {
+      parentTaskId: r.parent_task_id,
+      childMergeStatus: r.child_merge_status as Task["childMergeStatus"],
+      archivedAt: r.archived_at,
+    },
+    r.current_run_status ?? null,
+  ),
+  gateParked: isGateParked(
+    {
+      parentTaskId: r.parent_task_id,
+      pipelineStage: r.pipeline_stage as Task["pipelineStage"],
+      archivedAt: r.archived_at,
+      pausedAt: r.paused_at,
+      column: r.column as Task["column"],
+    },
+    r.current_run_status ?? null,
+    r.current_run_origin ?? null,
+  ),
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -219,7 +249,9 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
 // exists for the task, 0 otherwise (NULL coalesces to 0 via COALESCE).
 const TASKS_SELECT = `
   SELECT tasks.*,
-         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run
+         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run,
+         (SELECT status FROM runs WHERE runs.id = tasks.run_id) AS current_run_status,
+         (SELECT origin FROM runs WHERE runs.id = tasks.run_id) AS current_run_origin
     FROM tasks
     LEFT JOIN runs ON runs.task_id = tasks.id
 `;
@@ -252,9 +284,9 @@ export const tasks = {
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, refs, backlog, draft,
           run_id, created_at, updated_at, archived_at,
-          pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, paused_at,
+          pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, pipeline_bounce_fingerprint, paused_at,
           block_reason, parent_task_id, plan_subtask_id, child_merge_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -264,7 +296,7 @@ export const tasks = {
         t.draft ? JSON.stringify(t.draft) : null,
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
         t.pipelineStage ?? null, t.planApproved ? 1 : 0, t.implementationApproved ? 1 : 0,
-        t.revisionCount ?? 0, t.pipelineFeedback ?? null, t.pausedAt ?? null,
+        t.revisionCount ?? 0, t.pipelineFeedback ?? null, t.pipelineBounceFingerprint ?? null, t.pausedAt ?? null,
         t.blockReason ?? null, t.parentTaskId ?? null, t.planSubtaskId ?? null, t.childMergeStatus ?? null,
       ],
     );
@@ -282,7 +314,7 @@ export const tasks = {
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
          branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, refs=?, backlog=?, draft=?,
          run_id=?, updated_at=?, archived_at=?,
-         pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, paused_at=?,
+         pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, pipeline_bounce_fingerprint=?, paused_at=?,
          block_reason=?, parent_task_id=?, plan_subtask_id=?, child_merge_status=?
        WHERE id=?`,
       [
@@ -294,7 +326,7 @@ export const tasks = {
         next.draft ? JSON.stringify(next.draft) : null,
         next.runId, next.updatedAt, next.archivedAt ?? null,
         next.pipelineStage ?? null, next.planApproved ? 1 : 0, next.implementationApproved ? 1 : 0,
-        next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pausedAt ?? null,
+        next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pipelineBounceFingerprint ?? null, next.pausedAt ?? null,
         next.blockReason ?? null, next.parentTaskId ?? null, next.planSubtaskId ?? null, next.childMergeStatus ?? null, id,
       ],
     );
@@ -517,6 +549,7 @@ type HarnessRow = {
   bin: string | null;
   env_json: string;
   enabled: number;
+  quota_enabled: number;
   created_at: number;
   updated_at: number;
 };
@@ -540,6 +573,7 @@ const toHarness = (r: HarnessRow): Harness => {
     bin: r.bin,
     env,
     enabled: r.enabled === 1,
+    quotaEnabled: r.quota_enabled === 1,
   };
 };
 
@@ -612,6 +646,7 @@ export const harnesses = {
         bin: null,
         env: {},
         enabled: true,
+        quotaEnabled: false,
       } satisfies Harness;
     }
     return null;
@@ -693,6 +728,19 @@ export const harnesses = {
     db.run(
       `UPDATE harnesses SET enabled = ?, updated_at = ? WHERE id = ?`,
       [enabled ? 1 : 0, Date.now(), id],
+    );
+    return this.get(id) as Harness;
+  },
+  /**
+   * Live-quota opt-in toggle. Same built-in carve-out as `setEnabled` — the
+   * default account is exactly the one most users want quota for.
+   */
+  setQuotaEnabled(id: string, quotaEnabled: boolean): Harness {
+    const current = this.get(id);
+    if (!current) throw new Error(`harness not found: ${id}`);
+    db.run(
+      `UPDATE harnesses SET quota_enabled = ?, updated_at = ? WHERE id = ?`,
+      [quotaEnabled ? 1 : 0, Date.now(), id],
     );
     return this.get(id) as Harness;
   },

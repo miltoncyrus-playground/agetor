@@ -26,6 +26,31 @@ export const DISPLAY_COLUMNS: { id: DisplayColumnId; label: string; dotClass: st
   { id: "done", label: "Done", dotClass: "bg-slate-400" },
 ];
 
+/**
+ * All six display columns render on every lane, empty or not — an empty
+ * column shrinks to a slim stub (Column.tsx) instead of disappearing, so
+ * the board geometry is stable and every column is always a drop target.
+ * Kept as a set (rather than deleting the auto-hide seam entirely) so a
+ * future column can opt back into auto-hide by omission.
+ */
+export const ALWAYS_VISIBLE_DISPLAY_COLUMNS: ReadonlySet<DisplayColumnId> =
+  new Set(["backlog", "ready", "in-progress", "blocked", "review", "done"]);
+
+/**
+ * Per-lane column visibility: keep a column when it's always-visible OR it
+ * has at least one task in this lane. With every column currently in the
+ * always-visible set this passes its input through — the seam stays because
+ * `visible` must already have the user's explicit status filter applied
+ * (App.tsx's `visibleDisplayColumns`), which is what makes the filter win:
+ * a status the user filtered out never reaches here.
+ */
+export function filterLaneColumns<T extends { id: DisplayColumnId }>(
+  visible: T[],
+  hasTasks: (id: DisplayColumnId) => boolean,
+): T[] {
+  return visible.filter((c) => ALWAYS_VISIBLE_DISPLAY_COLUMNS.has(c.id) || hasTasks(c.id));
+}
+
 const DISPLAY_COLUMN_BY_ID = new Map(DISPLAY_COLUMNS.map((c) => [c.id, c]));
 
 export function displayColumnMeta(id: DisplayColumnId) {

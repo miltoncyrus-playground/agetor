@@ -5,6 +5,7 @@ import type {
   BranchInfo,
   BranchNamingConfig,
   ColumnId,
+  DiscoveredAccount,
   GlobalEvent,
   GitHubItemKind,
   GitHubItemState,
@@ -325,6 +326,17 @@ export interface TaskEventsPage {
 }
 
 export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
+/** One day × model row of an account's local token rollup. */
+export interface AccountUsageDay {
+  day: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  messageCount: number;
+}
+export interface AccountUsagePayload { configDir: string; days: AccountUsageDay[] }
 export interface HarnessInput {
   id: string;
   kind: AgentKind;
@@ -370,8 +382,26 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ enabled }),
     }),
+  /** Live-quota opt-in (claude-code only; toggleable on built-ins too). */
+  setHarnessQuotaEnabled: (id: string, quotaEnabled: boolean) =>
+    j<Harness>(`/harnesses/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ quotaEnabled }),
+    }),
   getHarnessUsage: (id: string) =>
     j<HarnessUsage>(`/harnesses/${encodeURIComponent(id)}/usage`),
+  /** Hand a build child's finished work back to the pipeline: parks it
+   *  merge-deferred and ticks the parent's build (deterministic merge, no
+   *  new agent turn). 409s when the child isn't in the awaiting-hand-back
+   *  state anymore. Returns the updated Task. */
+  handBackChild: (id: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(id)}/hand-back`, { method: "POST" }),
+  /** Existing logged-in Claude config dirs no harness points at yet —
+   *  rendered by the Add-harness picker as one-click account entries. */
+  discoverAccounts: () => j<{ accounts: DiscoveredAccount[] }>("/harness-discovery"),
+  /** Daily per-model token rollup for a claude-code harness's account. */
+  getAccountUsage: (id: string) =>
+    j<AccountUsagePayload>(`/harnesses/${encodeURIComponent(id)}/account-usage`),
   openHarnessTerminal: (id: string) =>
     j<{ ok: true }>(`/harnesses/${encodeURIComponent(id)}/open-terminal`, {
       method: "POST",
@@ -386,6 +416,15 @@ export const api = {
     }),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  /** Clone a GitHub repo and register it as a project. `dest` defaults
+   *  server-side to ~/<repo>. Unless `eli5` is false, the server also creates
+   *  and starts a task that writes an ELI5.md explainer at the clone's root;
+   *  `eli5Error` carries a non-fatal failure of that step. */
+  cloneProject: (url: string, dest?: string, eli5?: boolean) =>
+    j<{ project: Project; eli5TaskId: string | null; eli5Error: string | null }>(
+      "/projects/clone",
+      { method: "POST", body: JSON.stringify({ url, dest, eli5 }) },
+    ),
   renameProject: (p: string, name: string) =>
     j<Project>("/projects", { method: "PATCH", body: JSON.stringify({ path: p, name }) }),
   /** Per-project branch nomenclature. GET resolves to built-in defaults when the
@@ -1133,6 +1172,7 @@ export const api = {
    *  stage auto-spawns once the current one resolves. */
   pausePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-pause`, { method: "POST" }),
   resumePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-resume`, { method: "POST" }),
+  overridePipelineGate: (id: string) => j<Task>(`/tasks/${id}/pipeline-override`, { method: "POST" }),
 
   /** Every git worktree materialized on disk under `dataDir/worktrees/`,
    *  cross-referenced against the tasks table. Drives the Worktrees page. */

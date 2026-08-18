@@ -1,8 +1,11 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import { TMUX_MISSING_REASON, type AgentKind, type Harness, type HarnessStatus } from "../shared/types.ts";
+import { TMUX_MISSING_REASON, type AgentKind, type ClaudeAccount, type Harness, type HarnessStatus } from "../shared/types.ts";
 import { resolveBin, harnessEnv } from "./agents.ts";
 import { harnesses } from "./db.ts";
+import { accountUsageSummary } from "./account-usage.ts";
+import { effectiveClaudeConfigDir, readClaudeAccount } from "./harness-discovery.ts";
+import { fetchQuota } from "./quota.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
 
 const VERSION_PROBE_TIMEOUT_MS = 2000;
@@ -68,9 +71,32 @@ function resolveBinPath(bin: string): string | null {
  */
 const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian/Ubuntu)";
 
+/**
+ * Account identity + local usage rollup for a claude-code harness — attached
+ * to every status shape (including the unavailable ones: "claude missing but
+ * the account dir is logged in" is still useful in Settings). Other kinds
+ * get nulls; their auth files are a separate follow-up. Live quota is
+ * overlaid only when the harness opted in (`quotaEnabled`) — that flag is
+ * the user's explicit consent for the credentials read + network call, and
+ * `fetchQuota` degrades to a reason string rather than ever failing the
+ * status probe.
+ */
+async function claudeAccountFields(harness: Harness): Promise<{ account: ClaudeAccount | null; usage: HarnessStatus["usage"] }> {
+  if (harness.kind !== "claude-code") return { account: null, usage: null };
+  const configDir = effectiveClaudeConfigDir(harness.home);
+  const usage = accountUsageSummary(configDir);
+  if (harness.quotaEnabled) {
+    const { quota, reason } = await fetchQuota(configDir);
+    usage.quota = quota;
+    usage.quotaReason = reason;
+  }
+  return { account: readClaudeAccount(configDir), usage };
+}
+
 export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
   const bin = resolveBin(harness);
   const path = resolveBinPath(bin);
+  const accountFields = await claudeAccountFields(harness);
   if (!path) {
     return {
       harnessId: harness.id,
@@ -81,6 +107,7 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
       version: null,
       reason: `\`${bin}\` not found on PATH`,
       installHint: INSTALL_HINTS[harness.kind],
+      ...accountFields,
     };
   }
 
@@ -96,6 +123,7 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
         version: null,
         reason: TMUX_MISSING_REASON,
         installHint: TMUX_INSTALL_HINT,
+        ...accountFields,
       };
     }
 
@@ -116,6 +144,7 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
     version,
     reason: null,
     installHint: null,
+    ...accountFields,
   };
 }
 

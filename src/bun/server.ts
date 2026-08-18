@@ -18,8 +18,12 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, pausePipelineTask, reconcileTaskSession, resumePipelineTask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, handBackChild, listWorktrees, startTask, cancelRun, overridePipelineGate, pausePipelineTask, reconcileTaskSession, resumePipelineTask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { stalledSince } from "./stall-registry.ts";
+import { accountUsageDays } from "./account-usage.ts";
+import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
+import { buildEli5Prompt, cloneRepo, defaultCloneDest, eli5TaskTitle, parseGitHubRepo } from "./clone.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
   buildHarnessTerminalCommand,
@@ -221,7 +225,10 @@ const PREVIEW_CONTENT_TYPES: Record<string, string> = {
 // query instead of calling this per row.
 function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   const runningSubagents = subagents.listForTask(t.id).filter((s) => s.status === "running").length;
-  return { ...t, runningSubagents };
+  // `stalledSince` rides the same decoration: transient in-memory server
+  // state (the turn-stall watchdog's mark) that the DB-derived Task can't
+  // carry — see stall-registry.ts.
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -559,6 +566,68 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
         // Removal-by-path lives on `DELETE /projects` (used by both the webview
         // and the CLI); /projects/pick is the native add-picker only.
+      },
+
+      // Checkout an existing GitHub repo as a new project: clone it, register
+      // the destination in the projects list, and (unless eli5:false) create +
+      // start a claude-code task that writes an ELI5.md explainer at the clone's
+      // root. The explainer goes through agetor's own agent driver — never a
+      // direct LLM API call — so it shows up on the board like any other task.
+      "/projects/clone": {
+        POST: authed(async (req) => {
+          // Clones are network-bound and can take minutes; disable the
+          // per-request idle timeout like /tasks/:id/start does.
+          server.timeout(req, 0);
+          const body = (await req.json().catch(() => ({}))) as {
+            url?: unknown;
+            dest?: unknown;
+            eli5?: unknown;
+          };
+          const url = typeof body.url === "string" ? body.url.trim() : "";
+          if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
+          const parsed = parseGitHubRepo(url);
+          if (!parsed) {
+            return json(
+              { error: `not a GitHub repo — use https://github.com/owner/repo, git@github.com:owner/repo.git, or owner/repo` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const dest =
+            typeof body.dest === "string" && body.dest.trim()
+              ? body.dest.trim()
+              : defaultCloneDest(parsed.repo);
+          if (!path.isAbsolute(dest)) {
+            return json({ error: "dest must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const cloned = await cloneRepo(parsed.cloneUrl, dest);
+          if (!cloned.ok) {
+            return json({ error: cloned.error }, { status: 502, headers: corsHeaders(req) });
+          }
+          const project = projects.upsert(dest, parsed.repo);
+
+          // The explainer task runs with isolation "none" so ELI5.md lands
+          // directly in the clone the user just registered, not on a branch in
+          // a worktree. Task-creation failure downgrades the response, never
+          // rolls back the clone — the project is already usable.
+          let eli5TaskId: string | null = null;
+          let eli5Error: string | null = null;
+          if (body.eli5 !== false) {
+            const created = await createTask({
+              title: eli5TaskTitle(parsed.repo),
+              prompt: buildEli5Prompt(parsed.repo),
+              workdir: dest,
+              isolation: "none",
+            });
+            if ("error" in created) {
+              eli5Error = created.error;
+            } else {
+              eli5TaskId = created.task.id;
+              const started = await startTask(created.task.id);
+              if ("error" in started) eli5Error = started.error;
+            }
+          }
+          return json({ project, eli5TaskId, eli5Error }, { headers: corsHeaders(req) });
+        }),
       },
 
       "/projects/branches": {
@@ -2801,6 +2870,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.enabled === "boolean") {
             harnesses.setEnabled(req.params.id, body.enabled);
           }
+          // `quotaEnabled` is the second carve-out (same rationale as
+          // `enabled`): the live-quota opt-in must be togglable on the
+          // built-in claude-code harness — the default account is exactly
+          // the one most users want to watch. claude-code only; the flag is
+          // meaningless for other kinds and accepting it would imply support.
+          if (typeof body.quotaEnabled === "boolean") {
+            if (current.kind !== "claude-code") {
+              return json(
+                { error: "quotaEnabled is only supported on claude-code harnesses" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            harnesses.setQuotaEnabled(req.params.id, body.quotaEnabled);
+          }
           if (!hasConfigPatch) {
             return json(harnesses.get(req.params.id), { headers: corsHeaders(req) });
           }
@@ -2859,6 +2942,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Existing Claude config dirs (`~/.claude*` + CLAUDE_CONFIG_DIR) with a
+      // logged-in account that no registered harness points at yet — the
+      // Add-harness picker renders these as one-click "use existing account"
+      // entries. Identity fields only; never tokens or account uuids.
+      "/harness-discovery": {
+        GET: authed((req) => {
+          const registeredHomes = harnesses.list()
+            .filter((h) => h.kind === "claude-code")
+            .map((h) => h.home);
+          return json(
+            { accounts: discoverClaudeAccounts(registeredHomes) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
       // Blast-radius probe for the disable-confirmation UI. Returns the
       // running task ids (so we can warn "N tasks are still using this")
       // plus the total task count for context.
@@ -2869,6 +2968,30 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           return json(harnesses.usage(req.params.id), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Daily per-model token rollups for the harness's ACCOUNT (config dir),
+      // for the Settings drill-down. Distinct from `/harnesses/:id/usage`
+      // above, which reports task counts — do not overload that route.
+      // claude-code only: other kinds have no local usage source wired yet.
+      "/harnesses/:id/account-usage": {
+        GET: authed((req) => {
+          const h = harnesses.getByIdOrKind(req.params.id);
+          if (!h) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (h.kind !== "claude-code") {
+            return json(
+              { error: "account usage is only available for claude-code harnesses" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const configDir = effectiveClaudeConfigDir(h.home);
+          return json(
+            { configDir, days: accountUsageDays(configDir) },
+            { headers: corsHeaders(req) },
+          );
         }),
       },
 
@@ -3023,7 +3146,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const counts = subagents.runningCountsByTask();
           return json(
-            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0 })),
+            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0, stalledSince: stalledSince(t.id) })),
             { headers: corsHeaders(req) },
           );
         }),
@@ -3199,6 +3322,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Explicit hand-back of a build child's finished work: parks the child
+      // as merge-deferred and ticks the parent's build so the deterministic
+      // merge (and, if that was the last subtask, the stage advance) runs.
+      // 409 on guard failures — the button-visible state may have gone stale
+      // between the poll and the click.
+      "/tasks/:id/hand-back": {
+        POST: authed(async (req) => {
+          const result = await handBackChild(req.params.id);
+          return "error" in result
+            ? json(result, { status: 409, headers: corsHeaders(req) })
+            : json(tasks.get(req.params.id), { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
           // Worktree teardown can now be awaited inline (`awaitTeardown`)
@@ -3266,6 +3403,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         POST: authed(async (req) => {
           server.timeout(req, 0);
           const result = await resumePipelineTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+      // Explicit human override of the current pipeline gate — advances
+      // exactly one stage and records a durable audit status event. This is
+      // the ONLY way to force a gate: advancePipelineStage's provenance gate
+      // means a verdict line typed into a conversation turn no longer moves
+      // the pipeline. 400 on artifact-gated stages (nothing to overrule).
+      "/tasks/:id/pipeline-override": {
+        POST: authed((req) => {
+          const result = overridePipelineGate(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });

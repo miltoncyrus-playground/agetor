@@ -1,6 +1,6 @@
 export type ColumnId =
   | "backlog" | "ready" | "running" | "blocked" | "review" | "done"
-  | "planning" | "plan-review" | "pre-builder" | "building" | "code-review" | "testing";
+  | "specify" | "clarify" | "planning" | "plan-review" | "decompose" | "analyze" | "building" | "code-review" | "testing";
 
 /**
  * The exact `HarnessStatus.reason` string the server emits when claude-code
@@ -20,6 +20,28 @@ export const TMUX_MISSING_REASON = "tmux is required to drive claude-code intera
 export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
 
 /**
+ * Sentinel prefix for the `status` chunk claude-tmux's turn-stall watchdog
+ * emits when a turn is in flight but the session's JSONL transcript has been
+ * silent past `AGETOR_TURN_STALL_MS` (default 10 min) with no subagent
+ * activity either — the signature of an interactive TUI dialog the pane
+ * scraper's matchers don't know (2dot2dot incident 2026-08-15: an
+ * `/auto-mode-setup` wizard froze a code-review turn for 13 minutes while
+ * the card showed a healthy green "running"). Unlike the death/API-error
+ * sentinels this does NOT settle the turn or move the card — the session is
+ * alive, just possibly wedged — it only marks the task "may be stuck"
+ * (orchestrator's stall registry → `Task.stalledSince` → amber card state)
+ * until activity resumes or the turn ends. */
+export const TURN_STALLED_STATUS_PREFIX = "turn stalled: ";
+
+/**
+ * Companion sentinel to {@link TURN_STALLED_STATUS_PREFIX}: emitted when
+ * transcript activity resumes while the same turn is still in flight, so the
+ * orchestrator clears the stall mark without waiting for the turn to end.
+ * (A turn that ends while marked is cleared by the done handler instead —
+ * no resume event is emitted after the fact.) */
+export const TURN_STALL_RESUMED_STATUS_PREFIX = "turn resumed: ";
+
+/**
  * The Settings section name where per-host git credentials live, interpolated
  * into the server-side credential-error hints (github.ts `privateRepoHint`,
  * gitlab.ts `authHint`, bitbucket.ts `bitbucketAccessHint` and friends) as
@@ -36,9 +58,12 @@ export const GIT_HOST_TOKENS_SECTION = "Git host tokens";
 export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "backlog", label: "Backlog" },
   { id: "ready", label: "Ready" },
+  { id: "specify", label: "Specify" },
+  { id: "clarify", label: "Clarify" },
   { id: "planning", label: "Planning" },
   { id: "plan-review", label: "Plan Review" },
-  { id: "pre-builder", label: "Pre-Builder" },
+  { id: "decompose", label: "Decompose" },
+  { id: "analyze", label: "Analyze" },
   { id: "building", label: "Building" },
   { id: "code-review", label: "Code Review" },
   { id: "testing", label: "Testing" },
@@ -48,7 +73,7 @@ export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "done", label: "Done" },
 ];
 
-/** The 6 columns a pipeline task's own agent occupies while auto-advancing
+/** The 9 columns a pipeline task's own agent occupies while auto-advancing
  *  (see src/bun/pipeline-prompts.ts and orchestrator.ts's advancePipelineStage).
  *  Never used by a non-pipeline task — `running`/`review` stay exactly as
  *  they are for those. Also the set of columns a CHILD task (see
@@ -56,13 +81,25 @@ export const COLUMNS: { id: ColumnId; label: string }[] = [
  *  `building` (or `blocked` on failure, outside this list), so it inherits
  *  the same undraggable/isActiveColumn treatment for free. */
 export const PIPELINE_STAGE_COLUMNS: readonly ColumnId[] =
-  ["planning", "plan-review", "pre-builder", "building", "code-review", "testing"];
+  ["specify", "clarify", "planning", "plan-review", "decompose", "analyze", "building", "code-review", "testing"];
 
-/** Shared send-back budget for a pipeline task across BOTH loop edges
- *  (plan-review→planning and testing→building combined, not 4 each).
- *  Hitting the cap routes the task to `blocked` (reason "revision-cap")
- *  instead of looping again. */
-export const PIPELINE_REVISION_CAP = 4;
+/** Shared send-back budget for a pipeline task across ALL bounce edges
+ *  (plan-review→planning, analyze→decompose, code-review→building, and
+ *  testing→building — one budget, not one per edge). Bumped 4→6 to
+ *  accommodate the new analyze→decompose edge (which costs zero agent turns
+ *  but still counts, so the cap needs room). Hitting the cap routes the
+ *  task to `blocked` (reason "revision-cap") instead of looping again. */
+export const PIPELINE_REVISION_CAP = 6;
+
+/** The pipeline stages whose advance is decided by a gate (a parsed verdict
+ *  or the building barrier) rather than by an artifact file landing on disk —
+ *  exactly the stages `overridePipelineGate` will force through. The artifact
+ *  stages (specify/clarify/planning/decompose/analyze) advance on their file
+ *  gates and the server refuses to override them. Shared so the two RunPanel
+ *  banners that offer "Override gate" (blocked, and gate-parked) can't drift
+ *  from the server's switch. */
+export const GATE_BEARING_STAGES: readonly ColumnId[] =
+  ["plan-review", "building", "code-review", "testing"];
 
 /** True when a task's column means "an agent is actively occupying this row
  *  right now" — the plain `running` column for an ordinary task, or any of
@@ -185,6 +222,13 @@ export interface Harness {
    *  in-flight runs are unaffected. Built-ins are toggleable too — this
    *  is the one carve-out from the built-in immutability rule. */
   enabled: boolean;
+  /** Live-quota opt-in (claude-code only; meaningless for other kinds).
+   *  When true, agetor reads the account's `.credentials.json` access token
+   *  at request time and queries Anthropic's (unofficial) OAuth usage
+   *  endpoint to show 5-hour/weekly limit utilization. Off by default —
+   *  nothing leaves the machine until the user flips it. Toggleable on
+   *  built-ins too, same carve-out as `enabled`. */
+  quotaEnabled: boolean;
 }
 
 export interface HarnessUsage {
@@ -197,6 +241,62 @@ export interface HarnessUsage {
   /** Total number of tasks (any column) referencing this harness — used
    *  to communicate the soft-delete blast radius. */
   totalTaskCount: number;
+}
+
+/**
+ * The identity block of a logged-in Claude account, read from the account's
+ * `.claude.json` (`oauthAccount`). Deliberately excludes `accountUuid` and
+ * anything token-shaped — this crosses the API boundary to the webview and
+ * must stay safe to display.
+ */
+export interface ClaudeAccount {
+  email: string;
+  displayName: string | null;
+  billingType: string | null;
+}
+
+/**
+ * An existing Claude config dir found on disk that no registered harness
+ * points at yet — surfaced in the Add-harness picker so a second account
+ * (`~/.claude-adevinta` style) is one click instead of a hand-typed path.
+ */
+export interface DiscoveredAccount {
+  /** Absolute path to the config dir (would become `Harness.home`). */
+  configDir: string;
+  email: string;
+  displayName: string | null;
+  billingType: string | null;
+  /** Slug derived from the dir name; the UI may bump it on collision. */
+  suggestedHarnessId: string;
+}
+
+/** Aggregated token counts for one time window of one account. */
+export interface TokenTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  messageCount: number;
+}
+
+/**
+ * Per-account usage summary attached to a claude-code harness's status.
+ * Keyed by config dir, not harness id — two harnesses sharing a `home` share
+ * one account, and the numbers include the user's direct CLI sessions too
+ * (the budget shown is the account's, not agetor's). `quota` stays null
+ * until the opt-in live-quota plane ships (see the SDD, phase 2).
+ */
+export interface AccountUsageSummary {
+  configDir: string;
+  today: TokenTotals;
+  last7d: TokenTotals;
+  /** Live limit utilization from Anthropic's OAuth usage endpoint. Null
+   *  when the harness hasn't opted in (`Harness.quotaEnabled`) or the fetch
+   *  degraded — `quotaReason` says which. */
+  quota: { fiveHourPct: number; weeklyPct: number; resetsAt: string | null } | null;
+  /** Why `quota` is null despite the opt-in ("re-login needed", "quota
+   *  unavailable"…). Null when quota is present or the opt-in is off. */
+  quotaReason: string | null;
 }
 
 export interface HarnessStatus {
@@ -213,6 +313,12 @@ export interface HarnessStatus {
   reason: string | null;
   /** Suggested install command when missing. */
   installHint: string | null;
+  /** Logged-in account identity (claude-code only; null for other kinds,
+   *  for a logged-out account, or an unreadable config blob). */
+  account: ClaudeAccount | null;
+  /** Local token-usage rollup for the harness's account (claude-code only;
+   *  null for other kinds). */
+  usage: AccountUsageSummary | null;
 }
 
 /**
@@ -245,7 +351,7 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     id: "claude-code-additional",
     label: "Additional Claude Code",
     description:
-      "Another claude-code harness with its own CLAUDE_CONFIG_DIR so login, history, and config live separately from the built-in.",
+      "A fresh claude-code harness with its own CLAUDE_CONFIG_DIR — a new login, separate from any existing account. To reuse an already-logged-in account, pick it from the detected accounts above instead.",
     kind: "claude-code",
     suggestedHarnessId: "claude-2",
     home: "{dataDir}/harnesses/claude-2",
@@ -767,29 +873,30 @@ export interface Task {
    *  that don't join the subagents table. */
   runningSubagents?: number;
   /**
-   * Non-null marks this a "pipeline task": its 6 stages (planning →
-   * plan-review → pre-builder → building → code-review → testing → ready)
-   * run automatically with no human click between them, using the same
-   * harness/CLI as an ordinary task — just a different prompt template per
-   * stage (see src/bun/pipeline-prompts.ts). Null (the default, and every
-   * legacy row) is a completely ordinary task — every existing single-agent
-   * behavior is unaffected; this includes every CHILD task a "building"
-   * stage spawns (see `parentTaskId`) — a child is an ordinary task in its
-   * own right, never a pipeline task itself. Set once at creation from the
-   * "Run as pipeline" checkbox; never settable via PATCH — deliberately
-   * absent from `ALLOWED_PATCH_FIELDS` (server.ts), same treatment as
+   * Non-null marks this a "pipeline task": its 9 stages
+   * (specify → clarify → planning → plan-review → decompose → analyze →
+   * building → code-review → testing → ready) run automatically with no
+   * human click between them (except one bounded `ask_user` pause in
+   * `clarify` for claude-code tasks), using the same harness/CLI as an
+   * ordinary task — just a different prompt template per stage (see
+   * src/bun/pipeline-prompts.ts). Null (the default, and every legacy row)
+   * is a completely ordinary task — every existing single-agent behavior is
+   * unaffected; this includes every CHILD task a "building" stage spawns
+   * (see `parentTaskId`) — a child is an ordinary task in its own right,
+   * never a pipeline task itself. Set once at creation from the "Run as
+   * pipeline" checkbox; never settable via PATCH — deliberately absent from
+   * `ALLOWED_PATCH_FIELDS` (server.ts), same treatment as
    * `branch`/`worktreePath`/`prUrl`. Written exclusively by
-   * orchestrator.ts's `advancePipelineStage` (and, for the pre-builder →
+   * orchestrator.ts's `advancePipelineStage` (and, for the decompose →
    * building fresh-entry transition, `spawnPipelineStage`) from here on.
    *
-   * `building` has two distinct entries: FRESH (from pre-builder success —
-   * the parent spawns child tasks per BUILD_PLAN.json and runs no agent of
-   * its own; see build-scheduler.ts's `tickBuild`) and BOUNCE (from
+   * `building` has two distinct entries: FRESH (from decompose/analyze
+   * success — the parent spawns child tasks per TASKS.json and runs no
+   * agent of its own; see build-scheduler.ts's `tickBuild`) and BOUNCE (from
    * code-review "revise" or testing "fail" — a plain single-agent fixup
-   * turn, no children spawned, identical to how `building` always worked
-   * before this stage existed).
+   * turn, no children spawned).
    */
-  pipelineStage: "planning" | "plan-review" | "pre-builder" | "building" | "code-review" | "testing" | null;
+  pipelineStage: "specify" | "clarify" | "planning" | "plan-review" | "decompose" | "analyze" | "building" | "code-review" | "testing" | null;
   /**
    * Set true by the Critic's "approve" verdict on a plan-review run; reset
    * to false whenever a later plan-review run instead sends the task back
@@ -807,10 +914,11 @@ export interface Task {
   implementationApproved: boolean;
   /**
    * Shared send-back counter for a pipeline task: incremented on EVERY
-   * plan-review→planning or testing→building bounce (both edges share one
-   * budget, not one each). Capped at `PIPELINE_REVISION_CAP` (4) — hitting
-   * the cap routes the task to `blocked` (reason "revision-cap") instead of
-   * looping again, so a human can see why. Always 0 for a non-pipeline task.
+   * bounce (plan-review→planning, code-review→building, testing→building,
+   * analyze→decompose — one budget shared across all edges). Capped at
+   * `PIPELINE_REVISION_CAP` (6) — hitting the cap routes the task to
+   * `blocked` (reason "revision-cap") instead of looping again, so a human
+   * can see why. Always 0 for a non-pipeline task.
    */
   revisionCount: number;
   /**
@@ -822,6 +930,21 @@ export interface Task {
    * Always null for a non-pipeline task.
    */
   pipelineFeedback: string | null;
+  /**
+   * Progress marker for the pipeline's bounce loop-breaker: set on every
+   * `bounceOrBlock` spawn to `"<targetStage>:<tree-fingerprint>"`, where the
+   * fingerprint hashes the parent worktree's HEAD + dirty state
+   * (`treeFingerprintSync` in worktree.ts). When the NEXT bounce to the same
+   * target computes the same fingerprint, the previous bounce cycle changed
+   * nothing on disk and looping again is guaranteed waste — the task blocks
+   * immediately instead of burning revision-cap slots one no-op cycle at a
+   * time. Null when there's no pending bounce baseline (fresh task, non-git
+   * workdir, or the last verdict was a pass/approve — cleared on every
+   * approve/pass edge and on a gate override). Optional so the many
+   * pre-existing `tasks.insert` fixture literals keep compiling; DB rows
+   * predating migration 039 read back as null.
+   */
+  pipelineBounceFingerprint?: string | null;
   /**
    * Unix ms when auto-advance was paused for this pipeline task via
    * `POST /tasks/:id/pipeline-pause`, or null when running normally. While
@@ -876,8 +999,101 @@ export interface Task {
    * to `"blocked"` and aborts the whole build (see orchestrator.ts's
    * `blockPipelineTask`/`cancelSiblingChildren`). Never settable via
    * PATCH, same treatment as `parentTaskId`.
+   *
+   * A fourth value, `"merge-deferred"`, marks a child whose run succeeded
+   * AFTER the parent had already left its active `building` state (late
+   * settle — boot-reconciliation replay, a build aborted by a sibling then
+   * this child finishing anyway, or a manual child restart racing the
+   * parent). The work is preserved: the child moves to `"review"` so it's
+   * visible instead of stranded, and the next `tickBuild` for the parent
+   * (a bounce back into building, or the barrier check on the building
+   * exit) merges deferred children FIRST, before deciding anything else.
    */
-  childMergeStatus: "pending" | "merged" | "merge-failed" | null;
+  childMergeStatus: "pending" | "merged" | "merge-failed" | "merge-deferred" | null;
+  /**
+   * Derived (never persisted, like `pendingInteractionCount`): true for a
+   * build child whose latest run SUCCEEDED but whose work hasn't been handed
+   * back to the pipeline (`childMergeStatus: "pending"`). This is the state
+   * the RC-6 provenance gate deliberately leaves behind when a non-pipeline
+   * conversation turn finishes a child's work — correct, but previously
+   * invisible (the card just said "Running" forever, 2DOT2DOT stuck-tasks
+   * incident 2026-08-14). Drives the card's "awaiting hand-back" state and
+   * RunPanel's hand-back banner. Optional so the many test fixtures that
+   * build full Task literals don't churn; absent means false.
+   */
+  awaitingHandBack?: boolean;
+  /**
+   * Derived (never persisted): true for a PARENT pipeline task parked on its
+   * gate column because the latest run to touch it was a conversation turn,
+   * not a stage run — the parent-side twin of `awaitingHandBack`. The RC-6
+   * provenance gate correctly refuses to advance on such a run, but until
+   * this flag the resulting state was invisible: the card sat on its stage
+   * column with the "use Retry stage or the gate override" breadcrumb
+   * pointing at buttons that only render for a `blocked` task (2dot2dot
+   * code-review incident 2026-08-15). Drives the card's "gate parked" state
+   * and RunPanel's GateParkedBanner. Optional so test fixtures don't churn;
+   * absent means false.
+   */
+  gateParked?: boolean;
+  /**
+   * Transient (in-memory on the server, decorated onto API responses — never
+   * persisted): `Date.now()` when the turn-stall watchdog flagged this
+   * task's in-flight turn as possibly stuck (see
+   * {@link TURN_STALLED_STATUS_PREFIX}). Cleared when transcript activity
+   * resumes, the turn settles, or the run is cancelled. Null/absent means
+   * not stalled. Resets on server restart by design — the watchdog re-fires
+   * within one threshold window if the session is still wedged after a
+   * reattach.
+   */
+  stalledSince?: number | null;
+}
+
+/**
+ * The predicate behind {@link Task.awaitingHandBack} — pure so it's
+ * gate-testable. `currentRunStatus` is the status of the run `task.runId`
+ * points at (null when the task never ran): requiring `"succeeded"` both
+ * proves the work exists AND rules out an in-flight turn (which would be
+ * `"running"`).
+ */
+export function isAwaitingHandBack(
+  t: Pick<Task, "parentTaskId" | "childMergeStatus" | "archivedAt">,
+  currentRunStatus: string | null,
+): boolean {
+  return t.parentTaskId != null
+    && t.childMergeStatus === "pending"
+    && t.archivedAt == null
+    && currentRunStatus === "succeeded";
+}
+
+/**
+ * The predicate behind {@link Task.gateParked} — pure so it's gate-testable.
+ * True when a PARENT pipeline task is parked on its own stage column with a
+ * settled, successful latest run that was NOT a stage run (`origin !==
+ * "pipeline-stage"`): the exact state advancePipelineStage's RC-6 provenance
+ * gate leaves behind after a conversation turn. The origin check is what
+ * makes the flag race-free — during a normal auto-advance the settled run IS
+ * a stage run, so the flag never flickers on in the async gap before the
+ * next stage's run row appears. Paused tasks are excluded (pause has its own
+ * resume affordance); children are excluded (they get `awaitingHandBack`).
+ *
+ * `currentRunStatus`/`currentRunOrigin` are the status/origin of the run
+ * `task.runId` points at (null when the task never ran). Requiring
+ * `"succeeded"` both proves a turn actually finished AND rules out an
+ * in-flight one; a failed conversation turn lands on the blocked path, which
+ * already renders the gate controls.
+ */
+export function isGateParked(
+  t: Pick<Task, "parentTaskId" | "pipelineStage" | "archivedAt" | "pausedAt" | "column">,
+  currentRunStatus: string | null,
+  currentRunOrigin: string | null,
+): boolean {
+  return t.parentTaskId == null
+    && t.pipelineStage != null
+    && t.archivedAt == null
+    && t.pausedAt == null
+    && t.column === t.pipelineStage
+    && currentRunStatus === "succeeded"
+    && currentRunOrigin !== "pipeline-stage";
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can
@@ -1391,11 +1607,15 @@ export interface Run {
    * this field existed). `"continuation"` = opened automatically by the
    * orchestrator after the same claude session auto-resumed post `end_turn`
    * (e.g. it delegated to a background task and later kept talking once
-   * that task finished). Optional so callers that don't pass it (most of
-   * them — only the continuation-run factory sets it) keep compiling
-   * unchanged; DB rows predating migration 023 read back as null.
+   * that task finished). `"pipeline-stage"` = spawned by `startTask` for a
+   * pipeline task's stage turn or a build child's own build turn — the ONLY
+   * runs whose terminal outcome is allowed to move the pipeline
+   * (`advancePipelineStage` / `settleChildRun` ignore unstamped runs, so a
+   * user free-text follow-up or an auto-continuation can never advance a
+   * stage or trigger a merge). Optional so callers that don't pass it keep
+   * compiling unchanged; DB rows predating migration 023 read back as null.
    */
-  origin?: "continuation" | null;
+  origin?: "continuation" | "pipeline-stage" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

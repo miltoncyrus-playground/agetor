@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, FolderGit2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { readCollapsed, writeCollapsed } from "@/lib/panel-collapse";
+import { stageBreakdown } from "@/lib/board-status";
 import { displayColumnMeta, type DisplayColumnId } from "@/lib/display-columns";
 import type { Task } from "../../../shared/types.ts";
 import { Column } from "./Column";
@@ -10,11 +11,11 @@ import { Column } from "./Column";
 interface Props {
   workdir: string;
   label: string;
-  /** The columns to render, in board order — already filtered down to this
-   *  lane's OWN non-empty display columns by the caller (App.tsx's `lanes`
-   *  useMemo): a column with zero tasks in THIS project doesn't appear in
-   *  its row, even if another project's row still shows it (auto-hide is
-   *  per-lane, not board-wide). */
+  /** The columns to render, in board order — filtered by the caller
+   *  (App.tsx's `lanes` useMemo via `filterLaneColumns`): the four working
+   *  columns (backlog/ready/in-progress/blocked) always appear, while
+   *  review/done auto-hide when THIS lane has zero tasks in them (per-lane,
+   *  not board-wide). */
   visibleColumns: { id: DisplayColumnId; label: string }[];
   tasksByColumn: Map<DisplayColumnId, Task[]>;
   taskCount: number;
@@ -81,6 +82,19 @@ export function SwimLane({
               </span>
             );
           })}
+          {/* The In Progress chip above merges 6 pipeline stages + plain
+              running into one number — spell out which stages it's hiding
+              ("2 building · 1 testing") so pipeline position reads from the
+              lane header without expanding the lane. */}
+          {(() => {
+            const stages = stageBreakdown(tasksByColumn.get("in-progress") ?? []);
+            if (stages.length === 0) return null;
+            return (
+              <span className="truncate text-[10px] text-muted-foreground/70">
+                ({stages.map((s) => `${s.count} ${s.label.toLowerCase()}`).join(" · ")})
+              </span>
+            );
+          })()}
         </div>
       </button>
       {!collapsed && (

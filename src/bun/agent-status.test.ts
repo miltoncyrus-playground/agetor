@@ -14,7 +14,7 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-agent-stat
 const { checkHarness } = await import("./agent-status.ts");
 
 function builtin(kind: AgentKind): Harness {
-  return { id: kind, kind, label: kind, isBuiltin: true, home: null, bin: null, env: {}, enabled: true };
+  return { id: kind, kind, label: kind, isBuiltin: true, home: null, bin: null, env: {}, enabled: true, quotaEnabled: false };
 }
 const checkAgent = (kind: AgentKind) => checkHarness(builtin(kind));
 
@@ -126,7 +126,7 @@ test("claude-code alias with a CLAUDE_CONFIG_DIR override is available without p
     home: harnessHome,
     bin: null,
     env: {},
-    enabled: true,
+    enabled: true, quotaEnabled: false,
   };
 
   const status = await checkHarness(alias);
