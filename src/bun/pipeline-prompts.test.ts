@@ -5,6 +5,7 @@ import {
   parseSpecAcceptanceCriteria,
   analyzeCoverage,
   childBuildPrompt,
+  mergeResolutionPrompt,
   stagePrompt,
   PIPELINE_PLAN_FILE,
   PIPELINE_TASKS_FILE,
@@ -20,7 +21,7 @@ function task(overrides: Partial<Task> = {}): Task {
     taskType: "task", branch: "agetor/t1-add-dark-mode", branchSource: "created",
     worktreePath: "/tmp/wt", baseRef: "abc123", prUrl: null,
     mode: null, model: null, effort: null,
-    references: [], backlog: [], draft: null, runId: null,
+    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: 0, updatedAt: 0, archivedAt: null,
     pipelineStage: "planning", planApproved: false, implementationApproved: false,
@@ -302,7 +303,7 @@ test("parseBuildPlan: a subtask missing a prompt is rejected", () => {
 test("childBuildPrompt: folds in the subtask's own prompt, points at PLAN.md, requires a local commit, forbids push", () => {
   const p = childBuildPrompt(
     task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
-    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [], acceptanceCriteria: [] },
+    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [], acceptanceCriteria: [], files: [] },
   );
   expect(p).toContain("Add a toggle component to settings.");
   expect(p).toContain(PIPELINE_PLAN_FILE);
@@ -319,7 +320,7 @@ test("childBuildPrompt: folds in the subtask's own prompt, points at PLAN.md, re
 test("childBuildPrompt: references owned ACs by id and points at SPEC.md for their text", () => {
   const p = childBuildPrompt(
     task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
-    { id: "toggle", title: "Add the toggle", prompt: "Do the thing.", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2"] },
+    { id: "toggle", title: "Add the toggle", prompt: "Do the thing.", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2"], files: [] },
   );
   expect(p).toContain("AC-1");
   expect(p).toContain("AC-2");
@@ -333,7 +334,7 @@ test("childBuildPrompt: fixed overhead stays well inside the claude argv budget"
   // subtask prompt still ships via argv instead of the deferred-paste path.
   const p = childBuildPrompt(
     task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "x".repeat(2000) }),
-    { id: "s", title: "T", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2", "AC-3"] },
+    { id: "s", title: "T", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-1", "AC-2", "AC-3"], files: [] },
   );
   expect(Buffer.byteLength(p, "utf8")).toBeLessThan(2048);
 });
@@ -363,8 +364,8 @@ test("parseSpecAcceptanceCriteria: leading whitespace is tolerated", () => {
 test("analyzeCoverage: all ACs covered returns ok", () => {
   const plan = {
     subtasks: [
-      { id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: ["AC-1"] },
-      { id: "b", title: "B", prompt: "do b", dependsOn: [], acceptanceCriteria: ["AC-2", "AC-3"] },
+      { id: "a", title: "A", prompt: "do a", dependsOn: [], acceptanceCriteria: ["AC-1"], files: [] },
+      { id: "b", title: "B", prompt: "do b", dependsOn: [], acceptanceCriteria: ["AC-2", "AC-3"], files: [] },
     ],
   };
   expect(analyzeCoverage(["AC-1", "AC-2", "AC-3"], plan)).toEqual({ ok: true });
@@ -372,7 +373,7 @@ test("analyzeCoverage: all ACs covered returns ok", () => {
 
 test("analyzeCoverage: an unclaimed AC id returns a gap error", () => {
   const plan = {
-    subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-1"] }],
+    subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-1"], files: [] }],
   };
   const result = analyzeCoverage(["AC-1", "AC-2"], plan);
   expect(result.ok).toBe(false);
@@ -381,7 +382,7 @@ test("analyzeCoverage: an unclaimed AC id returns a gap error", () => {
 
 test("analyzeCoverage: a phantom AC id (in subtask but not in spec) returns a phantom error", () => {
   const plan = {
-    subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-99"] }],
+    subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: ["AC-99"], files: [] }],
   };
   const result = analyzeCoverage(["AC-1"], plan);
   expect(result.ok).toBe(false);
@@ -392,7 +393,7 @@ test("analyzeCoverage: a phantom AC id (in subtask but not in spec) returns a ph
 });
 
 test("analyzeCoverage: empty spec ACs with empty subtask ACs returns ok", () => {
-  const plan = { subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: [] }] };
+  const plan = { subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [], acceptanceCriteria: [], files: [] }] };
   expect(analyzeCoverage([], plan)).toEqual({ ok: true });
 });
 
@@ -543,4 +544,96 @@ test("stagePrompt: testing on a retry pass injects prior failure and narrows sco
   expect(p).toContain("3 type errors in settings.ts");
   expect(p).toContain("CHECK ONLY");
   expect(p).toContain("Do NOT fail on new issues");
+});
+
+// --- file ownership (merge-conflict prevention at decompose time) ---------------
+
+test("parseBuildPlan: files accepted, trimmed, defaulted to [] when omitted", () => {
+  const result = parseBuildPlan(JSON.stringify({ subtasks: [
+    { id: "a", prompt: "p", files: [" src/a/ ", "src/routes/A.tsx"] },
+    { id: "b", prompt: "p" },
+  ] }));
+  expect(result.ok).toBe(true);
+  if (result.ok) {
+    expect(result.plan.subtasks[0]!.files).toEqual(["src/a/", "src/routes/A.tsx"]);
+    expect(result.plan.subtasks[1]!.files).toEqual([]);
+  }
+});
+
+test("parseBuildPlan: rejects non-string / empty files entries", () => {
+  const bad = parseBuildPlan(JSON.stringify({ subtasks: [{ id: "a", prompt: "p", files: [1] }] }));
+  expect(bad.ok).toBe(false);
+  if (!bad.ok) expect(bad.reason).toContain("files");
+  const empty = parseBuildPlan(JSON.stringify({ subtasks: [{ id: "a", prompt: "p", files: [" "] }] }));
+  expect(empty.ok).toBe(false);
+});
+
+test("parseBuildPlan: the same file owned by two subtasks is a validation error naming both", () => {
+  const result = parseBuildPlan(JSON.stringify({ subtasks: [
+    { id: "a", prompt: "p", files: ["package.json", "src/a/"] },
+    { id: "b", prompt: "p", files: ["src/b/", "package.json"] },
+  ] }));
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toContain("package.json");
+    expect(result.reason).toContain('"a"');
+    expect(result.reason).toContain('"b"');
+  }
+});
+
+test("parseBuildPlan: the same file listed twice by ONE subtask is fine (self-overlap is not a conflict)", () => {
+  const result = parseBuildPlan(JSON.stringify({ subtasks: [
+    { id: "a", prompt: "p", files: ["src/a.ts", "src/a.ts"] },
+  ] }));
+  expect(result.ok).toBe(true);
+});
+
+test("decompose prompt: instructs per-subtask file ownership and single-owner shared files", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
+  expect(p).toContain('"files"');
+  expect(p).toContain("exactly ONE subtask");
+});
+
+test("childBuildPrompt: with declared files, forbids out-of-lane edits and asks for a note instead", () => {
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/x", prompt: "t" }),
+    { id: "s", title: "S", prompt: "p", dependsOn: [], acceptanceCriteria: [], files: ["src/canvas/", "src/routes/Puzzle.tsx"] },
+  );
+  expect(p).toContain("src/canvas/");
+  expect(p).toContain("You own ONLY these paths");
+  expect(p).toContain("describe the exact needed change in your final message");
+});
+
+test("childBuildPrompt: with no declared files, no ownership block is emitted (back-compat)", () => {
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/x", prompt: "t" }),
+    { id: "s", title: "S", prompt: "p", dependsOn: [], acceptanceCriteria: [], files: [] },
+  );
+  expect(p).not.toContain("You own ONLY these paths");
+});
+
+// --- building prompt: commit discipline ------------------------------------------
+
+test("building prompt: requires a local commit, forbids push — 'do not commit' is gone", () => {
+  const p = stagePrompt(task({ pipelineStage: "building", branch: "feature/dark-mode" }), "building");
+  expect(p.toLowerCase()).toContain("commit your changes locally");
+  expect(p.toLowerCase()).toContain("do not push");
+  expect(p).toContain('"feature:');
+  expect(p.toLowerCase()).not.toContain("do not commit anything");
+});
+
+// --- merge-resolution prompt -----------------------------------------------------
+
+test("mergeResolutionPrompt: names the branch and subtask, forbids re-implementation, requires concluding the merge, forbids push", () => {
+  const p = mergeResolutionPrompt(
+    task({ pipelineStage: "building", branch: "feature/parent" }),
+    { branch: "feature/parent-canvas", planSubtaskId: "canvas", title: "Puzzle canvas" },
+  );
+  expect(p).toContain("feature/parent-canvas");
+  expect(p).toContain('"canvas"');
+  expect(p).toContain("Puzzle canvas");
+  expect(p).toContain("do NOT re-implement");
+  expect(p).toContain("git commit");
+  expect(p.toLowerCase()).toContain("do not push");
+  expect(p).toContain("IN PROGRESS");
 });

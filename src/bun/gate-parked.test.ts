@@ -71,7 +71,7 @@ function seedPipelineTask(overrides: Partial<Task> = {}): string {
     workdir: "/tmp", isolation: "none", taskType: "task",
     branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
     mode: "auto", model: null, effort: null,
-    references: [], backlog: [], draft: null, runId: null,
+    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: "code-review", planApproved: true, implementationApproved: false,

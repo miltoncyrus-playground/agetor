@@ -1,9 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tasks, runs } from "./db.ts";
-import { createTask, startTask, spawnPipelineStage, blockPipelineTask, cancelSiblingChildren, archiveTask } from "./orchestrator.ts";
+import { createTask, startTask, spawnPipelineStage, blockPipelineTask, cancelSiblingChildren, archiveTask, spawnMergeResolution } from "./orchestrator.ts";
 import { parseBuildPlan, childBuildPrompt, PIPELINE_BUILD_PLAN_FILE } from "./pipeline-prompts.ts";
-import { mergeBranch, abortMerge } from "./worktree.ts";
+import { mergeBranch, abortMerge, commitAll } from "./worktree.ts";
 import type { Task } from "../shared/types.ts";
 
 /**
@@ -75,8 +75,14 @@ export function buildBarrierState(parent: Task): BuildBarrierState {
   const childBySubtaskId = new Map(
     tasks.list().filter((t) => t.parentTaskId === parent.id).map((c) => [c.planSubtaskId, c]),
   );
+  // A subtask is met by a merged child OR by an explicit human "satisfied"
+  // marker (`satisfyPipelineSubtask` / the building gate override) — the
+  // latter is what stops a work-landed-another-way subtask from re-tripping
+  // this barrier on every bounce forever (2dot2dot-redesign, 2026-08-19).
   const unmet = parsed.plan.subtasks
-    .filter((s) => childBySubtaskId.get(s.id)?.childMergeStatus !== "merged")
+    .filter((s) =>
+      childBySubtaskId.get(s.id)?.childMergeStatus !== "merged"
+      && !parent.satisfiedSubtasks.includes(s.id))
     .map((s) => s.id);
   return unmet.length === 0 ? { kind: "complete" } : { kind: "incomplete", unmet };
 }
@@ -105,11 +111,30 @@ async function mergeChildIntoParent(child: Task, parent: Task): Promise<boolean>
   const parentWorktreePath = parent.worktreePath ?? parent.workdir;
   const result = await mergeBranch(parentWorktreePath, child.branch);
   if (!result.ok) {
-    if (result.conflict) await abortMerge(parentWorktreePath);
+    // A genuine conflict is WORK, not a dead end: leave the merge in
+    // progress (markers + MERGE_HEAD intact) and hand it to an agent-driven
+    // merge-resolution turn on the parent. The child parks in
+    // "merge-conflict" — the latch that makes every other scheduler entry
+    // defer until `settleMergeResolution` decides merged vs merge-failed.
+    // One automatic attempt only: a failed resolution lands the child on
+    // "merge-failed", which nothing retries without a human bounce.
+    if (result.conflict) {
+      tasks.update(child.id, { childMergeStatus: "merge-conflict", column: "review" });
+      const freshChild = tasks.get(child.id);
+      if (freshChild && spawnMergeResolution(parent, freshChild, result.detail)) {
+        return false; // not landed YET — the resolution run's settle continues the build
+      }
+      // Could not spawn a resolution turn (parent busy, no session, spawn
+      // error) — fall back to the pre-resolution behavior.
+      await abortMerge(parentWorktreePath);
+    }
     tasks.update(child.id, { childMergeStatus: "merge-failed", column: "blocked" });
     blockPipelineTask(
       parent.id, null, "pipeline-failed",
-      `merge conflict on subtask "${child.planSubtaskId}": ${result.detail}`,
+      `merge conflict on subtask "${child.planSubtaskId}": ${result.detail}. ` +
+      `The subtask's finished work is on branch "${child.branch}" — resolve that merge ` +
+      `into this worktree (or mark the subtask satisfied if its work already landed ` +
+      `another way); do NOT re-implement the feature.`,
     );
     cancelSiblingChildren(parent.id);
     return false;
@@ -150,6 +175,26 @@ async function doTick(parentTaskId: string): Promise<void> {
   // signal here, same distinction the rest of the pipeline draws.
   if (!parent || parent.pipelineStage !== "building" || parent.column !== "building") return;
 
+  // Merge-resolution latch: while a child sits in "merge-conflict", the
+  // parent's worktree holds an IN-PROGRESS merge and an agent turn owns it.
+  // Any git operation here (a deferred merge, the auto-commit below) would
+  // corrupt that state — no-op and let `settleMergeResolution` re-tick.
+  const allChildren = tasks.list().filter((t) => t.parentTaskId === parentTaskId);
+  if (allChildren.some((c) => c.childMergeStatus === "merge-conflict")) return;
+
+  // Deterministic backstop for stage turns that left work uncommitted in the
+  // parent's worktree (a bounced fixup turn ignoring its commit instruction):
+  // uncommitted files make every `git merge` below refuse outright, and are
+  // one reset away from lost (the 2dot2dot-redesign incident left an entire
+  // implementation as 41 uncommitted files). Only for real worktrees —
+  // isolation:"none" tests run in plain temp dirs where this is a no-op error.
+  if (parent.worktreePath) {
+    const checkpoint = await commitAll(parent.worktreePath, "chore: pipeline checkpoint — uncommitted stage work");
+    if (checkpoint.committed && parent.runId) {
+      runs.appendEvent(parent.runId, "status", "auto-committed uncommitted stage work before merging (pipeline backstop)");
+    }
+  }
+
   const planPath = join(parent.worktreePath ?? parent.workdir, PIPELINE_BUILD_PLAN_FILE);
   if (!existsSync(planPath)) {
     blockPipelineTask(parentTaskId, null, "pipeline-failed", `${PIPELINE_BUILD_PLAN_FILE} is missing`);
@@ -178,8 +223,13 @@ async function doTick(parentTaskId: string): Promise<void> {
 
   const children = tasks.list().filter((t) => t.parentTaskId === parentTaskId);
   const childBySubtaskId = new Map(children.map((c) => [c.planSubtaskId, c]));
+  // Human-satisfied subtasks count as met everywhere a merge would: the
+  // barrier below, the dependency edges, and the "already created" skip.
+  const satisfied = new Set(parent.satisfiedSubtasks);
+  const subtaskMet = (id: string): boolean =>
+    childBySubtaskId.get(id)?.childMergeStatus === "merged" || satisfied.has(id);
 
-  const allMerged = subtasks.every((s) => childBySubtaskId.get(s.id)?.childMergeStatus === "merged");
+  const allMerged = subtasks.every((s) => subtaskMet(s.id));
   if (allMerged) {
     // `pipelineFeedback: null` — consumed on the building→code-review hop,
     // matching what the old advancePipelineStage `case "building"` did
@@ -205,10 +255,9 @@ async function doTick(parentTaskId: string): Promise<void> {
   }
 
   for (const subtask of subtasks) {
+    if (satisfied.has(subtask.id)) continue; // human-satisfied — never spawn a child
     if (childBySubtaskId.has(subtask.id)) continue; // already created (any state)
-    const depsSatisfied = subtask.dependsOn.every(
-      (depId) => childBySubtaskId.get(depId)?.childMergeStatus === "merged",
-    );
+    const depsSatisfied = subtask.dependsOn.every(subtaskMet);
     if (!depsSatisfied) continue;
 
     const created = await createTask({
@@ -301,6 +350,39 @@ async function doCompleteChild(childTaskId: string, parentTaskId: string): Promi
       runs.appendEvent(parent.runId, "status", data);
     }
     return;
+  }
+
+  // Merge-resolution latch (same as doTick's): a sibling's conflicted merge
+  // is in progress in the parent's worktree — merging THIS child now would
+  // hit "You have not concluded your merge" and wrongly abort the build.
+  // Park it; the resolution's settle re-ticks and picks deferred children up.
+  const siblings = tasks.list().filter((t) => t.parentTaskId === parentTaskId);
+  if (siblings.some((s) => s.id !== childTaskId && s.childMergeStatus === "merge-conflict")) {
+    tasks.update(childTaskId, { childMergeStatus: "merge-deferred", column: "review" });
+    if (parent.runId) {
+      runs.appendEvent(
+        parent.runId, "status",
+        `subtask "${child.planSubtaskId}" completed while a sibling's merge resolution is in flight — merge deferred`,
+      );
+    }
+    return;
+  }
+
+  // Deterministic backstop for a child agent that finished without
+  // committing (its prompt requires it, but "Already up to date" merging an
+  // empty branch would silently mark the subtask merged with ZERO work
+  // landed). Real worktrees only — isolation:"none" children have none.
+  if (child.worktreePath) {
+    const checkpoint = await commitAll(
+      child.worktreePath,
+      `chore: pipeline checkpoint — uncommitted work from subtask "${child.planSubtaskId}"`,
+    );
+    if (checkpoint.committed && parent.runId) {
+      runs.appendEvent(
+        parent.runId, "status",
+        `subtask "${child.planSubtaskId}" left uncommitted work — auto-committed before merging (pipeline backstop)`,
+      );
+    }
   }
 
   if (!(await mergeChildIntoParent(child, parent))) return;

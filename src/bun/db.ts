@@ -87,6 +87,7 @@ type TaskRow = {
   parent_task_id: string | null;
   plan_subtask_id: string | null;
   child_merge_status: string | null;
+  satisfied_subtasks: string;
   /** Status of the run `run_id` points at (correlated subquery in
    *  TASKS_SELECT) — feeds the derived `awaitingHandBack`. Missing on
    *  code paths that don't join (insert fallback). */
@@ -119,6 +120,17 @@ const parseRefs = (raw: string): TaskReference[] => {
       const isDirectory = Boolean((r as { isDirectory?: unknown }).isDirectory);
       return [{ path, isDirectory }];
     });
+  } catch { return []; }
+};
+
+/** Parse a plain JSON string-array column (e.g. `satisfied_subtasks`) —
+ *  anything malformed or non-string collapses to []/dropped, same defensive
+ *  posture as `parseRefs`. */
+const parseStringArray = (raw: string): string[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((v): v is string => typeof v === "string" && v.length > 0);
   } catch { return []; }
 };
 
@@ -223,6 +235,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   parentTaskId: r.parent_task_id,
   planSubtaskId: r.plan_subtask_id,
   childMergeStatus: r.child_merge_status as Task["childMergeStatus"],
+  satisfiedSubtasks: parseStringArray(r.satisfied_subtasks),
   awaitingHandBack: isAwaitingHandBack(
     {
       parentTaskId: r.parent_task_id,
@@ -285,8 +298,8 @@ export const tasks = {
           branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, refs, backlog, draft,
           run_id, created_at, updated_at, archived_at,
           pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, pipeline_bounce_fingerprint, paused_at,
-          block_reason, parent_task_id, plan_subtask_id, child_merge_status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          block_reason, parent_task_id, plan_subtask_id, child_merge_status, satisfied_subtasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -298,6 +311,7 @@ export const tasks = {
         t.pipelineStage ?? null, t.planApproved ? 1 : 0, t.implementationApproved ? 1 : 0,
         t.revisionCount ?? 0, t.pipelineFeedback ?? null, t.pipelineBounceFingerprint ?? null, t.pausedAt ?? null,
         t.blockReason ?? null, t.parentTaskId ?? null, t.planSubtaskId ?? null, t.childMergeStatus ?? null,
+        JSON.stringify(t.satisfiedSubtasks ?? []),
       ],
     );
     // Round-trip via `get` so the returned shape carries the computed
@@ -315,7 +329,7 @@ export const tasks = {
          branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, refs=?, backlog=?, draft=?,
          run_id=?, updated_at=?, archived_at=?,
          pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, pipeline_bounce_fingerprint=?, paused_at=?,
-         block_reason=?, parent_task_id=?, plan_subtask_id=?, child_merge_status=?
+         block_reason=?, parent_task_id=?, plan_subtask_id=?, child_merge_status=?, satisfied_subtasks=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
@@ -327,7 +341,8 @@ export const tasks = {
         next.runId, next.updatedAt, next.archivedAt ?? null,
         next.pipelineStage ?? null, next.planApproved ? 1 : 0, next.implementationApproved ? 1 : 0,
         next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pipelineBounceFingerprint ?? null, next.pausedAt ?? null,
-        next.blockReason ?? null, next.parentTaskId ?? null, next.planSubtaskId ?? null, next.childMergeStatus ?? null, id,
+        next.blockReason ?? null, next.parentTaskId ?? null, next.planSubtaskId ?? null, next.childMergeStatus ?? null,
+        JSON.stringify(next.satisfiedSubtasks ?? []), id,
       ],
     );
     // Re-fetch so hasOpenableRun reflects the row state immediately after
@@ -813,6 +828,16 @@ export const runs = {
       [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.geminiSessionId, r.origin ?? null],
     );
     return { ...r, origin: r.origin ?? null };
+  },
+  /** Stamp a run's origin after the fact. Exists for `spawnMergeResolution`:
+   *  the per-kind turn spawners (sendClaudeTurn / sendCodexTurn /
+   *  sendGeminiTurn) insert their run rows with origin null, and threading an
+   *  origin through every one of their internal spawn paths would touch far
+   *  more surface than this single UPDATE. Safe because the stamp happens in
+   *  the same synchronous continuation as the spawn — long before the run's
+   *  done-handler (which is what reads origin) can fire. */
+  setOrigin(id: string, origin: Run["origin"]): void {
+    db.run(`UPDATE runs SET origin = ? WHERE id = ?`, [origin ?? null, id]);
   },
   update(id: string, patch: Partial<Run>): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);

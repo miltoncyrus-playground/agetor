@@ -1173,6 +1173,11 @@ export const api = {
   pausePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-pause`, { method: "POST" }),
   resumePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-resume`, { method: "POST" }),
   overridePipelineGate: (id: string) => j<Task>(`/tasks/${id}/pipeline-override`, { method: "POST" }),
+  /** Mark one build subtask as satisfied without a merged child — the durable
+   *  escape hatch when the work landed some other way (see the per-subtask
+   *  buttons in the blocked banner). Server-validated against TASKS.json. */
+  satisfyPipelineSubtask: (id: string, subtaskId: string) =>
+    j<Task>(`/tasks/${id}/satisfy-subtask`, { method: "POST", body: JSON.stringify({ subtaskId }) }),
 
   /** Every git worktree materialized on disk under `dataDir/worktrees/`,
    *  cross-referenced against the tasks table. Drives the Worktrees page. */

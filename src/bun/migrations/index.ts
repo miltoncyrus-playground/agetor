@@ -47,6 +47,7 @@ import m038 from "./038_sdd_pipeline_stages.sql" with { type: "text" };
 import m039 from "./039_pipeline_bounce_fingerprint.sql" with { type: "text" };
 import m040 from "./040_account_usage.sql" with { type: "text" };
 import m041 from "./041_harness_quota.sql" with { type: "text" };
+import m042 from "./042_satisfied_subtasks.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -92,4 +93,5 @@ export const migrations: Migration[] = [
   { id: "039_pipeline_bounce_fingerprint", sql: m039 },
   { id: "040_account_usage", sql: m040 },
   { id: "041_harness_quota", sql: m041 },
+  { id: "042_satisfied_subtasks", sql: m042 },
 ];

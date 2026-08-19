@@ -104,6 +104,8 @@ import {
   hasUncommittedChanges,
   getAheadCount,
   isMergedIntoDefaultBranch,
+  isBranchMerged,
+  abortMerge,
 } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -130,6 +132,7 @@ import {
   parseSpecAcceptanceCriteria,
   analyzeCoverage,
   stagePrompt,
+  mergeResolutionPrompt,
   type PlanReviewVerdict,
   type TestingVerdict,
 } from "./pipeline-prompts.ts";
@@ -1593,6 +1596,117 @@ export async function handBackChild(taskId: string): Promise<{ ok: true } | { er
   return { ok: true };
 }
 
+/**
+ * Spawn an agent-driven merge-conflict-resolution turn on a pipeline PARENT
+ * whose child's merge-back just conflicted (build-scheduler.ts's
+ * `mergeChildIntoParent` is the only caller). The merge has been left IN
+ * PROGRESS in the parent's worktree — conflict markers and MERGE_HEAD intact
+ * — and the child sits in `childMergeStatus: "merge-conflict"`, which is
+ * both the scheduler's "one merge in flight, everyone else defer" latch and
+ * how `settleMergeResolution` finds the child again after a restart (no
+ * in-memory state to lose).
+ *
+ * The turn rides the task's normal per-kind conversation machinery
+ * (sendClaudeTurn / sendCodexTurn / sendGeminiTurn — same session the
+ * parent's stage turns used, so the agent has the pipeline context), then
+ * the fresh run row is stamped `origin: "pipeline-merge"` so its settle
+ * routes to `settleMergeResolution` instead of the stage-advance switch.
+ * The stamp-after-spawn is safe: the run can't settle before this
+ * synchronous continuation finishes (the done handler fires on agent exit,
+ * strictly later).
+ *
+ * Returns false when no resolution turn could be spawned — parent busy
+ * (an in-flight run would fold/queue the prompt into the WRONG turn), no
+ * session to resume, spawn failure — in which case the caller falls back to
+ * the pre-resolution behavior (abort + block + cancel siblings).
+ */
+export function spawnMergeResolution(parent: Task, child: Task, conflictDetail: string): boolean {
+  if (parent.runId && active.has(parent.runId)) return false;
+  const prompt = mergeResolutionPrompt(parent, child);
+  const kind = resolveHarness(parent.agent)?.kind;
+  let runId: string | null = null;
+  try {
+    if (kind === "claude-code") runId = sendClaudeTurn(parent.id, prompt);
+    else if (kind === "codex") runId = sendCodexTurn(parent.id, prompt);
+    else if (kind === "gemini") runId = sendGeminiTurn(parent.id, prompt);
+  } catch (err) {
+    console.error(`[agetor] merge-resolution spawn failed for parent ${parent.id}:`, err);
+    return false;
+  }
+  if (!runId) return false;
+  // Defense in depth: the idle guard above should make a fold-into-active-run
+  // impossible, but if the returned id is a pre-existing run (already
+  // stamped, or mid-flight), do not repurpose it as a merge turn.
+  if (runs.get(runId)?.origin != null) return false;
+  runs.setOrigin(runId, "pipeline-merge");
+  pipelineStatus(
+    runId, parent.id,
+    `merge of subtask "${child.planSubtaskId}" (branch ${child.branch}) hit conflicts — ` +
+    `spawned a merge-resolution turn instead of aborting (${conflictDetail.slice(0, 200)})`,
+  );
+  return true;
+}
+
+/**
+ * Settle a `origin: "pipeline-merge"` run (spawned by
+ * {@link spawnMergeResolution}). The agent's own outcome is deliberately
+ * IGNORED as evidence: whether the merge landed is re-derived from git alone
+ * (`isBranchMerged` — merge concluded AND the branch's commits reachable
+ * from the parent's HEAD). An agent that resolved+committed but then errored
+ * still counts as landed; an agent that reported success but left MERGE_HEAD
+ * parked does not — that half-state is exactly what stranded the
+ * 2dot2dot-redesign worktree.
+ *
+ * Landed → child `"merged"`/done + resume the DAG (tickBuild). Not landed →
+ * the pre-resolution conflict behavior: abort the merge, child
+ * `"merge-failed"`/blocked, parent blocked with a merge-scoped feedback
+ * (names the branch, forbids re-implementation — that text is folded into
+ * any later "Retry stage" fixup prompt via `buildingPrompt`), siblings
+ * cancelled.
+ */
+async function settleMergeResolution(taskId: string, runId: string): Promise<void> {
+  const parent = tasks.get(taskId);
+  if (!parent) return;
+  const child = tasks.list().find(
+    (t) => t.parentTaskId === taskId && t.childMergeStatus === "merge-conflict",
+  );
+  if (!child) {
+    pipelineStatus(runId, taskId, "merge-resolution turn ended but no subtask is awaiting a merge — nothing to settle");
+    return;
+  }
+  const parentWorktree = parent.worktreePath ?? parent.workdir;
+  const landed = child.branch != null && (await isBranchMerged(parentWorktree, child.branch));
+  if (landed) {
+    tasks.update(child.id, { childMergeStatus: "merged", column: "done" });
+    pipelineStatus(
+      runId, taskId,
+      `merge conflict resolved — subtask "${child.planSubtaskId}" landed on the parent branch; resuming the build`,
+    );
+    // Re-affirm the building column (the resolution turn pulled the card to
+    // "running") before the tick decides what's next.
+    if (parent.pipelineStage === "building") {
+      updateColumn(taskId, runId, "building", "stage-advance");
+    }
+    void tickBuild(taskId).catch((err) => {
+      console.error(`[agetor] post-resolution tickBuild failed for parent ${taskId}:`, err);
+      if (tasks.get(taskId)?.column === "building") {
+        blockPipelineTask(taskId, null, "pipeline-failed", String(err));
+      }
+    });
+    return;
+  }
+  await abortMerge(parentWorktree);
+  tasks.update(child.id, { childMergeStatus: "merge-failed", column: "blocked" });
+  blockPipelineTask(
+    taskId, runId, "pipeline-failed",
+    `merge conflict on subtask "${child.planSubtaskId}" could not be auto-resolved. ` +
+    `The subtask's finished work is on branch "${child.branch}" — resolve that merge into ` +
+    `this worktree (or mark the subtask satisfied if its work already landed another way); ` +
+    `do NOT re-implement the feature.`,
+  );
+  cancelSiblingChildren(taskId);
+}
+
 // Exported for unit tests (orchestrator-pipeline-guards.test.ts) — production
 // callers are attachDoneHandler + maybeReleaseHeldTask only.
 export function settleChildRun(taskId: string, runId: string, outcome: PipelineOutcome): void {
@@ -1729,6 +1843,21 @@ export function settleChildRun(taskId: string, runId: string, outcome: PipelineO
 export function advancePipelineStage(taskId: string, runId: string, outcome: PipelineOutcome): void {
   const task = tasks.get(taskId);
   if (!task || task.pipelineStage == null || task.runId !== runId) return;
+
+  // A merge-resolution turn settles through its own git-verified path — the
+  // agent's outcome (success, failure, even a user Stop) is only the trigger;
+  // `settleMergeResolution` re-derives whether the merge landed from git and
+  // never trusts the run. Routed before the provenance gate below since
+  // "pipeline-merge" is its own provenance.
+  if (runs.get(runId)?.origin === "pipeline-merge") {
+    void settleMergeResolution(taskId, runId).catch((err) => {
+      console.error(`[agetor] settleMergeResolution failed for task ${taskId}:`, err);
+      if (tasks.get(taskId)?.column === "building" || tasks.get(taskId)?.column === "running") {
+        blockPipelineTask(taskId, null, "pipeline-failed", `merge-resolution settle failed: ${String(err)}`);
+      }
+    });
+    return;
+  }
 
   // Provenance gate (RC-6): only a run startTask stamped as a stage turn may
   // move the pipeline. A user follow-up ("continue"), an auto-continuation
@@ -3105,6 +3234,7 @@ export async function createTask(
     id,
     title: input.title,
     prompt: input.prompt,
+    satisfiedSubtasks: [],
     column: input.column ?? "backlog",
     agent: agentId,
     workdir,
@@ -3451,6 +3581,81 @@ export async function resumePipelineTask(taskId: string): Promise<{ task: Task }
  * the DAG barrier — that is exactly the "human decides the unmet subtasks
  * don't matter" case, and it is recorded as such.
  */
+/**
+ * Explicit human declaration that a build subtask's work is satisfied
+ * WITHOUT a merged child — `POST /tasks/:id/satisfy-subtask`. The durable
+ * escape hatch for bookkeeping-vs-reality divergence: a subtask whose work
+ * landed some other way (re-implemented on the parent branch after a failed
+ * merge — the 2dot2dot-redesign incident) otherwise re-trips the build
+ * barrier on every bounce back into building, forever.
+ *
+ * Persisted on `task.satisfiedSubtasks`, consumed by `buildBarrierState`
+ * (counts as met) and `tickBuild` (never spawns a child for it, counts it as
+ * a met dependency). A leftover un-merged child row for the subtask is
+ * archived (force) so the board reflects the decision and no later tick can
+ * retry its doomed merge. Audited as a status event on the latest run, same
+ * treatment as the gate override.
+ */
+export async function satisfyPipelineSubtask(
+  taskId: string,
+  subtaskId: string,
+): Promise<{ task: Task } | { error: string }> {
+  const task = tasks.get(taskId);
+  if (!task) return { error: "task not found" };
+  if (task.pipelineStage == null || task.parentTaskId != null) return { error: "not a pipeline task" };
+  if (task.archivedAt != null) return { error: "task is archived" };
+  if (typeof subtaskId !== "string" || !subtaskId.trim()) return { error: "subtaskId required" };
+
+  // Validate against the declared plan so a typo can't silently "satisfy"
+  // nothing. Missing/unparseable TASKS.json is a real error here, mirroring
+  // buildBarrierState's "invalid" posture.
+  const planPath = join(task.worktreePath ?? task.workdir, PIPELINE_TASKS_FILE);
+  if (!existsSync(planPath)) return { error: `${PIPELINE_TASKS_FILE} is missing` };
+  const parsed = parseBuildPlan(readFileSync(planPath, "utf8"));
+  if (!parsed.ok) return { error: parsed.reason };
+  if (!parsed.plan.subtasks.some((s) => s.id === subtaskId)) {
+    return { error: `subtask "${subtaskId}" is not declared in ${PIPELINE_TASKS_FILE}` };
+  }
+
+  const child = tasks.list().find((t) => t.parentTaskId === taskId && t.planSubtaskId === subtaskId);
+  if (child?.childMergeStatus === "merged") {
+    return { error: `subtask "${subtaskId}" is already merged — nothing to satisfy` };
+  }
+  if (child?.childMergeStatus === "merge-conflict") {
+    // Refuse only while the resolution turn is genuinely LIVE. A stale
+    // "merge-conflict" (the resolution run died/orphaned across a restart)
+    // must stay satisfiable — it's the human's only unwedge — and the parked
+    // merge it left in the parent worktree gets aborted below.
+    if (task.runId && active.has(task.runId)) {
+      return { error: `subtask "${subtaskId}" has a merge-resolution turn in flight — stop it or let it finish first` };
+    }
+    await abortMerge(task.worktreePath ?? task.workdir);
+  }
+  if (task.satisfiedSubtasks.includes(subtaskId)) {
+    return { error: `subtask "${subtaskId}" is already marked satisfied` };
+  }
+
+  tasks.update(taskId, { satisfiedSubtasks: [...task.satisfiedSubtasks, subtaskId] });
+  const latest = runs.listForTask(taskId)[0];
+  if (latest) {
+    pipelineStatus(
+      latest.id, taskId,
+      `subtask "${subtaskId}" marked satisfied by user — the build barrier no longer requires its merge`,
+    );
+  }
+  if (child && child.archivedAt == null) {
+    // Its branch will never be merged now; park the card honestly and tear
+    // down the redundant worktree, same treatment the barrier-completion
+    // sweep gives merged children.
+    const result = await archiveTask(child.id, { force: true, stopRun: true });
+    if ("error" in result) {
+      console.error(`[agetor] failed to archive satisfied subtask's child ${child.id}:`, result.error);
+    }
+  }
+  const updated = tasks.get(taskId);
+  return updated ? { task: updated } : { error: "task not found" };
+}
+
 export function overridePipelineGate(taskId: string): { task: Task } | { error: string } {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
@@ -3482,6 +3687,22 @@ export function overridePipelineGate(taskId: string): { task: Task } | { error: 
       break;
     }
     case "building": {
+      // Make the override DURABLE, not amnesiac: mark every currently-unmet
+      // subtask as satisfied so a later bounce back into building can't
+      // re-trip the barrier on the exact state the human just waved through
+      // (the 2dot2dot-redesign loop). Recorded per-subtask in the audit.
+      const barrier = buildBarrierState(task);
+      if (barrier.kind === "incomplete" && barrier.unmet.length > 0) {
+        const merged = Array.from(new Set([...task.satisfiedSubtasks, ...barrier.unmet]));
+        tasks.update(taskId, { satisfiedSubtasks: merged });
+        const latest = runs.listForTask(taskId)[0];
+        if (latest) {
+          pipelineStatus(
+            latest.id, taskId,
+            `gate override marked unmet subtasks satisfied: ${barrier.unmet.join(", ")}`,
+          );
+        }
+      }
       audit("code-review");
       spawnPipelineStage(taskId, null, "code-review", { pipelineFeedback: null, pipelineBounceFingerprint: null });
       break;

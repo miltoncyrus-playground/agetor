@@ -2565,6 +2565,7 @@ function RunPanelBody({
           task={task}
           onRetryStage={() => onStart(task)}
           onOverrideGate={() => void api.overridePipelineGate(task.id).catch(() => {})}
+          onSatisfySubtask={(subtaskId) => void api.satisfyPipelineSubtask(task.id, subtaskId).catch(() => {})}
           onRetryNudge={() => void send("Please continue from where you left off.")}
           onEditAndRetry={editAndRetry}
           onRetryAsIs={() => void send(lastUserMessageText)}
@@ -3197,6 +3198,7 @@ function BlockedBanner({
   task,
   onRetryStage,
   onOverrideGate,
+  onSatisfySubtask,
   onRetryNudge,
   onEditAndRetry,
   onRetryAsIs,
@@ -3205,6 +3207,7 @@ function BlockedBanner({
   task: Task;
   onRetryStage: () => void;
   onOverrideGate: () => void;
+  onSatisfySubtask: (subtaskId: string) => void;
   onRetryNudge: () => void;
   onEditAndRetry: () => void;
   onRetryAsIs: () => void;
@@ -3267,6 +3270,31 @@ function BlockedBanner({
       <div className="min-w-0 flex-1">
         <p className="text-xs font-medium text-foreground">{copy.heading}</p>
         <p className="mt-0.5 text-xs text-muted-foreground">{copy.detail}</p>
+        {/* Per-subtask escape hatch (building stage only — `unmetSubtasks` is
+            a server decoration computed exactly for a parent blocked in
+            building): "this subtask's work landed some other way — stop
+            requiring its merge." Durable, unlike the whole-gate override:
+            marked subtasks survive a later bounce back into building. */}
+        {task.unmetSubtasks && task.unmetSubtasks.length > 0 && (
+          <div className="mt-2 flex flex-col gap-1">
+            <p className="text-[11px] text-muted-foreground">
+              Unmet subtasks — mark one satisfied if its work already landed another way (e.g. re-implemented on the parent branch):
+            </p>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {task.unmetSubtasks.map((id) => (
+                <Button
+                  key={id}
+                  size="sm"
+                  variant="outline"
+                  title={`Stop requiring subtask "${id}"'s merge — records the decision on the run log`}
+                  onClick={() => onSatisfySubtask(id)}
+                >
+                  Mark “{id}” satisfied
+                </Button>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="mt-2 flex flex-wrap items-center gap-1.5">{actions}</div>
       </div>
     </div>

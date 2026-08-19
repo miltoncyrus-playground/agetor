@@ -200,6 +200,16 @@ export interface BuildSubtask {
    *  user-visible acceptance criterion. Shape-validated by parseBuildPlan;
    *  cross-checked against SPEC.md's actual AC list by analyzeCoverage. */
   acceptanceCriteria: string[];
+  /** File-ownership declaration: the paths (files or directories) this
+   *  subtask will create or modify. Merge conflicts between parallel slices
+   *  come almost entirely from shared surfaces (README, package.json, a
+   *  global CSS/config file) that several subtasks all touch — the
+   *  2dot2dot-redesign build died on exactly that. When present,
+   *  parseBuildPlan rejects a plan where the same path appears in two
+   *  subtasks, and childBuildPrompt tells the child's agent to stay inside
+   *  its list. Optional for back-compat with plans written before this
+   *  field existed (empty array = "not declared", no overlap check). */
+  files: string[];
 }
 
 export interface BuildPlan {
@@ -268,7 +278,34 @@ export function parseBuildPlan(raw: string): { ok: true; plan: BuildPlan } | { o
       }
       acceptanceCriteria = r.acceptanceCriteria as string[];
     }
-    subtasks.push({ id: r.id, title, prompt: r.prompt, dependsOn, acceptanceCriteria });
+    let files: string[] = [];
+    if (r.files !== undefined) {
+      if (!Array.isArray(r.files) || r.files.some((f) => typeof f !== "string" || !f.trim())) {
+        return { ok: false, reason: `subtasks[${i}] ("${r.id}").files must be an array of non-empty strings` };
+      }
+      files = (r.files as string[]).map((f) => f.trim());
+    }
+    subtasks.push({ id: r.id, title, prompt: r.prompt, dependsOn, acceptanceCriteria, files });
+  }
+
+  // File-ownership overlap check: the same path declared by two subtasks is
+  // a merge conflict waiting to happen (parallel slices each committing their
+  // own version of it). Exact-string match after trim — a glob/prefix
+  // relationship (e.g. "src/" vs "src/a.ts") is deliberately NOT flagged,
+  // since directory-level ownership plus a file inside it can be legitimate
+  // parent/child structure the decomposer chose on purpose.
+  const fileOwner = new Map<string, string>();
+  for (const s of subtasks) {
+    for (const f of s.files) {
+      const owner = fileOwner.get(f);
+      if (owner !== undefined && owner !== s.id) {
+        return {
+          ok: false,
+          reason: `file "${f}" is declared by both subtask "${owner}" and subtask "${s.id}" — every file must have exactly one owning subtask`,
+        };
+      }
+      fileOwner.set(f, s.id);
+    }
   }
 
   for (const s of subtasks) {
@@ -473,14 +510,23 @@ function decomposePrompt(task: Task): string {
     `    { "id": "short-unique-id", "title": "short title", "prompt": "concrete, ` +
     `self-contained instructions for exactly this slice — the agent that implements it ` +
     `will see ONLY this text plus ${PIPELINE_PLAN_FILE} itself, not your reasoning here", ` +
-    `"dependsOn": [], "acceptanceCriteria": ["AC-1", "AC-2"] },\n` +
-    `    { "id": "another-id", "title": "...", "prompt": "...", "dependsOn": ["short-unique-id"], "acceptanceCriteria": [] }\n` +
+    `"dependsOn": [], "acceptanceCriteria": ["AC-1", "AC-2"], "files": ["src/feature-a/", "src/routes/A.tsx"] },\n` +
+    `    { "id": "another-id", "title": "...", "prompt": "...", "dependsOn": ["short-unique-id"], "acceptanceCriteria": [], "files": ["src/feature-b/"] }\n` +
     `  ]\n` +
     `}\n\n` +
     `Every "id" must be unique within the file; every "dependsOn" entry must name another ` +
     `declared "id" (never itself); the resulting dependency graph must be acyclic. Each ` +
     `subtask's "prompt" must be concrete enough to implement without further clarification ` +
     `— the agent implementing it works from that text and ${PIPELINE_PLAN_FILE} alone.\n\n` +
+    `Every subtask must declare "files": the paths (files or directories) it will create or ` +
+    `modify. Each subtask builds in its own worktree and all of them merge back into one ` +
+    `branch, so ANY file touched by two subtasks is a merge conflict waiting to happen — ` +
+    `the same path may not appear in two subtasks' "files" (that is a validation error that ` +
+    `blocks the pipeline). Shared, high-traffic files (README, package.json, lockfiles, a ` +
+    `global CSS/config/registry file that every slice would want a line in) must be owned by ` +
+    `exactly ONE subtask — usually a final integration subtask that dependsOn the others and ` +
+    `does the wiring; the other subtasks keep their code self-contained (their own ` +
+    `directories, their own CSS) and leave those shared files alone.\n\n` +
     `Then commit ${PIPELINE_SPEC_FILE}, ${PIPELINE_PLAN_FILE}, and ${PIPELINE_TASKS_FILE} ` +
     `to this branch (they may already be committed from an earlier pass — commit again only ` +
     `if you changed something). Do NOT push, do not open a pull request — this stays local. ` +
@@ -498,6 +544,7 @@ function decomposePrompt(task: Task): string {
  *  reason with "code review:" / "testing:" so the Builder knows which gate
  *  it is answering. */
 function buildingPrompt(task: Task): string {
+  const ccType = branchCommitType(task.branch, task.taskType);
   const feedback = task.pipelineFeedback
     ? `\n\nThe previous implementation was sent back. What the reviewing stage found:\n\n${task.pipelineFeedback}`
     : "";
@@ -510,8 +557,55 @@ function buildingPrompt(task: Task): string {
     `deviate in a small way to make it actually work, that's fine, but stay within its ` +
     `intent — don't redesign the approach. A Tester agent will run linters/typecheck/tests ` +
     `against your changes next. ` +
-    `When you're done, stop — do not ask a question, do not wait for confirmation, do not ` +
-    `commit anything (a later stage handles that).${feedback}`
+    `When you're done, commit your changes locally with a clear commit message (prefix the ` +
+    `subject with "${ccType}:", e.g. "${ccType}: ..."). This is required: uncommitted work ` +
+    `is invisible to later pipeline stages and blocks merges into this worktree. Do NOT ` +
+    `push, do not open a pull request, do not run any git command that touches a remote — ` +
+    `the commit stays local, a human reviews and pushes later. Do not include any AI ` +
+    `attribution in the commit message. Then stop — do not ask a question, do not wait for ` +
+    `confirmation.${feedback}`
+  );
+}
+
+/**
+ * Prompt for an agent-driven merge-conflict-resolution turn on a pipeline
+ * PARENT (origin `"pipeline-merge"` — see orchestrator.ts's
+ * `spawnMergeResolution`). Spawned by build-scheduler.ts when a child
+ * slice's merge-back conflicts: the merge is left IN PROGRESS in the
+ * parent's worktree, and this turn's only job is to conclude it.
+ *
+ * The "do NOT re-implement" line is the load-bearing sentence: the
+ * 2dot2dot-redesign incident (2026-08-19) happened because a recovery turn
+ * on a merge-blocked parent, with no idea the work already existed on a
+ * branch, rebuilt the entire feature in the parent worktree — permanently
+ * diverging bookkeeping from reality. Settle-side, nothing this agent SAYS
+ * is trusted: `settleMergeResolution` re-derives the outcome from git alone
+ * (`isBranchMerged`).
+ */
+export function mergeResolutionPrompt(
+  parentTask: Task,
+  child: Pick<Task, "branch" | "planSubtaskId" | "title">,
+): string {
+  const ccType = branchCommitType(parentTask.branch, parentTask.taskType);
+  return (
+    `A git merge is IN PROGRESS in this worktree and has conflicts. The branch being ` +
+    `merged is "${child.branch}" — the completed work of build subtask ` +
+    `"${child.planSubtaskId}" ("${child.title}"). Your ONLY job is to conclude this merge:\n\n` +
+    `1. Run \`git status\` to see the conflicted paths.\n` +
+    `2. Resolve every conflict by hand, preserving the intent of BOTH sides — the branch ` +
+    `carries that subtask's finished implementation and the current worktree carries the ` +
+    `other already-merged slices. Do NOT resolve by discarding one side wholesale, and do ` +
+    `NOT re-implement the subtask's feature from scratch — the work already exists on the ` +
+    `branch; your job is to land it, not to rewrite it.\n` +
+    `3. \`git add\` the resolved files and conclude the merge with \`git commit\` (the ` +
+    `prepared merge message is fine; if you write your own, prefix the subject with ` +
+    `"${ccType}:"). Do not include any AI attribution.\n` +
+    `4. If the project has a fast test/typecheck command, run it once to sanity-check the ` +
+    `resolution; fix only what the merge itself broke.\n\n` +
+    `Do NOT push, do not open a pull request, do not run any git command that touches a ` +
+    `remote. Do NOT abort the merge unless the conflict is genuinely unresolvable — and if ` +
+    `you do abort, say so plainly in your final message. When the merge commit exists, ` +
+    `stop — do not ask a question, do not wait for confirmation.`
   );
 }
 
@@ -545,6 +639,14 @@ export function childBuildPrompt(
     ? `\n\nYour slice must satisfy these acceptance criteria — read their full text in ` +
       `${PIPELINE_SPEC_FILE} at the repository root: ${subtask.acceptanceCriteria.join(", ")}.`
     : "";
+  const filesBlock = subtask.files.length > 0
+    ? `\n\nYou own ONLY these paths: ${subtask.files.join(", ")}. Do not create or modify ` +
+      `any file outside them — sibling slices own the rest, and an out-of-lane edit is a ` +
+      `merge conflict when the slices land. If your slice genuinely needs a change to a ` +
+      `file you don't own (a registry entry, a shared config line), do NOT make it: ` +
+      `describe the exact needed change in your final message instead, so the integration ` +
+      `slice can apply it.`
+    : "";
   return (
     `You are one of several agents implementing independent slices of a larger plan in ` +
     `parallel, each in your own git worktree branched off the same commit. Your slice: ` +
@@ -552,7 +654,7 @@ export function childBuildPrompt(
     `${PIPELINE_PLAN_FILE} at the repository root has the full plan for context — read it ` +
     `if you need to understand how your slice fits in, but implement ONLY what's described ` +
     `below; the other slices are being built separately and will be merged in alongside ` +
-    `yours.${acBlock}\n\n${subtask.prompt}\n\n` +
+    `yours.${acBlock}${filesBlock}\n\n${subtask.prompt}\n\n` +
     `When you're done, commit your changes locally with a clear commit message (prefix the ` +
     `subject with "${ccType}:", e.g. "${ccType}: ..."). This step is required — your work ` +
     `is only picked up by the rest of the pipeline once it's committed. Do NOT push, do not ` +

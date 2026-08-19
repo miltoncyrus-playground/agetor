@@ -44,7 +44,7 @@ async function seedTask(overrides: SeedOverrides): Promise<string> {
     workdir: makeWorkdir(), isolation: "none", taskType: "task",
     branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
     mode: "auto", model: "opus-4.7", effort: "high",
-    references: [], backlog: [], draft: null, runId: null,
+    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     createdAt: now, updatedAt: now, archivedAt: null,
     pipelineStage: null, planApproved: false, implementationApproved: false,
@@ -433,4 +433,131 @@ test("settleChildRun: a hard-failed conversation turn moves the child card to bl
   // Parent NOT blocked by a non-stage failure — only the child's own build
   // run may abort the build.
   expect(tasks.get(parentId)!.column).toBe("building");
+});
+
+// ─── satisfied subtasks: the durable barrier escape hatch ────────────────────
+
+test("satisfy: marks the subtask, records an audit event, and the barrier counts it as met", async () => {
+  const { satisfyPipelineSubtask } = await import("./orchestrator.ts");
+  const { buildBarrierState } = await import("./build-scheduler.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await seedTask({ pipelineStage: "building", column: "blocked", blockReason: "pipeline-failed" });
+  const task = tasks.get(taskId)!;
+  writeTasksPlan(task.workdir, { subtasks: [
+    { id: "a", title: "A", prompt: "do a", dependsOn: [] },
+    { id: "b", title: "B", prompt: "do b", dependsOn: [] },
+  ] });
+  // A merge-failed child for "a" — the 2dot2dot-redesign shape.
+  await seedTask({ parentTaskId: taskId, planSubtaskId: "a", childMergeStatus: "merge-failed", column: "blocked" });
+  const runId = await seedRun(taskId, "pipeline-stage");
+  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: 1 });
+
+  expect(buildBarrierState(task)).toEqual({ kind: "incomplete", unmet: ["a", "b"] });
+
+  const r1 = await satisfyPipelineSubtask(taskId, "a");
+  expect("error" in r1).toBe(false);
+  const after1 = tasks.get(taskId)!;
+  expect(after1.satisfiedSubtasks).toEqual(["a"]);
+  expect(buildBarrierState(after1)).toEqual({ kind: "incomplete", unmet: ["b"] });
+  const events = runs.events(runId).filter((e) => e.stream === "status");
+  expect(events.some((e) => e.data.includes('subtask "a" marked satisfied'))).toBe(true);
+
+  const r2 = await satisfyPipelineSubtask(taskId, "b");
+  expect("error" in r2).toBe(false);
+  expect(buildBarrierState(tasks.get(taskId)!)).toEqual({ kind: "complete" });
+});
+
+test("satisfy guards: unknown subtask, double-mark, non-pipeline task, missing TASKS.json", async () => {
+  const { satisfyPipelineSubtask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const taskId = await seedTask({ pipelineStage: "building", column: "blocked" });
+  writeTasksPlan(tasks.get(taskId)!.workdir, { subtasks: [{ id: "a", title: "A", prompt: "p", dependsOn: [] }] });
+
+  const unknown = await satisfyPipelineSubtask(taskId, "nope");
+  expect("error" in unknown && unknown.error).toContain('"nope"');
+
+  const ok = await satisfyPipelineSubtask(taskId, "a");
+  expect("error" in ok).toBe(false);
+  const dup = await satisfyPipelineSubtask(taskId, "a");
+  expect("error" in dup && dup.error).toContain("already marked satisfied");
+
+  const plainId = await seedTask({});
+  const plain = await satisfyPipelineSubtask(plainId, "a");
+  expect("error" in plain && plain.error).toBe("not a pipeline task");
+
+  const noPlanId = await seedTask({ pipelineStage: "building", column: "blocked", workdir: mkdtempSync(path.join(tmpdir(), "agetor-noplan-")) });
+  const noPlan = await satisfyPipelineSubtask(noPlanId, "a");
+  expect("error" in noPlan && noPlan.error).toContain("TASKS.json");
+});
+
+test("satisfy: refuses an already-merged subtask; a STALE merge-conflict (no live resolution run) stays satisfiable", async () => {
+  const { satisfyPipelineSubtask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const taskId = await seedTask({ pipelineStage: "building", column: "building" });
+  writeTasksPlan(tasks.get(taskId)!.workdir, { subtasks: [
+    { id: "a", title: "A", prompt: "p", dependsOn: [] },
+    { id: "b", title: "B", prompt: "p", dependsOn: [] },
+  ] });
+  // "merge-conflict" with NO live run on the parent = the resolution turn
+  // died/orphaned across a restart. Satisfy must remain available — it's the
+  // human's only unwedge for that state (the in-flight case is guarded by
+  // the same live-run check overridePipelineGate uses).
+  await seedTask({ parentTaskId: taskId, planSubtaskId: "a", childMergeStatus: "merge-conflict", column: "review" });
+  await seedTask({ parentTaskId: taskId, planSubtaskId: "b", childMergeStatus: "merged", column: "done" });
+
+  const merged = await satisfyPipelineSubtask(taskId, "b");
+  expect("error" in merged && merged.error).toContain("already merged");
+
+  const stale = await satisfyPipelineSubtask(taskId, "a");
+  expect("error" in stale).toBe(false);
+  expect(tasks.get(taskId)!.satisfiedSubtasks).toEqual(["a"]);
+});
+
+test("override at building marks every unmet subtask satisfied — a later bounce back into building cannot re-trip the barrier", async () => {
+  const { overridePipelineGate } = await import("./orchestrator.ts");
+  const { buildBarrierState } = await import("./build-scheduler.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await seedTask({ pipelineStage: "building", column: "blocked", blockReason: "pipeline-failed" });
+  writeTasksPlan(tasks.get(taskId)!.workdir, { subtasks: [
+    { id: "canvas", title: "C", prompt: "p", dependsOn: [] },
+    { id: "integration", title: "I", prompt: "p", dependsOn: ["canvas"] },
+  ] });
+  const runId = await seedRun(taskId, "pipeline-stage");
+  runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: 1 });
+
+  const result = overridePipelineGate(taskId);
+  expect("error" in result).toBe(false);
+  await settle();
+
+  const after = tasks.get(taskId)!;
+  expect(after.pipelineStage).toBe("code-review");
+  expect(after.satisfiedSubtasks.sort()).toEqual(["canvas", "integration"]);
+  expect(buildBarrierState(after)).toEqual({ kind: "complete" });
+  const events = runs.events(runId).filter((e) => e.stream === "status");
+  expect(events.some((e) => e.data.includes("marked unmet subtasks satisfied") && e.data.includes("canvas"))).toBe(true);
+});
+
+test("tickBuild: never spawns a child for a satisfied subtask, and counts it as a met dependency", async () => {
+  const { tickBuild } = await import("./build-scheduler.ts");
+  const { tasks } = await import("./db.ts");
+
+  const taskId = await seedTask({
+    pipelineStage: "building", column: "building",
+    satisfiedSubtasks: ["a"],
+  });
+  writeTasksPlan(tasks.get(taskId)!.workdir, { subtasks: [
+    { id: "a", title: "A", prompt: "do a", dependsOn: [] },
+    { id: "b", title: "B", prompt: "do b", dependsOn: ["a"] },
+  ] });
+
+  await tickBuild(taskId);
+  await settle(200);
+
+  const children = tasks.list().filter((t) => t.parentTaskId === taskId);
+  // No child for satisfied "a"; "b" spawned because its dependency counts as met.
+  expect(children.map((c) => c.planSubtaskId)).toEqual(["b"]);
 });

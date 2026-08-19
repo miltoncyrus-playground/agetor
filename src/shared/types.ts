@@ -1008,8 +1008,41 @@ export interface Task {
    * visible instead of stranded, and the next `tickBuild` for the parent
    * (a bounce back into building, or the barrier check on the building
    * exit) merges deferred children FIRST, before deciding anything else.
+   *
+   * A fifth value, `"merge-conflict"`, marks a child whose merge-back hit a
+   * genuine conflict and whose parent currently has an agent-driven
+   * merge-resolution run in flight (origin `"pipeline-merge"` — see
+   * orchestrator.ts's `spawnMergeResolution`). The merge is left IN
+   * PROGRESS in the parent's worktree (conflict markers and MERGE_HEAD
+   * intact) so the resolution agent works on the real merge state. This is
+   * a transient state: the resolution run's settle flips it to `"merged"`
+   * (verified via `isBranchMerged`) or `"merge-failed"` (abort + block, the
+   * pre-resolution behavior). While any sibling sits in `"merge-conflict"`,
+   * the scheduler parks other finishing children as `"merge-deferred"` and
+   * `tickBuild` no-ops — exactly one merge may be in flight per parent.
    */
-  childMergeStatus: "pending" | "merged" | "merge-failed" | "merge-deferred" | null;
+  childMergeStatus: "pending" | "merged" | "merge-failed" | "merge-deferred" | "merge-conflict" | null;
+  /**
+   * Pipeline PARENT only (empty otherwise): subtask ids from TASKS.json a
+   * human has explicitly marked as satisfied without a merged child — the
+   * durable "this work landed some other way" marker (e.g. re-implemented
+   * directly on the parent branch after a failed merge, the 2dot2dot-redesign
+   * incident of 2026-08-19). `buildBarrierState` counts these as met,
+   * `tickBuild` never spawns a child for them and treats them as met
+   * dependencies. Written only by `satisfyPipelineSubtask` and by
+   * `overridePipelineGate`'s building case (which marks every currently-unmet
+   * subtask so a later bounce back into building can't re-trip the barrier).
+   * Never settable via PATCH.
+   */
+  satisfiedSubtasks: string[];
+  /**
+   * Server decoration (never persisted — same lifecycle as `stalledSince`):
+   * for a pipeline parent blocked in the "building" stage, the subtask ids
+   * the build barrier still counts as unmet. Drives the per-subtask "Mark
+   * satisfied" affordance in the RunPanel's blocked banner. Absent/undefined
+   * everywhere else.
+   */
+  unmetSubtasks?: string[];
   /**
    * Derived (never persisted, like `pendingInteractionCount`): true for a
    * build child whose latest run SUCCEEDED but whose work hasn't been handed
@@ -1644,10 +1677,15 @@ export interface Run {
    * runs whose terminal outcome is allowed to move the pipeline
    * (`advancePipelineStage` / `settleChildRun` ignore unstamped runs, so a
    * user free-text follow-up or an auto-continuation can never advance a
-   * stage or trigger a merge). Optional so callers that don't pass it keep
-   * compiling unchanged; DB rows predating migration 023 read back as null.
+   * stage or trigger a merge). `"pipeline-merge"` = an agent-driven
+   * merge-conflict-resolution turn on a pipeline parent (see
+   * `spawnMergeResolution`): its settle is routed to
+   * `settleMergeResolution` — which verifies the merge actually landed via
+   * git, never by trusting the run's exit — instead of the stage-advance
+   * switch. Optional so callers that don't pass it keep compiling
+   * unchanged; DB rows predating migration 023 read back as null.
    */
-  origin?: "continuation" | "pipeline-stage" | null;
+  origin?: "continuation" | "pipeline-stage" | "pipeline-merge" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

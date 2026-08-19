@@ -703,6 +703,59 @@ export async function abortMerge(parentWorktreePath: string): Promise<void> {
   await git(["merge", "--abort"], parentWorktreePath, 30_000);
 }
 
+/**
+ * Deterministic "did that merge actually land" check — the settle path of an
+ * agent-driven merge-resolution turn ({@link mergeBranch} conflicted, an
+ * agent was asked to resolve and `git commit`) must never trust the agent's
+ * exit status; only git's own graph answers this. True iff BOTH hold:
+ *   1. no merge is in progress (MERGE_HEAD is gone — the agent concluded the
+ *      merge rather than leaving it parked half-done, the exact state the
+ *      2dot2dot-redesign worktree was found in on 2026-08-19), and
+ *   2. the branch's tip is an ancestor of the worktree's HEAD (its commits
+ *      are reachable — the merge commit exists).
+ * A `-`-leading branch name is rejected like mergeBranch's own guard.
+ */
+export async function isBranchMerged(worktreePath: string, branch: string): Promise<boolean> {
+  if (branch.startsWith("-")) return false;
+  const mergeHead = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], worktreePath, 15_000);
+  if (mergeHead.ok) return false; // merge still in progress
+  const ancestor = await git(["merge-base", "--is-ancestor", branch, "HEAD"], worktreePath, 15_000);
+  return ancestor.ok;
+}
+
+/**
+ * Commit everything in a worktree (`git add -A` + `git commit`) if — and only
+ * if — the tree is dirty. The pipeline's deterministic backstop for stage
+ * turns that leave work uncommitted despite their prompt's instruction: an
+ * uncommitted tree is both at risk (one reset from gone — the
+ * 2dot2dot-redesign incident left its entire canvas implementation as 41
+ * uncommitted files) and a hard blocker for every later `git merge` into
+ * that worktree. Never called on a tree with an in-progress merge
+ * (MERGE_HEAD) — committing there would conclude a merge nobody resolved —
+ * so callers on merge-adjacent paths check that first; this function also
+ * refuses on its own as defense in depth.
+ *
+ * `{ committed: false }` with no error means "already clean" — the common
+ * case. A non-git dir or git failure reports `error` and is otherwise
+ * harmless: the caller's next real git operation surfaces the underlying
+ * problem with better context.
+ */
+export async function commitAll(
+  worktreePath: string,
+  message: string,
+): Promise<{ committed: boolean; error?: string }> {
+  const mergeHead = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], worktreePath, 15_000);
+  if (mergeHead.ok) return { committed: false, error: "merge in progress — refusing to auto-commit" };
+  const status = await git(["status", "--porcelain=v1"], worktreePath, 30_000);
+  if (!status.ok) return { committed: false, error: status.stderr || "git status failed" };
+  if (!status.stdout.trim()) return { committed: false };
+  const add = await git(["add", "-A"], worktreePath, 60_000);
+  if (!add.ok) return { committed: false, error: add.stderr || "git add failed" };
+  const commit = await git(["commit", "-m", message], worktreePath, 60_000);
+  if (!commit.ok) return { committed: false, error: commit.stderr || commit.stdout || "git commit failed" };
+  return { committed: true };
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()

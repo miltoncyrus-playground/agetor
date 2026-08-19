@@ -89,7 +89,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     mode: null,
     model: null,
     effort: null,
-    references: [],    backlog: [], draft: null,
+    references: [],    backlog: [], satisfiedSubtasks: [], draft: null,
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,
@@ -1322,5 +1322,97 @@ describe("treeFingerprintSync", () => {
     const { treeFingerprintSync } = await import("./worktree.ts");
     const dir = mkdtempSync(path.join(tmpdir(), "agetor-not-a-repo-"));
     expect(treeFingerprintSync(dir)).toBeNull();
+  });
+});
+
+// ─── isBranchMerged / commitAll (pipeline merge-resolution primitives) ───────
+
+describe("isBranchMerged", () => {
+  test("true for a concluded merge, false for an unmerged branch", async () => {
+    const { isBranchMerged } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    await git(["checkout", "-b", "feature"], repo);
+    writeFileSync(path.join(repo, "f.txt"), "work\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "feat"], repo);
+    await git(["checkout", "main"], repo);
+
+    expect(await isBranchMerged(repo, "feature")).toBe(false);
+    await git(["merge", "--no-ff", "--no-edit", "feature"], repo);
+    expect(await isBranchMerged(repo, "feature")).toBe(true);
+  });
+
+  test("false while a conflicted merge is still IN PROGRESS (MERGE_HEAD parked)", async () => {
+    const { isBranchMerged } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    await git(["checkout", "-b", "feature"], repo);
+    writeFileSync(path.join(repo, "c.txt"), "feature side\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "feat"], repo);
+    await git(["checkout", "main"], repo);
+    writeFileSync(path.join(repo, "c.txt"), "main side\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "main"], repo);
+    await git(["merge", "--no-ff", "--no-edit", "feature"], repo); // conflicts, parks
+
+    expect(await isBranchMerged(repo, "feature")).toBe(false);
+
+    // Concluding the merge flips it — the exact transition
+    // settleMergeResolution verifies after a resolution turn.
+    writeFileSync(path.join(repo, "c.txt"), "resolved\n");
+    await git(["add", "c.txt"], repo);
+    await git(["commit", "--no-edit"], repo);
+    expect(await isBranchMerged(repo, "feature")).toBe(true);
+  });
+
+  test("rejects a dash-leading branch name", async () => {
+    const { isBranchMerged } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await isBranchMerged(repo, "--all")).toBe(false);
+  });
+});
+
+describe("commitAll", () => {
+  test("clean tree is a no-op; dirty tree (modified + untracked) commits everything", async () => {
+    const { commitAll } = await import("./worktree.ts");
+    const repo = await makeRepo();
+
+    expect(await commitAll(repo, "chore: checkpoint")).toEqual({ committed: false });
+
+    writeFileSync(path.join(repo, "README"), "changed\n");
+    writeFileSync(path.join(repo, "new.txt"), "untracked\n");
+    const result = await commitAll(repo, "chore: checkpoint");
+    expect(result.committed).toBe(true);
+
+    const status = await runCapture(["status", "--porcelain=v1"], repo);
+    expect(status.trim()).toBe("");
+    const subject = await runCapture(["log", "-1", "--format=%s"], repo);
+    expect(subject.trim()).toBe("chore: checkpoint");
+  });
+
+  test("refuses while a merge is in progress — never concludes a merge nobody resolved", async () => {
+    const { commitAll } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    await git(["checkout", "-b", "feature"], repo);
+    writeFileSync(path.join(repo, "c.txt"), "feature side\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "feat"], repo);
+    await git(["checkout", "main"], repo);
+    writeFileSync(path.join(repo, "c.txt"), "main side\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "main"], repo);
+    await git(["merge", "--no-ff", "--no-edit", "feature"], repo); // conflicts, parks
+
+    const result = await commitAll(repo, "chore: checkpoint");
+    expect(result.committed).toBe(false);
+    expect(result.error).toContain("merge in progress");
+  });
+
+  test("non-git directory reports an error without throwing", async () => {
+    const { commitAll } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-nogit-"));
+    const result = await commitAll(dir, "chore: checkpoint");
+    expect(result.committed).toBe(false);
+    expect(result.error).toBeDefined();
   });
 });

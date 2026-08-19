@@ -18,7 +18,8 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, handBackChild, listWorktrees, startTask, cancelRun, overridePipelineGate, pausePipelineTask, reconcileTaskSession, resumePipelineTask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, handBackChild, listWorktrees, startTask, cancelRun, overridePipelineGate, pausePipelineTask, reconcileTaskSession, resumePipelineTask, satisfyPipelineSubtask, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { buildBarrierState } from "./build-scheduler.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -229,7 +230,20 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   // `stalledSince` rides the same decoration: transient in-memory server
   // state (the turn-stall watchdog's mark) that the DB-derived Task can't
   // carry — see stall-registry.ts.
-  return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), unmetSubtasks: unmetSubtasksFor(t) };
+}
+
+/**
+ * `unmetSubtasks` decoration: only computed for a pipeline parent BLOCKED in
+ * its building stage — the one state where the RunPanel's blocked banner
+ * offers per-subtask "Mark satisfied" buttons. Costs one TASKS.json read per
+ * qualifying task per poll; blocked building parents are rare (normally zero),
+ * so this stays off the hot path. Undefined everywhere else.
+ */
+function unmetSubtasksFor(t: Task): string[] | undefined {
+  if (t.pipelineStage !== "building" || t.column !== "blocked" || t.parentTaskId != null) return undefined;
+  const barrier = buildBarrierState(t);
+  return barrier.kind === "incomplete" ? barrier.unmet : undefined;
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -3147,7 +3161,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const counts = subagents.runningCountsByTask();
           return json(
-            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0, stalledSince: stalledSince(t.id) })),
+            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0, stalledSince: stalledSince(t.id), unmetSubtasks: unmetSubtasksFor(t) })),
             { headers: corsHeaders(req) },
           );
         }),
@@ -3417,6 +3431,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/tasks/:id/pipeline-override": {
         POST: authed((req) => {
           const result = overridePipelineGate(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+      // Explicit human declaration that one build subtask's work landed some
+      // other way than a merged child (e.g. re-implemented on the parent
+      // branch after a failed merge). Durable: buildBarrierState counts it as
+      // met and tickBuild never spawns a child for it, so a later bounce back
+      // into building can't re-trip the barrier on it. Audited on the run log.
+      "/tasks/:id/satisfy-subtask": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { subtaskId?: string };
+          const result = await satisfyPipelineSubtask(req.params.id, body.subtaskId ?? "");
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
