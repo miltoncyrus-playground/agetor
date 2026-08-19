@@ -162,7 +162,7 @@ test("override: code-review gate forced to testing, with a durable audit event",
   expect(status.some((e) => e.data.includes("overridden by user"))).toBe(true);
 });
 
-test("override: testing gate forced straight to ready", async () => {
+test("override: testing gate forced straight to done (the pipeline's terminal column)", async () => {
   const { overridePipelineGate } = await import("./orchestrator.ts");
   const { tasks } = await import("./db.ts");
 
@@ -171,8 +171,31 @@ test("override: testing gate forced straight to ready", async () => {
   if ("error" in result) throw new Error(result.error);
 
   const task = tasks.get(taskId)!;
-  expect(task.column).toBe("ready");
+  expect(task.column).toBe("done");
   expect(task.implementationApproved).toBe(true);
+});
+
+test("provenance: a conversation turn on a COMPLETE pipeline re-affirms done, not the stage column", async () => {
+  const { advancePipelineStage } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  // Both gates approved — the 2dot2dot-fresh shape (2026-08-19): a chat turn
+  // ("push to main") on a finished pipeline used to drag the card back to the
+  // stage column, forcing a fresh gate override after every conversation.
+  const taskId = await seedTask({
+    pipelineStage: "testing", column: "running",
+    planApproved: true, implementationApproved: true,
+  });
+  const runId = await seedRun(taskId, null);
+
+  advancePipelineStage(taskId, runId, { kind: "success" });
+  await settle();
+
+  const task = tasks.get(taskId)!;
+  expect(task.column).toBe("done");
+  expect(task.pipelineStage).toBe("testing"); // stage history untouched
+  const status = runs.events(runId).filter((e) => e.stream === "status");
+  expect(status.some((e) => e.data.includes("already complete"))).toBe(true);
 });
 
 test("override: artifact-gated stages refuse (nothing to overrule)", async () => {

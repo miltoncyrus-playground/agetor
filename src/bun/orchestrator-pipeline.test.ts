@@ -342,7 +342,7 @@ test("pipeline: decompose success with an INVALID TASKS.json (cycle) blocks with
   expect(task.blockReason).toBe("pipeline-failed");
 });
 
-test("pipeline: plan-review approve goes straight to ready when implementationApproved was already true", async () => {
+test("pipeline: plan-review approve goes straight to done when implementationApproved was already true", async () => {
   const { startTask } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");
 
@@ -367,7 +367,7 @@ test("pipeline: plan-review approve goes straight to ready when implementationAp
   await settle();
 
   const task = tasks.get(taskId)!;
-  expect(task.column).toBe("ready");
+  expect(task.column).toBe("done");
   expect(task.planApproved).toBe(true);
   expect(task.implementationApproved).toBe(true);
 });
@@ -657,7 +657,7 @@ test("pipeline: specify through decompose chains correctly across real auto-adva
   void decomposeRunId; // decompose isn't verdict-bearing; reaching it is the assertion
 });
 
-test("pipeline: testing pass reaches ready (planApproved already true by construction)", async () => {
+test("pipeline: testing pass reaches done (planApproved already true by construction)", async () => {
   const { startTask } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");
 
@@ -681,7 +681,7 @@ test("pipeline: testing pass reaches ready (planApproved already true by constru
   await settle();
 
   const task = tasks.get(taskId)!;
-  expect(task.column).toBe("ready");
+  expect(task.column).toBe("done");
   expect(task.implementationApproved).toBe(true);
 });
 

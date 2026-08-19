@@ -1808,7 +1808,7 @@ export function settleChildRun(taskId: string, runId: string, outcome: PipelineO
  *   - clarify success: requires SPEC.md still present → advance to planning.
  *   - planning success: requires PLAN.md to exist → advance to plan-review.
  *   - plan-review: parses the Critic's verdict. approve → planApproved=true,
- *     advance to decompose (or straight to ready if implementationApproved
+ *     advance to decompose (or straight to done if implementationApproved
  *     was already true from an earlier pass). revise → bump the shared
  *     revision counter; over cap → blocked; under cap → back to planning
  *     with the reason folded into pipelineFeedback.
@@ -1826,8 +1826,9 @@ export function settleChildRun(taskId: string, runId: string, outcome: PipelineO
  *     approve → straight to testing. revise → same cap arithmetic,
  *     bounce target is building (plain fixup, no re-decomposition).
  *   - testing: same verdict shape. pass → implementationApproved=true,
- *     straight to ready (planApproved is true by construction). fail → same
- *     cap arithmetic, bounce target is building (not planning).
+ *     straight to done — the pipeline's terminal column (planApproved is
+ *     true by construction). fail → same cap arithmetic, bounce target is
+ *     building (not planning).
  *
  * The `startTask` call for the next stage is fired-and-forgotten
  * (`void ...catch(...)`), never awaited — it must not block the caller's
@@ -1868,11 +1869,18 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
   // sentinel paths already landed the card on `blocked` with the reason.
   if (runs.get(runId)?.origin !== "pipeline-stage") {
     if (outcome.kind === "success") {
+      // A COMPLETE pipeline (both gates approved) has no gate left to park
+      // at — re-affirming the stage column here would drag a finished task
+      // out of `done` and make the user override the testing gate again
+      // after every chat turn (the 2dot2dot-fresh loop, 2026-08-19).
+      const complete = task.planApproved && task.implementationApproved;
       pipelineStatus(
         runId, taskId,
-        `conversation turn ended — pipeline stage "${task.pipelineStage}" not advanced (only stage runs move the pipeline; use Retry stage or the gate override)`,
+        complete
+          ? `conversation turn ended — pipeline already complete (both gates approved); card stays in done`
+          : `conversation turn ended — pipeline stage "${task.pipelineStage}" not advanced (only stage runs move the pipeline; use Retry stage or the gate override)`,
       );
-      updateColumn(taskId, runId, task.pipelineStage, "stage-advance");
+      updateColumn(taskId, runId, complete ? "done" : task.pipelineStage, "stage-advance");
     }
     return;
   }
@@ -2032,7 +2040,11 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
       if (verdict.kind === "approve") {
         tasks.update(taskId, { planApproved: true, pipelineFeedback: null });
         if (tasks.get(taskId)?.implementationApproved) {
-          updateColumn(taskId, runId, "ready", "stage-advance");
+          // Both gates approved — the pipeline is complete. Terminal column
+          // is `done`, not `ready`: `ready` reads as "waiting to run" and a
+          // finished pipeline parked there is indistinguishable from a task
+          // that never started (the 2dot2dot-fresh confusion, 2026-08-19).
+          updateColumn(taskId, runId, "done", "stage-advance");
           return;
         }
         // Reset the shared revision budget so decompose/build phases each get
@@ -2196,7 +2208,9 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
         tasks.update(taskId, { implementationApproved: true, pipelineFeedback: null, pipelineBounceFingerprint: null });
         // planApproved is true by construction here — testing is only
         // reachable after an approved plan (see the plan-review case above).
-        updateColumn(taskId, runId, "ready", "stage-advance");
+        // `done` is the pipeline's terminal column (see the plan-review
+        // case above for why not `ready`).
+        updateColumn(taskId, runId, "done", "stage-advance");
         return;
       }
       bounceOrBlock("building", `testing: ${verdict.reason}`, { implementationApproved: false });
@@ -3678,8 +3692,8 @@ export function overridePipelineGate(taskId: string): { task: Task } | { error: 
     case "plan-review": {
       tasks.update(taskId, { planApproved: true, pipelineFeedback: null, pipelineBounceFingerprint: null });
       if (tasks.get(taskId)?.implementationApproved) {
-        audit("ready");
-        updateColumn(taskId, null, "ready", "stage-advance");
+        audit("done");
+        updateColumn(taskId, null, "done", "stage-advance");
       } else {
         audit("decompose");
         spawnPipelineStage(taskId, null, "decompose", { revisionCount: 0 });
@@ -3713,9 +3727,9 @@ export function overridePipelineGate(taskId: string): { task: Task } | { error: 
       break;
     }
     case "testing": {
-      audit("ready");
+      audit("done");
       tasks.update(taskId, { implementationApproved: true, pipelineFeedback: null, pipelineBounceFingerprint: null });
-      updateColumn(taskId, null, "ready", "stage-advance");
+      updateColumn(taskId, null, "done", "stage-advance");
       break;
     }
     default:
