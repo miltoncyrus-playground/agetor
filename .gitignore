@@ -52,3 +52,6 @@ skills-lock.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Pipeline eval reports (per-run output, not source)
+evals/pipeline/last-report.json
