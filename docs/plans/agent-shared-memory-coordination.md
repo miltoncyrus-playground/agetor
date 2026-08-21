@@ -1,4 +1,4 @@
-# Plan — Shared agent state and coordination across concurrent agetor tasks
+# Design: shared agent state and coordination across concurrent agetor tasks
 
 | Field | Value |
 | --- | --- |
@@ -8,6 +8,7 @@
 | Prior design reconciled | `docs/plans/pipeline-shared-memory.md` (design only, unimplemented as of this date) |
 | Scope decision | Every concurrently running agetor task on one machine and one `AGETOR_DATA_DIR`: plain tasks, pipeline stage tasks, and pipeline build children alike |
 | Status | **Design only. No code, no migration, no prompt file, no UI has been written for this document.** |
+| History | Sections 0 through 12 were written by the agetor pipeline on task `15c939ea` and are unchanged except for four corrections noted inline (§3's two added rows, §6.2's uncapped-N statement, §6.3's queue-durability rule, §7.5's fourth resume trigger, §10.2's `isolation: "none"` row). Sections 13 through 17 and the acceptance-criteria map were added afterwards. Every file and line citation in the document has been checked against the tree at `a0ab0d5` |
 
 ## 0. How to read this document
 
@@ -193,6 +194,8 @@ Every row here is shipped. This design builds on them and does not re-specify th
 | Session-death detection mid-run | EXISTING | `startDeathWatch` (`claude-tmux.ts:4260`) polls `tmux has-session` while a turn is in flight and requires `DEATH_MISS_THRESHOLD` (`:3991`, currently 4) consecutive misses before emitting `SESSION_DIED_STATUS_PREFIX` (`shared/types.ts:20`); the orchestrator moves the card to `blocked` with `reason: "session-died"`. `codex-tmux.ts` carries the same watch | Same gap as stalls: the run is correctly declared dead, and the work in the operator's head is the only record of what it had achieved. |
 | Per-task branch and working-copy isolation | EXISTING | `prepareWorkdir` (`worktree.ts:872`) creates `~/.agetor/worktrees/<task-id>/` on branch `agetor/<short-id>-<slug>`, off a `baseRef` resolved to a sha at create time so re-runs are reproducible | **Visibility between the copies.** Isolation is why two agents can work at once and also why neither can see the other. Divergence is discovered at merge, not before. |
 | Declared ownership of code areas between parallel subtasks | EXISTING | `BuildSubtask.files` (`pipeline-prompts.ts:203-212`), `parseBuildPlan`'s exact-match cross-subtask overlap rejection (`:288-308`), and `childBuildPrompt`'s instruction to the child to stay inside its list | **Everything outside one build plan.** Ownership is declared inside a single TASKS.json and is invisible to plain tasks, to a second pipeline running at the same time, and to any task that did not come from that plan. |
+| A cross-task claim on a shared resource | EXISTING | `createTask` refuses an `existingBranch` that another non-archived task in the same `workdir` has already pinned (`orchestrator.ts:3135` onward), and `ensureUniqueBranch` (`worktree.ts:795`) re-pins an agetor-minted branch name against every branch held on any task row (`orchestrator.ts:964-972`) | **Branch names only.** It is the one place in agetor where one task's state constrains another's, which is why it is named here rather than left out: the mechanism exists, its vocabulary is one string per task. It says nothing about files, nothing about intent, and it only fires at create time |
+| Cross-task serialization against a shared repository | EXISTING | `teardownTails` (`orchestrator.ts:210`), chained by `enqueueTeardown` (`:221`): a per-source-`workdir` FIFO that serializes archive and delete teardown because concurrent `git worktree remove` and `prune` calls against one repo contend on git's internal locks | **Lock contention, not coordination.** It exists so git does not trip over itself, and it is keyed on the raw `task.workdir` string, so two tasks pointed at different subdirectories of one repository get separate chains and can still contend (accepted deliberately, with the reasoning written out at `orchestrator.ts:200-204`). No task learns anything about another from it |
 | Mid-run message delivery to a running agent | EXISTING | `sendInput` (`orchestrator.ts:2460`). For `claude-code`, a follow-up sent while a turn is in flight folds into the active run via `pasteFollowUp` with `holdUntilIdle` so the run does not settle on the intermediate `end_turn`. For `codex` and `gemini`, the message enters a per-task queue drained when the current turn resolves (`drainCodexQueue` / `drainGeminiQueue`, called at `:1331-1332` and `:1391-1392`) | Nothing generates such a message today except the operator typing it. §6 reuses this transport rather than inventing one. |
 | Parking a message that cannot be delivered now | EXISTING | `Task.backlog` (`BacklogMessage[]`, migration 025) with add, reorder, patch and delete routes, plus the RunPanel tray that can send, edit or drop each draft | Operator-authored only. Nothing system-generated parks here yet. §6 names it as the precedent for an undeliverable conflict notice. |
 | Pause and resume of a pipeline task | EXISTING | `Task.pausedAt` (`shared/types.ts:956`), `pausePipelineTask` (`orchestrator.ts:3550`), `resumePipelineTask` (`:3567`) which spawns the next stage on resume | The resumed stage starts from its stage prompt. Whatever the paused agent had worked out is not carried across the pause. |
@@ -412,7 +415,9 @@ C3 deserves one clarification, because it reaches into the durable store: the co
 
 ### 6.2 Notification volume bound
 
-N live tasks can produce N-squared candidate pairs. The bound is structural, not a rate limit bolted on afterwards:
+N live tasks can produce N-squared candidate pairs, and **N is not capped anywhere in agetor today**. The only concurrency guard is one in-flight run per task (`orchestrator.ts:930`); there is no global limit on how many tasks run at once, and a pipeline parent's `tickBuild` spawns every dependency-ready child simultaneously with no width limiter (`build-scheduler.ts:257-312`). So the pair count is genuinely unbounded by anything structural, which is what makes the bound below load-bearing rather than decorative.
+
+The bound is structural, not a rate limit bolted on afterwards:
 
 - **One open record per unordered task pair per class.** The record's identity is `(repoKey, min(taskA,taskB), max(taskA,taskB), class)`. A re-detection updates the existing record's evidence and counter; it does not open a second one and does not re-notify.
 - **Notify once per record.** The first transition of a record to open sends the notice. Later evidence changes update the record silently and are visible on the operator surface. A second notice fires only if the record was closed and genuinely reopens.
@@ -459,6 +464,8 @@ It rides the existing follow-up transport named in §3 (`sendInput`, `orchestrat
 - For `claude-code`, the notice folds into the live turn via `pasteFollowUp`, with `holdUntilIdle` set so the run does not settle on the intermediate `end_turn` between the current response and the reply. The turn stays `running` and resolves when claude goes quiet. This is the same mechanism an operator's mid-turn message already uses, and the reason it does not clobber in-progress work is that claude's REPL accepts a queued message rather than overwriting the current one.
 - For `codex` and `gemini`, there is no live process between turns: each turn is a one-shot `codex exec` or `gemini -p` invocation. The notice enters the existing per-task queue (`drainCodexQueue` / `drainGeminiQueue`, called at `orchestrator.ts:1331-1332` and `:1391-1392`) and is delivered as the next resumed turn, carried by the thread id or session id. The stated consequence is a delivery latency of up to one turn. This is a property of the substrate, not a gap to close (SPEC A-8).
 
+**The queue is the delivery attempt, never the record.** `codexTurnQueue` (`orchestrator.ts:2525`) and `geminiTurnQueue` (`:2672`) are in-memory `Map`s that do not survive an agetor restart: a message sitting in one when the app quits is dropped silently, which is already true today for an operator's follow-up typed during a turn. A notice must therefore stay on its conflict record until delivery is *observed*, and enqueueing is not observing. Otherwise a restart between detection and drain loses the notice while leaving the record marked notified, which is the one failure that would make the C1 signal in §13 read better than reality.
+
 **The guard that must never be skipped:** a notice is never delivered while a native prompt or modal is pending for that task. The RunPanel's own `modalPending` rule exists for this reason (see `DiffDialog.tsx:548-571`, where `canSend` is gated on `!modalPending` and `send()` re-checks before firing): a keystroke reaching a live tmux modal lands in the modal's prompt rather than in the agent's conversation. A notice delivered into an open permission dialog would answer the dialog. The registry in `interactions.ts` is the authority on whether an interaction is pending, and the notice waits, or parks per step 5, until it clears.
 
 **4. What the recipient is expected to do.**
@@ -476,7 +483,7 @@ Each case has its own outcome, and they are different.
 | Case | Outcome |
 | --- | --- |
 | Recipient is not running now | The notice **parks durably** on the record and is delivered at the task's next spawn as a prompt block rather than as a mid-turn message. The precedent is `Task.backlog` (migration 025), which already parks an undeliverable message until it can be sent. |
-| Recipient is mid-turn | Delivered by fold (claude-code) or queue (codex, gemini) per step 3. It is never dropped and never overwrites in-progress input. |
+| Recipient is mid-turn | Delivered by fold (claude-code) or queue (codex, gemini) per step 3. It is never dropped and never overwrites in-progress input. The record holds the notice until delivery is observed, so a restart that empties an in-memory queue re-delivers rather than losing it. |
 | Recipient has a pending interaction or modal | Held until the interaction resolves, then delivered. If the task settles first, it parks per the not-running case. |
 | Recipient has finished or is archived | **No delivery.** The record resolves as `moot` and is surfaced only on the operator surface. Injecting a notice into an archived task's history would be noise nobody reads, and the archived freeze already rejects mutations. |
 | Recipient was deleted | The record is **dropped with the task**, on the same teardown path that kills the session and removes the worktree (`deleteTask` → `removeWorktree`, `worktree.ts:1117`). A record referencing a task id that no longer exists is garbage, not evidence. |
@@ -582,17 +589,18 @@ When they differ, the injected block **says so, in the block**, rather than pres
 
 The checkpoint is not discarded and not silently rewritten. Most of what it holds (what was completed, what was decided, what remains) survives a base move intact; what does not survive is any conclusion about code the agent did not touch. Marking it is honest and cheap. Deleting it would throw away the completed-steps list, which is the part that was worth keeping.
 
-### 7.5 The three resume triggers are not the same
+### 7.5 The resume triggers are not the same
 
-AC-8 names three, and they differ in what has survived. Blurring them is how a design ends up injecting a checkpoint into a conversation that already contains it.
+AC-8 names three. agetor has a fourth, and all four differ in what has survived. Blurring them is how a design ends up injecting a checkpoint into a conversation that already contains it.
 
 | Trigger | What survived | Role of the checkpoint |
 | --- | --- | --- |
 | **After a stall** (`checkTurnStall`, `claude-tmux.ts:1422`) | The tmux session is usually still alive and the conversation is intact; the turn is wedged, not gone | Context for the *same* conversation. The block is delivered as a follow-up into the live session, not as a fresh spawn prompt. It reminds the agent what it had established before the wedge, and pairs with the scraped pane lines the stall sentinel already carries. |
 | **After a pause** (`resumePipelineTask`, `orchestrator.ts:3567`) | The task's DB state; the session may or may not still exist | `resumePipelineTask` already spawns the next stage, so the checkpoint rides that spawn as a prompt block. This is the cheapest of the three: the pause was deliberate, so the checkpoint was captured cleanly at `pausePipelineTask`. |
 | **After an app restart** (`reconcileOrphans`, `orchestrator.ts:606`) | Two sub-cases, and they are genuinely different. **Reattached**: the tmux session survived, the JSONL replays from offset 0, and the conversation is intact, so the checkpoint is **redundant but harmless** and is not injected. **Orphaned**: the session is gone, the run flipped to `orphaned` and the task went back to `ready` with `run_id=NULL`, so the conversation is unrecoverable and the checkpoint is **the only surviving context**. It is injected on the next spawn. | The reattach-versus-orphan split is the whole value of the distinction: injecting a checkpoint into a reattached conversation duplicates what the agent can already see, and *not* injecting one into an orphaned task loses everything. |
+| **After an idle-session reap** (`reapIdleSessions`, `orchestrator.ts:3890`) | The task row and the CLI's own transcript. The tmux session was killed **deliberately** by agetor after `IDLE_SESSION_REAP_MS` (30 minutes, `shared/types.ts:1145`) of genuine idleness, to reclaim the 300 to 500MB the process holds. The next message falls through `sendClaudeTurn`'s liveness probe to `spawnResumedSession` (`orchestrator.ts:3005`), which resumes on the persisted session id | Injected on the respawn, same as the orphaned case. The conversation is recoverable here (`--resume` against a JSONL that was never deleted), so the checkpoint is not the *only* context the way it is after an orphan, but the reap is silent by design and the operator's next message may arrive hours later against an agent that has lost its working set. |
 
----
+**Why the fourth trigger is listed even though AC-8 names three.** It is the one that actually fires most often. A stall needs a wedged TUI, a pause needs an operator, and a restart needs the app to go away; a reap needs nothing but half an hour of quiet, which is the normal shape of a developer stepping away from a board with several cards on it. A design that covered the three dramatic cases and missed the routine one would be measured in §13 against resumes that mostly do not happen.
 
 ## 8. Store split and the placement rule
 
@@ -731,6 +739,7 @@ Secrets, API keys, tokens, passwords, credentials, private keys, connection stri
 | Two clones of the same remote at different paths | Both resolve to the same canonical remote URL, so they **do** share a key | Correct coordination, with one caveat: path-based overlap (C1) compares repo-relative paths, so it works, while any absolute-path display shows two different roots. |
 | `origin` renamed or repointed after `createTask` | The persisted key is not recomputed, by design | An existing task keeps coordinating under its original key. A task created afterwards gets the new key and does not see it. The symptom is a peer that "should" be visible and is not. |
 | Different remotes for the same logical project (a fork) | Different keys | No coordination between fork and upstream working copies. This is the intended behavior, not a defect. |
+| A task with `isolation: "none"`, or one whose workdir is a subdirectory of the repo | Same key, and correctly so | This is the case where awareness matters most and is easiest to overlook. Such a task has no worktree and no branch of its own (`prepareWorkdir` returns `{ cwd: task.workdir, branch: null, worktreePath: null }`, `worktree.ts:883-885`), so it writes into the operator's live tree while every isolated peer writes into `~/.agetor/worktrees/`. Path overlap between the two is real and immediate rather than deferred to a merge, because there is no merge. The awareness row still renders, with `branch` empty, and C1 overlap against it should be read as higher severity than an overlap between two isolated peers, since git is not holding the two apart. |
 
 ---
 
@@ -768,6 +777,7 @@ Every store proposed anywhere in this document appears here.
 | Derived liveness (§5.1) | tmux probe fails or hangs | Non-zero exit or a probe deadline | Treat presence as unknown and render it as unknown, never as dead. Falsely reporting a live agent as dead is the one error that would make peers act wrongly. Note this store has no persistence to fail: there is nothing to corrupt |
 | Prompt injection (§5.4, §7.3) | The assembled block exceeds the budget, or gemini's argv ceiling | Byte count before spawn | Truncate by the stated order, then omit. **A spawn never fails because of an injected block** |
 | Notice delivery (§6.3) | The target session died between queueing and delivery | The existing death watch (`startDeathWatch`, `claude-tmux.ts:4260`) | Park the notice on the record; it is delivered at the next spawn. The record stays open |
+| Notice delivery, codex and gemini queue (§6.3 step 3) | agetor restarts while a notice sits in `codexTurnQueue` (`orchestrator.ts:2525`) or `geminiTurnQueue` (`:2672`); both are in-memory and are lost | Nothing detects it directly. The record is the detector: it still shows the notice undelivered | Re-deliver from the record on the next spawn. **The record is marked notified only when delivery is observed, never when the message is enqueued**, so a lost queue costs a delay and never a lost notice |
 | Sentinel parsing (`AGENT_STATE:`) | Malformed or absent lines | Pure parser | Drop the line, keep the rest, never fatal. Same discipline as `parsePipelineVerdict` and `parseBuildPlan` |
 | Optional fleet adapter (§2.3) | Hosted service unreachable, slow, or rate-limited | Request failure or timeout | Mirror outward is skipped and logged. **It is never read on any path that a run depends on**, which is the whole reason it is an adapter and not the mechanism |
 
@@ -817,3 +827,178 @@ It must offer, per entry: inspect, edit, and delete. Plus one action specific to
 Where it hangs: it extends the memory browser dialog already sketched in `pipeline-shared-memory.md` §4.6 rather than adding a second dialog beside it. That document's version covered `memories` only; this one adds the ephemeral kinds and the conflict-record close action.
 
 Deliberately thin. A browser, not an editor suite. The operator's job here is to delete what is wrong, not to author shared state by hand.
+
+---
+
+## 13. Measurable outcomes
+
+One outcome per capability area, each paired with a signal that already exists or that this design creates. **Every signal below is one sqlite query against `agetor.sqlite`.** No monitoring subsystem, no telemetry service, no counters that need their own storage. That is the direct consequence of §2.1 rejecting the reference's `enable_monitoring` and Agno's `monitoring=True`: the rejection is only honest if the replacement is genuinely readable, so each row names the table the number comes from.
+
+| Area | Outcome | Signal | Where the signal is read |
+| --- | --- | --- | --- |
+| **Awareness (§5)** | An agent that has live peers starts its turn knowing about them | Share of spawns that had at least one live peer at spawn time and carried a non-empty `## Other agents in this repo` block. Target is 100%; anything below it is a budget drop or a bug, and the two are distinguishable because a budget drop is recorded | `run_events`. `startTask` already persists the **fully assembled** prompt as a `user` event (`onChunk("user", normalizeUserText(promptWithRefs))`, `orchestrator.ts:1060`), so the injected block is on disk with no new instrumentation. The denominator is `agent_claims` rows live at that run's `started_at` |
+| **Awareness (§5)** | The operator sees an overlap before either agent finishes | Median age of a C1 record at the moment a human first opens the task pair, against the age of the same record when the merge is attempted | `conflict_records.opened_at` against `runs.started_at` and the merge attempt time |
+| **Conflict (§6)** | Overlaps are detected before integration rather than discovered at it | **Share of merge conflicts that had an open C1 record before the merge was attempted.** This is the number that says early detection works, and it is the one to watch first | Numerator: `conflict_records` rows with `class='C1'`, `state='open'` and `opened_at` earlier than the merge. Denominator: children that reached `child_merge_status='merge-conflict'` (`tasks`, migration 036 and 042). The denominator exists today, so a baseline can be taken before any of this ships |
+| **Conflict (§6)** | Notices stay bounded, so real conflicts are not buried | Notices sent per open record (§6.2's rule makes 1.0 the correct value; above 1.0 means the notify-once transition leaked) and open records per `repoKey` against the ceiling | `conflict_records.notified_at` and a count grouped by `repo_key` |
+| **Persistence (§7)** | An agent resuming does not repeat work it already completed | **Repeated-work overlap**: the intersection between the evidence paths in the injected checkpoint's `completedSteps` and the files the agent touches in the run that follows the resume. Falling overlap is the outcome; a high overlap means the block was injected and ignored, which is an eval failure rather than a plumbing failure, and §14 puts it in the eval lane for that reason | `agent_checkpoints.body` for the injected list, `getTaskDiff` (`worktree.ts:1035`) at the next settle for what was actually touched |
+| **Persistence (§7)** | A resume that could have had context did have it | Coverage: share of resumes (all four triggers in §7.5) where a checkpoint existed to inject. This is the leading indicator; the overlap number above is the lagging one, and reading them together separates "we never captured" from "we captured and it did not help" | `agent_checkpoints` against `runs` where the prior run ended `orphaned`, or the task was resumed after `paused_at`, or the session had been reaped |
+
+*Illustrative only. Shapes the discussion; not an implementation to merge.*
+
+```sql
+-- The conflict signal, in the shape it would actually be read.
+-- Numerator: merge conflicts that were seen coming.
+SELECT
+  SUM(CASE WHEN cr.opened_at IS NOT NULL THEN 1 ELSE 0 END) AS foreseen,
+  COUNT(*)                                                  AS conflicts
+FROM tasks child
+LEFT JOIN conflict_records cr
+  ON cr.class = 'C1'
+ AND cr.repo_key = child.repo_key
+ AND (cr.task_a = child.id OR cr.task_b = child.id)
+ AND cr.opened_at < child.updated_at
+WHERE child.child_merge_status = 'merge-conflict';
+```
+
+**The three signals already specified in `pipeline-shared-memory.md` §10 carry forward unchanged** (repeat-bounce rate, recall usage, eval score). They are not restated here and they are not renumbered.
+
+One property worth stating, because it is what makes these numbers trustworthy: **none of them depends on an agent reporting honestly about itself.** Every one is read from rows agetor writes about what happened. §6.3's `unacknowledged` terminal state exists for the same reason. "Did agents acknowledge notices" would have been the easy metric and the wrong one.
+
+---
+
+## 14. Phased delivery
+
+Four phases. Each is independently shippable in the strict sense: stopping after any one of them leaves agetor correct, useful, and with no half-built surface exposed to the operator.
+
+**The ordering rule: read-only observation lands before anything writes into a prompt.** Prompt content is the cheapest thing to get wrong and the most expensive to notice, because a bad injected block does not fail loudly, it just makes agents slightly worse in a way no test catches. Phase 1 therefore builds the whole fact-gathering path and shows it only to a human, where a wrong value is obvious and free. Phase 3 injects only facts that Phase 1 has already been proving correct on a real board.
+
+Migrations are numbered by the phase that first needs the table, not allocated up front, and `042_satisfied_subtasks.sql` is the latest on disk. Per CLAUDE.md an applied migration is never edited, so a table that ships in Phase 1 cannot be widened in Phase 2 by rewriting `043`.
+
+| | Phase 1: awareness, read-only | Phase 2: checkpoints and resume | Phase 3: conflict detection and notices | Phase 4: durable knowledge |
+| --- | --- | --- | --- | --- |
+| **Ships** | `repoKey` on every task with a backfill, `agent_claims`, claim writes at existing choke points, derived liveness assembly, the operator awareness view (§5.5). Migration `043` | `agent_checkpoints`, the `AGENT_STATE:` grammar and its pure parser, capture at the six points in §7.2, the resume block with §7.3's truncation order, base-moved marking (§7.4), all four triggers in §7.5. Migration `044` | `conflict_records`, detectors for C1 through C5, notice composition, delivery over `sendInput` with the pending-interaction guard, the volume bound in §6.2, and the peer block injection in §5.4. Migration `045` | Everything in `pipeline-shared-memory.md`, widened from pipeline tasks to all tasks per §4. **Deferred to that document rather than re-specified here** |
+| **Explicitly defers** | All prompt injection, all messaging, all conflict detection, checkpoints, durable knowledge. Nothing an agent can observe | Peer awareness in prompts, conflict detection, notice delivery, durable knowledge | Automatic resolution (never; SPEC non-goal 8), C3 arbitration (never; §6.1), the optional fleet adapter | Nothing. It is the last phase and its own document names its deferrals |
+| **Single-agent behavior** | Stronger than §1.2 requires: **no prompt path is touched at all**, so a solo agent's prompt is byte-identical by construction rather than by a gating predicate. The view hides rather than rendering empty | §1.2 does not apply. Checkpoints are per-task and involve no peers, so a solo agent gets its own state back. This is the one phase that is useful with one agent, and it is why it sits second | §1.2 verbatim: zero peers for the `repoKey` means the detector returns before touching the database and no block is injected | Recall is repo-scoped, not peer-scoped, so it works solo |
+| **Gate tests** (deterministic, local, free, sub-2s) | `repoKey` normalization over a table of URL forms; claim upsert and expiry with an injected clock; peer-set assembly excluding self and excluding other `repoKey`s; staleness classification exactly at the window boundary | Parser drops malformed `AGENT_STATE:` lines and never throws; truncation preserves `completedSteps` last and reports the dropped count; a crash between stage and swap leaves the previous checkpoint readable and never a half-record; base-moved comparison; zero headroom omits the block and the spawn still succeeds | Path-set intersection as a pure function; pair-key idempotence (re-detection updates, never duplicates); notify-once transition; ceiling behavior; delivery refused while an interaction is pending; **a record is marked notified only on observed delivery**, proven by dropping the in-memory queue mid-flight | As specified in that document |
+| **Periodic evals** (paid, LLM, threshold) | **None, and that is correct.** Nothing latent ships in this phase, so an empty eval lane is the honest answer rather than a gap | Does an agent given `## Your earlier state on this task` avoid redoing completed steps? Scored on §13's repeated-work overlap against a fixture task resumed after a forced session reap | Does an agent receiving a C1 notice pick one of the three bounded responses in §6.3 step 4, rather than attempting a merge it was told not to attempt? Scored on a fixture with a planted overlap | As specified in that document |
+| **Done when** | The operator can watch two concurrent tasks on one repo, see their overlapping paths, and no agent behaves differently than it did before the phase | A task resumed after an orphan or a reap receives its completed-steps list, and §13's coverage number is above zero on a real board | §13's foreseen-conflict share is measurable, with a baseline taken before the phase from `child_merge_status` alone | Per that document |
+
+Phase 2 sits before Phase 3 on purpose, and the reason is worth stating because the ticket's framing suggests the opposite order. Coordination is the headline ask, but most boards most of the time are running one agent, and the checkpoint is the only mechanism here that helps that case. It also exercises the injection budget machinery (§9's argv split, §7.3's truncation order) on a block whose content is authored by and for a single task, which is the low-risk way to get that machinery right before Phase 3 hangs a second block off it.
+
+---
+
+## 15. Prioritized recommendation
+
+One ranked list, highest value against cost first. Readable without re-reading §2 or §5 through §7.
+
+| Rank | Integration | Value | Cost | Why it sits here |
+| --- | --- | --- | --- | --- |
+| 1 | `repoKey` persisted on every task | high | very low | One column and a backfill. Nothing else in this document works without it, and it is already specified in `pipeline-shared-memory.md` §4.5 for a narrower scope. Cheapest unlock in the list |
+| 2 | Derived liveness and peer-set assembly | high | low | Reuses the derived-flag machinery `isGateParked` and `isAwaitingHandBack` already run through (`shared/types.ts:1091`, `:1118`). Stores nothing, so it can never go stale (§5.1) |
+| 3 | Operator awareness view (§5.5) | high | low | The highest human value per unit of work in the list: it catches the collision a person can act on immediately, and it needs no agent cooperation, no prompt budget, and no new trust boundary |
+| 4 | `agent_claims` with declared and touched paths | high | medium | The substrate every conflict class reads. Medium only because touched-path derivation costs a git call, which §5.2 keeps off the poll path |
+| 5 | Checkpoint capture, deterministic half | high | low | `filesTouched`, `baseSha`, `runId`, `capturedAt` come from git and the run row with no agent cooperation, so it works identically for all three kinds and cannot be degraded by an agent that ignores instructions |
+| 6 | Checkpoint feed-back on resume (§7.3) | high | medium | The "do not start from scratch" outcome, and the one that helps a solo agent. Medium cost because the truncation order is normative and has to be right |
+| 7 | `AGENT_STATE:` sentinel, agent-authored half | high | medium | Turns a file list into a reasoning trail. Ranked below 6 because its value is realized only once 6 exists, and it spends prompt real estate to ask for it |
+| 8 | C1 detection: path overlap between live tasks | high | medium | The headline conflict class and the one §13's primary signal measures. Deterministic set intersection, so the cost is in the claim freshness, not the test |
+| 9 | Peer block injection at spawn (§5.4) | medium | medium | The first thing that writes into a prompt. Sits after 8 deliberately so the block has something true to say on the day it ships |
+| 10 | C1 notice delivery over `sendInput` | medium | high | The most complex path in the design: the fold-versus-queue asymmetry (§9), the pending-modal guard, and the parking rules. High value when it lands, but it is the row most likely to be wrong |
+| 11 | Shared-state browser (§12.2) | medium | medium | Not needed before the store exists, needed before the store can be trusted. A store with no delete path is one wrong entry away from being worse than nothing |
+| 12 | C4 stale-claim expiry | medium | low | Small, and it is what keeps rank 8 honest. Without it, peers coordinate against claims whose owner walked away |
+| 13 | C2 divergence early warning | low | low | Cheap once 8 exists, because the git primitives are already there (`getAheadCount`, `worktree.ts:91`). Low value because the merge catches it anyway, just later and more expensively |
+| 14 | C5 duplicate-work advisory | low | low | Advisory by design and tuned to prefer silence. Worth having, never worth a false positive |
+| 15 | C3 contradictory-knowledge detection | low | medium | Depends on Phase 4 existing, and its only action is to show a human two entries. Correct, and not urgent |
+| 16 | Durable knowledge store | high | high | Ranked here only because it is already designed and owned by `pipeline-shared-memory.md`. Its value is real and its cost is a whole phase; this document adds nothing to it but scope |
+| 17 | Optional outbound fleet adapter (§2.3) | low | medium | Off by default, never on a path a run depends on. Last because it buys nothing on a single machine, which is the only environment in the boundary (§10.2) |
+
+**Everything marked `POSSIBLE-BUT-NOT-USEFUL` in §2.2 is absent from this list by construction**, and so are the five capabilities rejected as not possible. That is 31 of the 50 audited capabilities. The exclusion is stated here rather than left to be inferred from a gap between two tables.
+
+---
+
+## 16. Open questions and rejected alternatives
+
+### 16.1 Open questions
+
+Each row names what would settle it. An open question with no stated resolution path is a decision being avoided, not a question.
+
+| Question | Why it is open | What would settle it |
+| --- | --- | --- |
+| **Is the JubarteAI fleet platform an adapter or the mechanism?** (SPEC A-5, **Confirm**) | The ticket never says. This design assumes adapter, on the local-first rule and AC-15. If the operator intends otherwise, §5, §6 and most of §8 reverse | The operator answering, **before Phase 1**. A later reversal invalidates analysis rather than wording, which is why it carries the Confirm flag rather than sitting in a backlog |
+| **What multiple of the stall threshold sets the claim window?** (§5.3) | Too short and a long tool call looks abandoned; too long and peers coordinate against ghosts. `AGETOR_TURN_STALL_MS` defaults to 10 minutes for the first reason (`claude-tmux.ts:1363-1366`), which bounds the answer from below but does not pick it | Measurement, not judgement. Phase 1 already records claim rows and `run_events` already timestamps activity, so the distribution of legitimate quiet gaps is readable off a week of real boards. Take a high percentile of that distribution |
+| **When, if ever, do embeddings become worth it?** (§2.1, §2.3) | Rejected today as POSSIBLE-BUT-NOT-USEFUL at hundreds of rows, not rejected in principle. A row count is the wrong trigger because it is a proxy | An eval set of retrieval queries with known-correct answers, run against BM25 as the corpus grows. The trigger is recall measurably degrading on that set, not the store crossing a number someone guessed |
+| **Does the optional LanceDB retrieval sidecar ever get built?** | Same question as the row above wearing different clothes. The sidecar is a local, embedded vector index, so the objection is not hosting, it is a second datastore for a table that does not need one (§2.3) | The same recall trigger. The reason it stays a stated contract rather than a plan is that adding it later requires no schema change: sqlite stays the record of truth and the index is derived, so it can be built, discarded, and rebuilt without touching a row |
+| **How long is a bounded intent summary?** (§5.1, §5.4) | It trades directly against the argv budget in §9, and a summary too short to recognize overlap in is worse than none | The budget math in §9 sets the ceiling. Within that, an eval: can a reader given only the summary correctly identify which of several peers overlaps their own task |
+| **What threshold makes C5 fire?** (§6.1) | A duplicate-work advisory tuned wrong is noise in every prompt, and there is no ground truth for "materially the same intent" | Run the detector in shadow mode during Phase 1: record what it would have fired on, notify nobody, and count false positives against the operator's own reading of the pairs. It earns the right to notify by being quiet |
+| **Is the peer block refreshed mid-run, or only at spawn?** (§5.4) | A long task can spawn alone and acquire peers an hour later, and §5.4 injects only at spawn | Count it. Phase 1's claim rows make "how often did a peer appear after this task's spawn" a one-query answer, and the cost of mid-run refresh (a follow-up message into a live turn) is only worth paying if that number is high |
+| **How is overlap severity scored when one side has `isolation: "none"`?** (§10.2) | Such a task writes into the operator's live tree with no branch holding it apart, so an overlap is immediate rather than deferred to a merge. §6.1's severity rules assume both sides are isolated | A decision, not a measurement, and a small one: either a fixed severity bump or a separate class. It is listed because it was found late and should not be silently folded into C1 |
+
+### 16.2 Rejected alternatives
+
+| Alternative | Rejected because |
+| --- | --- |
+| **Run the reference project's runtime as-is inside agetor** | It is a Python library with no server, no API, and no process to talk to, and agetor is a Bun main process driving CLI subprocesses. There is no seam to host it, and SPEC non-goal 4 excludes committing to it as a dependency. Its ideas are adopted (§2.1); its runtime is not |
+| **LanceDB plus OpenAI embeddings as the store** | Two separate objections that are easy to conflate. The embedding call is barred by CLAUDE.md's rule against hosted inference endpoints. LanceDB is local and embedded, so hosting is not the objection there: it is a second datastore beside a migrated, backed-up, already-open sqlite file, for a table that will hold hundreds of rows |
+| **Agno as the orchestration framework** | agetor already has an orchestrator that spawns and drives real CLIs through tmux (`startTask`, `orchestrator.ts:927`; `advancePipelineStage`, `:1844`; the build barrier, `build-scheduler.ts:68`). Adopting Agno would mean hosting in-process Python agents, which is a different product. CLAUDE.md's "no framework-of-the-month" rule closes it independently |
+| **The JubarteAI fleet platform as the mechanism rather than an adapter** (**Confirm**, SPEC A-5) | A hosted service cannot sit on the spawn path when AC-15 requires that a shared-state failure never block a run, and nothing in `src/` calls it today. It stays available as an off-by-default outbound mirror. **This is the one rejection the operator should overturn early if it is wrong**, because it is load-bearing for §5 and §6 rather than incidental |
+| **Cross-machine coordination** | Outside the boundary set in §1.1 and SPEC A-6. It would require a shared authority for liveness, and liveness is the one thing this design refuses to store precisely because a stale copy is worse than none (§5.1). Deferred, not designed against: `repoKey` scoping is the same on one machine or many |
+| **An MCP tool surface for agent reads and writes** | It would work for none of the three kinds today. agetor's `ask_user` MCP server was deliberately removed and `hook-installer.ts` actively strips `mcpServers.agetor` from a worktree's settings on every spawn; codex and gemini would need separate registration paths regardless. Sentinels work identically across all three, which is why SPEC A-9 fixes the channel |
+| **Automatic conflict resolution** | SPEC non-goal 8, and the existing merge flow already draws the line correctly: `settleMergeResolution` (`orchestrator.ts:1667`) ignores the agent's own claim of success and re-derives the outcome from git through `isBranchMerged` (`worktree.ts:718`). A design that let a coordination layer decide merges would be trusting exactly the assertion that flow was built to distrust |
+| **A shared writable working copy instead of per-task worktrees** | It looks like it solves the visibility problem and it destroys the property that makes the problem tractable. With one tree, two agents' edits interleave silently and the last writer wins with no record; with worktrees, divergence is at least *detectable*, which is what §6 builds on. Isolation is why parallel agents are safe at all (`prepareWorkdir`, `worktree.ts:872`), and the fix for its blind spot is to describe the copies to each other, not to remove them |
+| **A stored `is_alive` flag per task** | A crashed writer leaves a stale `true` behind and peers then coordinate against an agent that no longer exists. Derived liveness cannot disagree with reality because there is no second copy (§5.1). Rejected here rather than only in §5.1 because it is the most natural thing to build and the mistake is invisible until it matters |
+| **Wall-clock timestamps to order concurrent writes** | Timestamps from different agent processes carry no ordering guarantee worth relying on, while a monotonic per-row counter under sqlite's WAL serialization is exact and cheap (§11.1). Timestamps are still recorded, for display and expiry, never for ordering |
+| **A regex that detects secrets before storing** | It would catch most secrets and thereby encourage treating the store as sanitized, which is worse than knowing it is not (§10.1). The three real controls are the prompt instruction, the operator's delete, and the fact that the file never leaves the machine |
+| **A global cap on concurrent tasks, as the answer to overlap** | It would reduce conflicts by reducing parallelism, which is the capability agetor exists to provide. §6.2 bounds *notices*, not work. Noted because the N-squared framing invites it |
+
+---
+
+## 17. Edge-case register
+
+One row per bullet in the ticket's "Edge cases considered". Fifteen rows, fifteen bullets.
+
+| Edge case | Where handled | Behavior |
+| --- | --- | --- |
+| Two agents change the same code in separate isolated copies | §6.1 (C1, C2), §5.1 | **Both**, and the document says so explicitly rather than choosing one. Intent is detected up front at every claim point (task start, build-plan parse, first observed write); divergence is watched cheaply while an overlap exists and definitively at merge through the existing `mergeBranch` and `isBranchMerged` path |
+| A conflict message is sent to an agent that is not running, has finished, or was deleted | §6.3 step 5 | Four distinct outcomes, not one: **not running** parks durably on the record and is injected at the next spawn; **finished or archived** resolves the record `moot` with no delivery; **deleted** drops the record with the task on the `deleteTask` teardown path; **nobody ever reads it** ages out and closes as `unacknowledged`, which §6.3 states is a normal terminal state and not an error |
+| A conflict message arrives while the recipient is mid-turn | §6.3 step 3, §9 | Never lost and never overwrites in-progress input. `claude-code` folds it into the live turn via `pasteFollowUp` with `holdUntilIdle`; `codex` and `gemini` have no live process between one-shot turns, so it goes through the existing per-task queue with a stated latency of up to one turn. The record, not the in-memory queue, is the durable home, so a restart re-delivers |
+| An agent records what it intends to work on, then changes course | §5.3, §6.1 (C4) | A claim whose task has had no active run past the claim window stops counting for overlap but stays visible marked stale, because "went quiet an hour ago" is information. Any open record resting on it moves to C4, and the peer holding that record is told |
+| An agent crashes, is killed, or the app quits while writing its state | §7.2, §11 | Answered by the write discipline, not by a validator on the read side: a checkpoint is written in one transaction or staged and swapped, so a crash leaves the previous complete checkpoint or none. **A partially written checkpoint must never read as complete** |
+| An agent resumes from state older than the code it is working against | §7.4 | The checkpoint records its `baseSha`. On resume it is compared against the task's `baseRef` and HEAD, and a difference is **stated inside the injected block**. The checkpoint is neither discarded nor silently rewritten, because the completed-steps list survives a base move even when conclusions about untouched code do not |
+| Recorded knowledge is wrong | §12, §12.1 | Correction is a first-class path: `supersedes` for durable entries with the old row kept for audit, hard delete for ephemeral ones. Blast radius is stated concretely: which prompts could carry it, over what window, and how the operator traces it in both directions using the source task id and the retrieval counters |
+| An agent's accumulated state grows past what can be handed back | §7.3 | Normative truncation order, narration sacrificed before completed work. When it still does not fit, `completedSteps` truncates oldest-first **with a stated count of what was dropped**, so the agent knows the list is partial rather than believing it started at step 15 |
+| Many agents produce many overlaps at once | §6.2 | Structural bound, not a rate limit: one open record per unordered pair per class, notify once per record, coalesce per recipient, and a per-repo ceiling above which detection continues and notification stops. Notice volume is bounded by distinct conflicting pairs, and N itself is uncapped in agetor today, which is what makes the bound necessary |
+| Two agents write the same shared entry at once, with no ordering or clock agreement | §11.1 | Last-writer-wins on a monotonic per-row `version` incremented inside the write's transaction. Wall-clock time is never used to order two writes. For durable knowledge a genuine same-subject collision is not resolved at all: it opens a C3 record and both entries stand until a human supersedes one |
+| The same repository reached through different working directories, or through separate dev and release stores | §10.2 | `repoKey` normalization handles the working-directory case and its four failure modes are tabulated, including the `isolation: "none"` case where no branch holds two agents apart. The `~/.agetor-dev` versus `~/.agetor` split is **deliberate and not unified** (SPEC A-6); it is recorded as a known limitation with its operator-visible symptom |
+| Secrets appear in an agent's output | §10.1 | Names and purposes only, never values, and the parser stays dumb on purpose. No detector, because one that catches most secrets encourages treating the store as sanitized. The three real controls are the prompt instruction, the operator's delete, and a local file that never leaves the machine |
+| The shared-state layer is unavailable, slow, or corrupt | §11 | The section's normative sentence governs: a failure never blocks, stalls, or corrupts a run. Every read is best-effort and yields nothing; every write is fail-open. **The observable result of a total outage of everything in this document is that agetor behaves exactly as it does today.** Every proposed store appears in the failure table |
+| An agent kind cannot accept input mid-run | §9, §6.3 step 3 | Named as a known property of the substrate rather than an open question. `claude-code` hosts a persistent REPL; `codex` and `gemini` are one-shot per turn, so their fallback is the between-turns queue with a stated latency. Every mechanism assuming a live conversation has a between-turns row in the matrix, and no mechanism depends on gemini's absent `thinking` stream |
+| A single agent runs alone, with no peers and no history | §1.2, §14 | Every coordination surface renders nothing: no peer block, no scan, no empty state, no zero-row table. The gating predicate is a zero peer count for the `repoKey`. Phase 1 is stronger still, touching no prompt path at all. The one deliberate exception is the checkpoint, which is per-task and helps a solo agent by design |
+
+---
+
+## Acceptance criteria map
+
+| AC | Section |
+| --- | --- |
+| AC-1 Documentation only | Header table; §0 |
+| AC-2 Every reference capability classified adopt / adapt / reject | §2.1 |
+| AC-3 Possible and useful judged separately; excluded set named | §2.1, §2.2 |
+| AC-4 All three capability areas, each its own section | §5, §6, §7 |
+| AC-5 Exact fact set, refresh, staleness | §5.1, §5.2, §5.3 |
+| AC-6 Conflict classes, detection point, who is notified | §6.1 |
+| AC-7 One class traced end to end | §6.3 |
+| AC-8 Resumable state: what, captured where, fed back how | §7.1, §7.2, §7.3, §7.5 |
+| AC-9 Ephemeral versus durable, and the placement rule | §8, §8.1 |
+| AC-10 Existing agetor capabilities marked EXISTING | §3 |
+| AC-11 Reconciliation with `pipeline-shared-memory.md` | §4 |
+| AC-12 Behavior per agent kind, with fallbacks | §9 |
+| AC-13 Hosted dependencies retained or substituted | §2.3 |
+| AC-14 Trust boundary and the secrets prohibition | §10.1 |
+| AC-15 Failure modes and degraded behavior | §11, §11.1 |
+| AC-16 Correcting and removing wrong state | §12, §12.1, §12.2 |
+| AC-17 Scoping rule, same repo versus different, machines | §1.1, §10.2 |
+| AC-18 Measurable outcome per area with its signal | §13 |
+| AC-19 Phased delivery, each phase shippable and deferring explicitly | §14 |
+| AC-20 Single prioritized recommendation list | §15 |
+| AC-21 Open questions and rejected alternatives | §16.1, §16.2 |
+| AC-22 Code-shaped blocks labelled illustrative | §0; every fenced block |
+| AC-23 Single-agent behavior adds no overhead | §1.2, §14 |
