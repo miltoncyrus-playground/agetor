@@ -450,6 +450,7 @@ function baseTask(overrides: Partial<Task> = {}): Task {
     createdAt: 0,
     updatedAt: 0,
     ...overrides,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   };
 }
 
@@ -565,6 +566,7 @@ test("reconcileOrphans has no reattach path for fx: a mid-boot running fx run al
     archivedAt: null,
     createdAt: now,
     updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   });
   // Populate BOTH tmuxSession and fxSessionId — proving the orphan outcome
   // holds even when the reattach key is present. fx's ACP pipes die with the

@@ -99,6 +99,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     createdAt: 0,
     updatedAt: 0,
     ...overrides,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   };
 }
 

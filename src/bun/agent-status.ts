@@ -1,8 +1,10 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import { TMUX_MISSING_REASON, type AgentKind, type Harness, type HarnessStatus } from "../shared/types.ts";
+import { TMUX_MISSING_REASON, type AgentKind, type ClaudeAccount, type Harness, type HarnessStatus } from "../shared/types.ts";
 import { resolveBin, harnessEnv } from "./agents.ts";
+import { accountUsageSummary } from "./account-usage.ts";
 import { harnesses } from "./db.ts";
+import { effectiveClaudeConfigDir, readClaudeAccount } from "./harness-discovery.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
 
 const VERSION_PROBE_TIMEOUT_MS = 2000;
@@ -311,6 +313,20 @@ function resolveBinPath(bin: string): string | null {
 const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian/Ubuntu)";
 
 /**
+ * Account identity + local usage rollup for a claude-code harness — attached
+ * to every status shape (including the unavailable ones: "claude missing but
+ * the account dir is logged in" is still useful in Settings). Other kinds
+ * get nulls; their auth files are a separate follow-up. Live quota/limit
+ * utilization is a separate concern (`src/bun/usage/*`'s per-harness-kind
+ * pollers) — this is purely the local, historical, no-network token rollup.
+ */
+function claudeAccountFields(harness: Harness): { account: ClaudeAccount | null; usage: HarnessStatus["usage"] } {
+  if (harness.kind !== "claude-code") return { account: null, usage: null };
+  const configDir = effectiveClaudeConfigDir(harness.home);
+  return { account: readClaudeAccount(configDir), usage: accountUsageSummary(configDir) };
+}
+
+/**
  * `opts.freshAuth` bypasses the fx auth-status cache (see `getCachedStatus`
  * above) for this one call. Start (`orchestrator.ts`'s `startTask`) passes
  * `{ freshAuth: true }` — a user who just ran `fx login` must not be refused
@@ -328,6 +344,7 @@ const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian
 export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolean }): Promise<HarnessStatus> {
   const bin = resolveBin(harness);
   const path = resolveBinPath(bin);
+  const accountFields = claudeAccountFields(harness);
   if (!path) {
     return {
       harnessId: harness.id,
@@ -340,6 +357,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
       installHint: INSTALL_HINTS[harness.kind],
       loggedIn: null,
       authHelp: null,
+      ...accountFields,
     };
   }
 
@@ -357,6 +375,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
         installHint: TMUX_INSTALL_HINT,
         loggedIn: null,
         authHelp: null,
+        ...accountFields,
       };
     }
 
@@ -404,6 +423,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
         installHint: FX_WRONG_BINARY_HINT,
         loggedIn: null,
         authHelp: null,
+        ...accountFields,
       };
     }
 
@@ -421,6 +441,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
     installHint: null,
     loggedIn,
     authHelp,
+    ...accountFields,
   };
 }
 

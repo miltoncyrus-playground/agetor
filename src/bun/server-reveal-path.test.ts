@@ -127,6 +127,7 @@ test("a relative path resolves against the task's worktreePath/workdir", async (
     pendingInteractionCount: 0,
     openTerminalCount: 0,
     archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   });
 
   try {

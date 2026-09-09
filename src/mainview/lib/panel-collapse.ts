@@ -15,6 +15,7 @@
 
 /** Storage key for the New Task sidebar's collapsed flag. */
 export const NEW_TASK_PANEL_COLLAPSED_KEY = "agetor:newTaskPanelCollapsed";
+export const PROJECTS_PANEL_COLLAPSED_KEY = "agetor:projectsPanelCollapsed";
 
 /** The slice of the Web Storage API we actually use — keeps tests to a
  *  two-method fake instead of a full `Storage` stub. */

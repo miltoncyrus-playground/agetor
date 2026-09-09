@@ -648,6 +648,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               : path.basename(p) || p;
           return json(projects.upsert(p, name), { headers: corsHeaders(req) });
         }),
+        // Rename a registered project's display name.
+        PATCH: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: unknown; name?: unknown };
+          const p = typeof body.path === "string" ? body.path.trim() : "";
+          const name = typeof body.name === "string" ? body.name.trim() : "";
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+          const updated = projects.rename(p, name);
+          if (!updated) return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
+          return json(updated, { headers: corsHeaders(req) });
+        }),
         DELETE: authed(async (req) => {
           const { path: p } = (await req.json().catch(() => ({}))) as { path?: string };
           if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
@@ -3459,8 +3470,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                   return [{ path: p, isDirectory: Boolean(r.isDirectory) }];
                 })
             : [];
+          // Child-linking fields are server-managed — only build-scheduler.ts's
+          // tickBuild may set them (calling createTask directly, not through
+          // this public route). Strip them from an external caller's body so
+          // nobody can fabricate a parent/child link through the public
+          // create route.
+          const { parentTaskId: _parentTaskId, planSubtaskId: _planSubtaskId, childMergeStatus: _childMergeStatus, ...safeBody } = body;
           const result = await createTask({
-            ...body,
+            ...safeBody,
             title: body.title,
             prompt: body.prompt,
             references,

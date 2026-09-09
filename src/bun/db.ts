@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
 import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, SentFileEntry, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import { isAwaitingHandBack, isGateParked } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
@@ -102,6 +103,26 @@ type TaskRow = {
   last_seen_event_id: number | null;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
+  pipeline_stage: string | null;
+  plan_approved: number;
+  implementation_approved: number;
+  revision_count: number;
+  pipeline_feedback: string | null;
+  pipeline_bounce_fingerprint: string | null;
+  paused_at: number | null;
+  block_reason: string | null;
+  parent_task_id: string | null;
+  plan_subtask_id: string | null;
+  child_merge_status: string | null;
+  satisfied_subtasks: string;
+  /** Status of the run `run_id` points at (correlated subquery in
+   *  TASKS_SELECT) — feeds the derived `awaitingHandBack`. Missing on
+   *  code paths that don't join (insert fallback). */
+  current_run_status?: string | null;
+  /** Origin of the run `run_id` points at (same correlated subquery shape as
+   *  `current_run_status`) — feeds the derived `gateParked`, whose predicate
+   *  needs to distinguish a stage run from a conversation turn. */
+  current_run_origin?: string | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
    *  a correlated subquery in `list` / `get` — see those for the full SQL. */
   has_openable_run?: number;
@@ -126,6 +147,17 @@ const parseRefs = (raw: string): TaskReference[] => {
       const isDirectory = Boolean((r as { isDirectory?: unknown }).isDirectory);
       return [{ path, isDirectory }];
     });
+  } catch { return []; }
+};
+
+/** Parse a plain JSON string-array column (e.g. `satisfied_subtasks`) —
+ *  anything malformed or non-string collapses to []/dropped, same defensive
+ *  posture as `parseRefs`. */
+const parseStringArray = (raw: string): string[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((v): v is string => typeof v === "string" && v.length > 0);
   } catch { return []; }
 };
 
@@ -368,6 +400,37 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
+  pipelineStage: r.pipeline_stage as Task["pipelineStage"],
+  planApproved: r.plan_approved === 1,
+  implementationApproved: r.implementation_approved === 1,
+  revisionCount: r.revision_count,
+  pipelineFeedback: r.pipeline_feedback,
+  pipelineBounceFingerprint: r.pipeline_bounce_fingerprint,
+  pausedAt: r.paused_at,
+  blockReason: r.block_reason as Task["blockReason"],
+  parentTaskId: r.parent_task_id,
+  planSubtaskId: r.plan_subtask_id,
+  childMergeStatus: r.child_merge_status as Task["childMergeStatus"],
+  satisfiedSubtasks: parseStringArray(r.satisfied_subtasks),
+  awaitingHandBack: isAwaitingHandBack(
+    {
+      parentTaskId: r.parent_task_id,
+      childMergeStatus: r.child_merge_status as Task["childMergeStatus"],
+      archivedAt: r.archived_at,
+    },
+    r.current_run_status ?? null,
+  ),
+  gateParked: isGateParked(
+    {
+      parentTaskId: r.parent_task_id,
+      pipelineStage: r.pipeline_stage as Task["pipelineStage"],
+      archivedAt: r.archived_at,
+      pausedAt: r.paused_at,
+      column: r.column as Task["column"],
+    },
+    r.current_run_status ?? null,
+    r.current_run_origin ?? null,
+  ),
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -375,7 +438,9 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
 // exists for the task, 0 otherwise (NULL coalesces to 0 via COALESCE).
 const TASKS_SELECT = `
   SELECT tasks.*,
-         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run
+         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run,
+         (SELECT status FROM runs WHERE runs.id = tasks.run_id) AS current_run_status,
+         (SELECT origin FROM runs WHERE runs.id = tasks.run_id) AS current_run_origin
     FROM tasks
     LEFT JOIN runs ON runs.task_id = tasks.id
 `;
@@ -408,8 +473,10 @@ export const tasks = {
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
           last_assistant_event_id, last_seen_event_id,
-          run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          run_id, created_at, updated_at, archived_at,
+          pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, pipeline_bounce_fingerprint, paused_at,
+          block_reason, parent_task_id, plan_subtask_id, child_merge_status, satisfied_subtasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -423,6 +490,10 @@ export const tasks = {
         // — both start NULL, which `toTask` reads as `unread: false`.
         null, null,
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
+        t.pipelineStage ?? null, t.planApproved ? 1 : 0, t.implementationApproved ? 1 : 0,
+        t.revisionCount ?? 0, t.pipelineFeedback ?? null, t.pipelineBounceFingerprint ?? null, t.pausedAt ?? null,
+        t.blockReason ?? null, t.parentTaskId ?? null, t.planSubtaskId ?? null, t.childMergeStatus ?? null,
+        JSON.stringify(t.satisfiedSubtasks ?? []),
       ],
     );
     // Round-trip via `get` so the returned shape carries the computed
@@ -451,7 +522,9 @@ export const tasks = {
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
          branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, issue_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
-         run_id=?, updated_at=?, archived_at=?
+         run_id=?, updated_at=?, archived_at=?,
+         pipeline_stage=?, plan_approved=?, implementation_approved=?, revision_count=?, pipeline_feedback=?, pipeline_bounce_fingerprint=?, paused_at=?,
+         block_reason=?, parent_task_id=?, plan_subtask_id=?, child_merge_status=?, satisfied_subtasks=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
@@ -462,7 +535,11 @@ export const tasks = {
         next.draft ? JSON.stringify(next.draft) : null,
         JSON.stringify(next.plans ?? []),
         next.todoProgress ? JSON.stringify(next.todoProgress) : null,
-        next.runId, next.updatedAt, next.archivedAt ?? null, id,
+        next.runId, next.updatedAt, next.archivedAt ?? null,
+        next.pipelineStage ?? null, next.planApproved ? 1 : 0, next.implementationApproved ? 1 : 0,
+        next.revisionCount ?? 0, next.pipelineFeedback ?? null, next.pipelineBounceFingerprint ?? null, next.pausedAt ?? null,
+        next.blockReason ?? null, next.parentTaskId ?? null, next.planSubtaskId ?? null, next.childMergeStatus ?? null,
+        JSON.stringify(next.satisfiedSubtasks ?? []), id,
       ],
     );
     // Re-fetch so hasOpenableRun reflects the row state immediately after
@@ -731,6 +808,16 @@ export const projects = {
       `UPDATE projects SET branch_config = ? WHERE path = ?`,
       [config ? JSON.stringify(config) : null, path],
     );
+    return this.get(path);
+  },
+  /**
+   * Update a project's display name. Returns the refreshed row, or null if the
+   * project isn't registered. `upsert` can't do this — it only refreshes
+   * added_at on conflict, deliberately, so re-picking a project never clobbers
+   * its name/config.
+   */
+  rename(path: string, name: string): Project | null {
+    db.run(`UPDATE projects SET name = ? WHERE path = ?`, [name, path]);
     return this.get(path);
   },
   delete(path: string) {
@@ -1168,6 +1255,15 @@ export const runs = {
       [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.origin ?? null],
     );
     return { ...r, origin: r.origin ?? null };
+  },
+  /** Stamp a run's origin after the fact. Exists for `spawnMergeResolution`:
+   *  the per-kind turn spawners insert their run rows with origin null, and
+   *  threading an origin through every one of their internal spawn paths
+   *  would touch far more surface than this single UPDATE. Safe because the
+   *  stamp happens in the same synchronous continuation as the spawn — long
+   *  before the run's done-handler (which is what reads origin) can fire. */
+  setOrigin(id: string, origin: Run["origin"]): void {
+    db.run(`UPDATE runs SET origin = ? WHERE id = ?`, [origin ?? null, id]);
   },
   update(id: string, patch: Partial<Run>): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);

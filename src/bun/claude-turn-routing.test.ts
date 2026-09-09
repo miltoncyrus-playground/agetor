@@ -277,6 +277,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       archivedAt: null,
       createdAt: now,
       updatedAt: now,
+      pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
     });
     runs.insert({
       id: priorRunId,
@@ -386,6 +387,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       archivedAt: null,
       createdAt: now,
       updatedAt: now,
+      pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
     });
     runs.insert({
       id: priorRunId,
@@ -507,6 +509,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
       archivedAt: null,
       createdAt: now,
       updatedAt: now,
+      pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
     });
     runs.insert({
       id: priorRunId,
@@ -650,6 +653,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
       archivedAt: null,
       createdAt: now,
       updatedAt: now,
+      pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
     });
     runs.insert({
       id: priorRunId,
@@ -820,6 +824,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
       archivedAt: null,
       createdAt: now,
       updatedAt: now,
+      pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
     });
     runs.insert({
       id: priorRunId,
@@ -930,6 +935,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
       archivedAt: null,
       createdAt: now,
       updatedAt: now,
+      pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
     });
     runs.insert({
       id: priorRunId,

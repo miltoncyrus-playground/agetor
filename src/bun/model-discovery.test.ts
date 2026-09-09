@@ -143,6 +143,8 @@ function makeStatus(harnessId: string, overrides: Partial<HarnessStatus> = {}): 
     installHint: null,
     loggedIn: true,
     authHelp: null,
+    account: null,
+    usage: null,
     ...overrides,
   };
 }

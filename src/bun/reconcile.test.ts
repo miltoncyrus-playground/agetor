@@ -85,6 +85,7 @@ function heldTaskRow(overrides: Partial<Task> & { id: string; runId: string | nu
     createdAt: now,
     updatedAt: now,
     ...overrides,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   };
 }
 
@@ -193,6 +194,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     archivedAt: null,
     createdAt: now,
     updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   });
   runs.insert({
     id: runId,
@@ -261,6 +263,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
     archivedAt: null,
     createdAt: now,
     updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   });
   // status='failed' (not 'running') so this test's rows can't be
   // re-orphaned by a sibling test that calls `reconcileOrphans` later

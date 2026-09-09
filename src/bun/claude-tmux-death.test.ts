@@ -304,6 +304,7 @@ function baseTask(id: string): Task {
     archivedAt: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   };
 }
 

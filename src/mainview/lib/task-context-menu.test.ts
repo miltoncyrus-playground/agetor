@@ -38,6 +38,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     updatedAt: Date.now(),
     archivedAt: null,
     ...overrides,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   };
 }
 

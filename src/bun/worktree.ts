@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
@@ -656,6 +657,143 @@ export async function gitPush(
   const res = await git(["push", "--set-upstream", remote, branch], root, 120_000);
   if (!res.ok) return { ok: false, error: res.stderr || res.stdout || `git push failed (exit ${res.exitCode})` };
   return { ok: true, remote };
+}
+
+/**
+ * Deterministic fingerprint of a working tree's full state: HEAD sha +
+ * `git status --porcelain` + `git diff HEAD` content, hashed together. Two
+ * calls return the same value iff nothing changed — no new commits, no
+ * staged/unstaged edits, no untracked-file churn. The dirty state is
+ * included deliberately: pipeline "building" fixup turns leave their work
+ * uncommitted (buildingPrompt forbids committing), so HEAD alone would call
+ * a productive fixup cycle a no-op.
+ *
+ * Sync (spawnSync) because its one caller — the orchestrator's
+ * `bounceOrBlock` loop-breaker — runs inside the synchronous run-settlement
+ * path. Returns null when `dir` isn't a git repo or any git call fails,
+ * which callers treat as "can't compare, skip the check" (never a false
+ * block).
+ */
+export function treeFingerprintSync(dir: string): string | null {
+  const run = (args: string[]): string | null => {
+    try {
+      const res = spawnSync("git", args, {
+        cwd: dir,
+        encoding: "utf8",
+        timeout: 10_000,
+        maxBuffer: 128 * 1024 * 1024,
+      });
+      if (res.status !== 0 || typeof res.stdout !== "string") return null;
+      return res.stdout;
+    } catch {
+      return null;
+    }
+  };
+  const head = run(["rev-parse", "HEAD"]);
+  if (head == null) return null;
+  const status = run(["status", "--porcelain"]);
+  const diff = run(["diff", "HEAD"]);
+  if (status == null || diff == null) return null;
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(head);
+  hasher.update(status);
+  hasher.update(diff);
+  return hasher.digest("hex");
+}
+
+/**
+ * Merge a completed child subtask's branch into its parent pipeline task's
+ * branch, run FROM the parent's own worktree — a real, local, deterministic
+ * git operation. Every task's worktree is a linked worktree off the same
+ * source repo (see `prepareWorkdir`), so the parent's worktree can see and
+ * merge any branch in that repo, including a sibling worktree's branch — no
+ * fetch needed, they already share one object database.
+ *
+ * `--no-ff` always creates a merge commit (even when a fast-forward would
+ * do), so the history keeps a visible node per merged subtask rather than
+ * silently rewriting the parent branch's tip. `--no-edit` accepts git's
+ * default merge message non-interactively, since nothing here can respond
+ * to an editor prompt.
+ *
+ * On failure, `conflict` distinguishes a real merge conflict (caller should
+ * follow up with {@link abortMerge} to leave the worktree clean) from some
+ * other failure (bad branch name, dirty working tree refusing to merge,
+ * etc.) — either way build-scheduler.ts treats it as a failed merge-back
+ * and aborts the whole build, but only a genuine conflict needs the abort.
+ */
+export async function mergeBranch(
+  parentWorktreePath: string,
+  childBranch: string,
+): Promise<{ ok: true } | { ok: false; conflict: boolean; detail: string }> {
+  // Defense-in-depth against a "-"-leading value being read as a git flag,
+  // mirroring gitPull/gitPush's guard.
+  if (childBranch.startsWith("-")) {
+    return { ok: false, conflict: false, detail: `invalid branch name: ${childBranch}` };
+  }
+  const res = await git(["merge", "--no-ff", "--no-edit", childBranch], parentWorktreePath, 120_000);
+  if (res.ok) return { ok: true };
+  const conflict = /CONFLICT|Automatic merge failed/i.test(res.stdout + res.stderr);
+  return { ok: false, conflict, detail: res.stderr || res.stdout || `git merge failed (exit ${res.exitCode})` };
+}
+
+/** Abort an in-progress merge left behind by a {@link mergeBranch} conflict,
+ *  so the parent's worktree returns to a clean pre-merge state rather than
+ *  sitting with unresolved conflict markers. Best-effort — if there's no
+ *  merge in progress (or the abort itself fails), that's not surfaced;
+ *  the caller has already decided to block the build either way. */
+export async function abortMerge(parentWorktreePath: string): Promise<void> {
+  await git(["merge", "--abort"], parentWorktreePath, 30_000);
+}
+
+/**
+ * Deterministic "did that merge actually land" check — the settle path of an
+ * agent-driven merge-resolution turn ({@link mergeBranch} conflicted, an
+ * agent was asked to resolve and `git commit`) must never trust the agent's
+ * exit status; only git's own graph answers this. True iff BOTH hold:
+ *   1. no merge is in progress (MERGE_HEAD is gone — the agent concluded the
+ *      merge rather than leaving it parked half-done, the exact state the
+ *      2dot2dot-redesign worktree was found in on 2026-08-19), and
+ *   2. the branch's tip is an ancestor of the worktree's HEAD (its commits
+ *      are reachable — the merge commit exists).
+ * A `-`-leading branch name is rejected like mergeBranch's own guard.
+ */
+export async function isBranchMerged(worktreePath: string, branch: string): Promise<boolean> {
+  if (branch.startsWith("-")) return false;
+  const mergeHead = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], worktreePath, 15_000);
+  if (mergeHead.ok) return false; // merge still in progress
+  const ancestor = await git(["merge-base", "--is-ancestor", branch, "HEAD"], worktreePath, 15_000);
+  return ancestor.ok;
+}
+
+/**
+ * Commit everything in a worktree (`git add -A` + `git commit`) if — and only
+ * if — the tree is dirty. The pipeline's deterministic backstop for stage
+ * turns that leave work uncommitted despite their prompt's instruction: an
+ * uncommitted tree is both at risk and a hard blocker for every later `git
+ * merge` into that worktree. Never called on a tree with an in-progress
+ * merge (MERGE_HEAD) — committing there would conclude a merge nobody
+ * resolved — so callers on merge-adjacent paths check that first; this
+ * function also refuses on its own as defense in depth.
+ *
+ * `{ committed: false }` with no error means "already clean" — the common
+ * case. A non-git dir or git failure reports `error` and is otherwise
+ * harmless: the caller's next real git operation surfaces the underlying
+ * problem with better context.
+ */
+export async function commitAll(
+  worktreePath: string,
+  message: string,
+): Promise<{ committed: boolean; error?: string }> {
+  const mergeHead = await git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], worktreePath, 15_000);
+  if (mergeHead.ok) return { committed: false, error: "merge in progress — refusing to auto-commit" };
+  const status = await git(["status", "--porcelain=v1"], worktreePath, 30_000);
+  if (!status.ok) return { committed: false, error: status.stderr || "git status failed" };
+  if (!status.stdout.trim()) return { committed: false };
+  const add = await git(["add", "-A"], worktreePath, 60_000);
+  if (!add.ok) return { committed: false, error: add.stderr || "git add failed" };
+  const commit = await git(["commit", "-m", message], worktreePath, 60_000);
+  if (!commit.ok) return { committed: false, error: commit.stderr || commit.stdout || "git commit failed" };
+  return { committed: true };
 }
 
 function slugify(s: string): string {

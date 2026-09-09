@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
-import { reconcileOrphans, reapIdleSessions } from "./orchestrator.ts";
+import { reconcileOrphans, resumeInFlightBuilds, reapIdleSessions } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
@@ -124,6 +124,7 @@ export async function runDaemon(): Promise<void> {
   // no swallow.
   rehydratePath();
   await reconcileOrphans();
+  resumeInFlightBuilds();
   // Same boot-sweep + periodic-refresh pair as index.ts's desktop boot path
   // (see its comment for the full rationale) — the daemon needs the same
   // model-discovery freshness the app gets, and `startPeriodicDiscovery`'s

@@ -80,6 +80,7 @@ test("priorApiError query ignores a subagent-tagged api-error row (subagent_id s
     archivedAt: null,
     createdAt: now,
     updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   });
   runs.insert({
     id: runId,
@@ -142,6 +143,7 @@ test("priorApiError query matches a main-tailer api-error row (subagent_id NULL)
     archivedAt: null,
     createdAt: now,
     updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   });
   runs.insert({
     id: runId,

@@ -77,6 +77,7 @@ async function seed() {
     prUrl: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   });
   // Insert the run as already-terminal: bun test shares one SQLite db across
   // files, and reconcileOrphans() scans every `running` run globally — a

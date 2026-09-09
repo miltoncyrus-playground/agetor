@@ -4,7 +4,7 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
+import { reconcileOrphans, resumeInFlightBuilds, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
@@ -131,6 +131,10 @@ rehydratePath();
 // fails boot loudly, matching that old synchronous-throw behavior — no
 // swallow.
 await reconcileOrphans();
+
+// Boot-time companion to reconcileOrphans: resume any pipeline parent stuck
+// mid-build (fresh-entry/DAG mode) with no run row of its own to reattach.
+resumeInFlightBuilds();
 
 // Heal any archive/delete teardown (tmux kill, terminal shells, worktree
 // detach) that was deferred to the in-memory teardown queue but never ran

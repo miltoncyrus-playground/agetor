@@ -52,6 +52,7 @@ function makeTask() {
     archivedAt: null,
     createdAt: now,
     updatedAt: now,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
   });
   createdTaskIds.push(id);
   return id;

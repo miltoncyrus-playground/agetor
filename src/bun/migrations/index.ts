@@ -65,6 +65,19 @@ import m047 from "./047_fx_session_id.sql" with { type: "text" };
 import m048 from "./048_issue_url.sql" with { type: "text" };
 import m049 from "./049_retire_gemini_3_pro_preview.sql" with { type: "text" };
 import m050 from "./050_sent_files.sql" with { type: "text" };
+// The pipeline branch's migrations 035-040/042 (originally numbered against
+// a 031-head trunk); renumbered to 051-057 on merge with upstream/main,
+// which had already claimed 032-050 (same renumber-with-alias pattern used
+// throughout this file). Pipeline's own 041_harness_quota is NOT ported —
+// superseded by upstream's 043_harness_usage/usage-tracker system, which
+// covers claude-code/codex/cursor rather than claude-only.
+import m051 from "./051_pipeline_tasks.sql" with { type: "text" };
+import m052 from "./052_prebuilder_children.sql" with { type: "text" };
+import m053 from "./053_block_reason.sql" with { type: "text" };
+import m054 from "./054_sdd_pipeline_stages.sql" with { type: "text" };
+import m055 from "./055_pipeline_bounce_fingerprint.sql" with { type: "text" };
+import m056 from "./056_account_usage.sql" with { type: "text" };
+import m057 from "./057_satisfied_subtasks.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -123,4 +136,11 @@ export const migrations: Migration[] = [
   { id: "048_issue_url", sql: m048 },
   { id: "049_retire_gemini_3_pro_preview", sql: m049 },
   { id: "050_sent_files", sql: m050 },
+  { id: "051_pipeline_tasks", sql: m051, aliases: ["035_pipeline_tasks"] },
+  { id: "052_prebuilder_children", sql: m052, aliases: ["036_prebuilder_children"] },
+  { id: "053_block_reason", sql: m053, aliases: ["037_block_reason"] },
+  { id: "054_sdd_pipeline_stages", sql: m054, aliases: ["038_sdd_pipeline_stages"] },
+  { id: "055_pipeline_bounce_fingerprint", sql: m055, aliases: ["039_pipeline_bounce_fingerprint"] },
+  { id: "056_account_usage", sql: m056, aliases: ["040_account_usage"] },
+  { id: "057_satisfied_subtasks", sql: m057, aliases: ["042_satisfied_subtasks"] },
 ];
