@@ -1233,6 +1233,9 @@ export const api = {
      *  a per-task file and attached as a reference. Only meaningful
      *  alongside `issueUrl`. */
     issueSnapshot?: string;
+    /** Opt-in: create as a pipeline task (see NewTaskForm's "Run as
+     *  pipeline" checkbox). Matches CreateTaskInput.pipeline server-side. */
+    pipeline?: boolean;
   }) =>
     // retry: false — a replay would create a duplicate task + branch.
     j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
@@ -1289,6 +1292,25 @@ export const api = {
         : {}),
     }, opts?.awaitTeardown ? { retry: false } : undefined),
   unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
+
+  /** Explicit hand-back of a build child's finished work to the pipeline —
+   *  see `Task.awaitingHandBack`. 409 if the button-visible state went stale
+   *  (e.g. the child isn't actually pending anymore). */
+  handBackChild: (id: string) => j<Task>(`/tasks/${id}/hand-back`, { method: "POST" }),
+  /** Pause a pipeline task's auto-advance — the in-flight stage still runs
+   *  to completion, only the *next* stage's spawn is skipped. */
+  pausePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-pause`, { method: "POST" }),
+  /** Resume a paused pipeline task, starting the current stage if nothing's
+   *  already running. */
+  resumePipelineTask: (id: string) => j<Task>(`/tasks/${id}/pipeline-resume`, { method: "POST" }, { retry: false }),
+  /** Force the current pipeline gate through one stage — see
+   *  `Task.gateParked`. Only accepted for the gate-bearing stages
+   *  (plan-review/building/code-review/testing); 400 otherwise. */
+  overridePipelineGate: (id: string) => j<Task>(`/tasks/${id}/pipeline-override`, { method: "POST" }),
+  /** Mark a build subtask satisfied without a merged child (work landed some
+   *  other way) — the build barrier stops counting it as unmet. */
+  satisfyPipelineSubtask: (id: string, subtaskId: string) =>
+    j<Task>(`/tasks/${id}/satisfy-subtask`, { method: "POST", body: JSON.stringify({ subtaskId }) }),
 
   /** Every git worktree materialized on disk under `dataDir/worktrees/`,
    *  cross-referenced against the tasks table. Drives the Worktrees page. */

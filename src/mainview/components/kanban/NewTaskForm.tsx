@@ -5,6 +5,7 @@ import {
   ClipboardList,
   Code2,
   RefreshCw,
+  Workflow,
 } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { discoveredEffortsFor, mergeModelOptions } from "../../../shared/model-options.ts";
@@ -70,6 +71,10 @@ interface Props {
       maxMode: boolean;
       references: TaskReference[];
       taskType: TaskType;
+      /** Opt-in: create as a pipeline task — see the checkbox's title copy
+       *  below for what that means. Matches CreateTaskInput.pipeline's name
+       *  exactly server-side. */
+      pipeline: boolean;
     },
     options: { start: boolean },
   ) => void;
@@ -179,6 +184,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   // — see `WorktreeOptions.tsx`. Declared here (before the mode/model state)
   // since `wt.baseRef` is read further down by `<PromptComposer branch={…}>`.
   const wt = useWorktreeOptions({ workdir, title, taskType });
+  // Requires isolation: a pipeline task needs the SAME worktree/branch
+  // stable across all 9 auto-advancing stages, which is exactly what
+  // isolation already provides — pipeline without it has no coherent
+  // meaning. Unchecking isolate clears pipeline too (effect below).
+  const [isPipeline, setIsPipeline] = useState(false);
   const [mode, setMode] = useState<string>(initialMode("claude-code"));
   const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
   // `null` is reserved for the Haiku-style "model doesn't accept effort" case.
@@ -417,6 +427,22 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const promptOverage = promptByteOverage(kind, prompt);
   const selectedHarnessLabel = selectedHarness?.label ?? agent;
 
+  // Isolation is a hard requirement for pipeline mode (see isPipeline's
+  // declaration above) — if the user turns isolation off after having
+  // checked pipeline, uncheck pipeline too rather than leaving it in a
+  // state that has no real meaning.
+  useEffect(() => {
+    if (!wt.isolate && isPipeline) setIsPipeline(false);
+  }, [wt.isolate, isPipeline]);
+
+  const pipelineTitle =
+    "Spec-driven pipeline: automatically walks this task through 9 stages "
+    + "— Specify, Clarify, Plan, Plan Review, Decompose, Analyze, Build, "
+    + "Code Review, Test — with no click between them. Writes a SPEC.md "
+    + "with numbered acceptance criteria, then designs and implements towards "
+    + "those criteria, looping revisions until all gates pass or the "
+    + "revision budget runs out. Requires isolation (worktree).";
+
   const canSubmit =
     title.trim() && prompt.trim() && workdir.trim() && wt.valid
     && promptOverage == null;
@@ -442,6 +468,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
         maxMode: kind === "cursor" ? maxMode : false,
         references,
         taskType,
+        pipeline: isPipeline,
       },
       { start },
     );
@@ -460,6 +487,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     setReferences([]);
     capture.clearDropHint();
     wt.resetAfterSubmit();
+    // A fresh form defaults back to non-pipeline — pipeline is a deliberate
+    // per-task opt-in, never sticky across tasks the way workdir/model/mode
+    // are.
+    setIsPipeline(false);
     // Keep `workdir`, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same project + picks the user just used.
   };
@@ -622,6 +653,23 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 />
               </div>
               <WorktreeOptions state={wt} />
+
+              <label
+                className={cn(
+                  "flex items-center gap-1.5",
+                  wt.isolate ? "cursor-pointer" : "cursor-not-allowed text-muted-foreground/60",
+                )}
+                title={pipelineTitle}
+              >
+                <input
+                  type="checkbox"
+                  checked={isPipeline}
+                  disabled={!wt.isolate}
+                  onChange={(e) => setIsPipeline(e.target.checked)}
+                />
+                <Workflow className="size-3" />
+                <span>Run as pipeline</span>
+              </label>
 
               <div className="space-y-1">
                 <label className="text-muted-foreground">Harness</label>

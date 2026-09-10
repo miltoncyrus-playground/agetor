@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  Archive, ArchiveRestore, AlertTriangle, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Pause, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
@@ -39,10 +39,12 @@ import { abbreviateHome, cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
+  BLOCK_REASON_COPY,
   CATALOG_SCOPED_KINDS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
+  GATE_BEARING_STAGES,
   FX_PROVIDER_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
@@ -2973,6 +2975,50 @@ function RunPanelBody({
         </div>
       )}
 
+      {!archived && task.column === "blocked" && (
+        <BlockedBanner
+          task={task}
+          onRetryStage={() => void api.startTask(task.id).catch((e) => {
+            toast.error("Couldn't retry the task", { description: e instanceof Error ? e.message : String(e) });
+          })}
+          onOverrideGate={() => void api.overridePipelineGate(task.id).catch((e) => {
+            toast.error("Couldn't override the gate", { description: e instanceof Error ? e.message : String(e) });
+          })}
+          onSatisfySubtask={(subtaskId) => void api.satisfyPipelineSubtask(task.id, subtaskId).catch((e) => {
+            toast.error(`Couldn't mark "${subtaskId}" satisfied`, { description: e instanceof Error ? e.message : String(e) });
+          })}
+          onArchive={() => onArchive(task)}
+        />
+      )}
+
+      {/* A build child whose last run succeeded outside the pipeline (a
+          follow-up conversation, not its own build turn) — its work isn't
+          merged back yet. */}
+      {!archived && task.awaitingHandBack && (
+        <HandBackBanner
+          task={task}
+          onRerun={() => void api.startTask(task.id).catch((e) => {
+            toast.error("Couldn't restart the build turn", { description: e instanceof Error ? e.message : String(e) });
+          })}
+        />
+      )}
+
+      {/* Parent-side twin of the hand-back banner: a pipeline task parked on
+          its gate column because a conversation turn (not a stage run) ended
+          there. Before this banner the state was invisible — the task just
+          sat on its stage column indefinitely with no visible explanation. */}
+      {!archived && task.gateParked && (
+        <GateParkedBanner
+          task={task}
+          onRetryStage={() => void api.startTask(task.id).catch((e) => {
+            toast.error("Couldn't retry the stage", { description: e instanceof Error ? e.message : String(e) });
+          })}
+          onOverrideGate={() => void api.overridePipelineGate(task.id).catch((e) => {
+            toast.error("Couldn't override the gate", { description: e instanceof Error ? e.message : String(e) });
+          })}
+        />
+      )}
+
       <div
         ref={logRef}
         onScroll={(e) => {
@@ -3447,6 +3493,190 @@ function RunPanelBody({
 const BACKLOG_ICON_BTN =
   "rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground "
   + "disabled:pointer-events-none disabled:opacity-40";
+
+/** Copy for a `blocked` task whose `blockReason` is null — a pre-migration
+ *  row, or (defensively) any future block path that hasn't been taught to
+ *  set the field. Falls back to the universally-safe "start it again"
+ *  action rather than assuming a specific recovery mechanic. */
+const UNKNOWN_BLOCK_COPY = {
+  heading: "Stopped",
+  detail: "This task stopped and needs your input to continue.",
+};
+
+/**
+ * Recovery banner for a `blocked` task, reason-specific via
+ * `Task.blockReason` (`BLOCK_REASON_COPY`). A pipeline task gets its full
+ * gate-recovery surface (retry the stage, force the gate through where
+ * that's accepted, mark a build subtask satisfied without a merge); every
+ * other blocked task — api-error, session-died, unknown-command, or a
+ * pre-migration row with no reason at all — gets the universally-safe
+ * "restart the task" action. Fork's original also offered a nudge-vs-edit
+ * distinction for those non-pipeline reasons (continue the same session vs.
+ * fix the message before resending); this port keeps the simpler restart
+ * path instead of reverse-engineering that composer-state integration.
+ */
+function BlockedBanner({
+  task,
+  onRetryStage,
+  onOverrideGate,
+  onSatisfySubtask,
+  onArchive,
+}: {
+  task: Task;
+  onRetryStage: () => void;
+  onOverrideGate: () => void;
+  onSatisfySubtask: (subtaskId: string) => void;
+  onArchive: () => void;
+}) {
+  const copy = task.blockReason ? BLOCK_REASON_COPY[task.blockReason] : UNKNOWN_BLOCK_COPY;
+  const isPipeline = task.pipelineStage != null;
+  // Gate-bearing stages only — the artifact stages (specify/clarify/
+  // planning/decompose) advance on their file gates and the server refuses
+  // to override them, so don't offer a button that 400s.
+  const canOverrideGate = isPipeline && GATE_BEARING_STAGES.includes(task.pipelineStage!);
+
+  return (
+    <div className="flex items-start gap-2.5 border-b border-amber-500/30 bg-amber-500/[0.06] px-3 py-2.5">
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-foreground">{copy.heading}</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">{copy.detail}</p>
+        {/* Per-subtask escape hatch (building stage only — `unmetSubtasks` is
+            a server decoration computed exactly for a parent blocked in
+            building): "this subtask's work landed some other way — stop
+            requiring its merge." Durable, unlike the whole-gate override:
+            marked subtasks survive a later bounce back into building. */}
+        {task.unmetSubtasks && task.unmetSubtasks.length > 0 && (
+          <div className="mt-2 flex flex-col gap-1">
+            <p className="text-[11px] text-muted-foreground">
+              Unmet subtasks — mark one satisfied if its work already landed another way (e.g. re-implemented on the parent branch):
+            </p>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {task.unmetSubtasks.map((id) => (
+                <Button
+                  key={id}
+                  size="sm"
+                  variant="outline"
+                  title={`Stop requiring subtask "${id}"'s merge — records the decision on the run log`}
+                  onClick={() => onSatisfySubtask(id)}
+                >
+                  Mark "{id}" satisfied
+                </Button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <Button size="sm" onClick={onRetryStage}>{isPipeline ? "Retry stage" : "Retry"}</Button>
+          {canOverrideGate && (
+            <Button
+              size="sm"
+              variant="outline"
+              title="Force this gate through — advances one stage and records the override on the run log"
+              onClick={onOverrideGate}
+            >
+              Override gate
+            </Button>
+          )}
+          <Button size="sm" variant="outline" onClick={onArchive}>Archive</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Rendered when `task.awaitingHandBack`: a build child whose last run
+ * succeeded outside the pipeline (a follow-up conversation, not its own
+ * build turn), so its branch hasn't been merged into the parent build.
+ * "Hand back & merge" is the explicit human declaration that the work is
+ * done; "Re-run build turn" lets the agent verify first instead.
+ */
+function HandBackBanner({ task, onRerun }: { task: Task; onRerun: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const handBack = async () => {
+    setBusy(true);
+    try {
+      await api.handBackChild(task.id);
+    } catch (e) {
+      toast.error("Couldn't hand back to the pipeline", {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="flex items-start gap-2.5 border-b border-amber-500/30 bg-amber-500/[0.06] px-3 py-2.5">
+      <GitMerge className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-foreground">Finished, but not handed back</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          This subtask's last run succeeded outside the pipeline (a follow-up conversation, not its own
+          build run), so its branch hasn't been merged into the parent build. Hand it back when the work
+          is done, or re-run the build turn to let the agent verify first.
+        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <Button size="sm" disabled={busy} onClick={() => void handBack()}>
+            Hand back &amp; merge
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy} onClick={onRerun}>
+            Re-run build turn
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Parent-pipeline twin of {@link HandBackBanner}: rendered when
+ * `task.gateParked` — the RC-6 provenance gate refused to advance because
+ * the turn that just ended was a conversation, not a stage run. Retry stage
+ * re-runs the CURRENT stage fresh from its prompt template (the stage run's
+ * verdict then advances or bounces normally — the right move when a verdict
+ * needs to be re-derived, e.g. after a `revise`). Override gate forces one
+ * stage forward without re-running anything — offered only for the
+ * gate-bearing stages the server will accept it for.
+ */
+function GateParkedBanner({
+  task,
+  onRetryStage,
+  onOverrideGate,
+}: {
+  task: Task;
+  onRetryStage: () => void;
+  onOverrideGate: () => void;
+}) {
+  const canOverrideGate = task.pipelineStage != null && GATE_BEARING_STAGES.includes(task.pipelineStage);
+  const stageLabel = task.pipelineStage ?? "stage";
+  return (
+    <div className="flex items-start gap-2.5 border-b border-amber-500/30 bg-amber-500/[0.06] px-3 py-2.5">
+      <Pause className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-foreground">Pipeline gate waiting on you</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          The last turn on this task was a conversation, not a stage run, so the {stageLabel} gate didn't
+          move — only stage runs advance the pipeline. Re-run the {stageLabel} stage to get a fresh verdict
+          (it bounces or advances on its own), or force this gate one stage forward.
+        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <Button size="sm" onClick={onRetryStage}>Retry stage</Button>
+          {canOverrideGate && (
+            <Button
+              size="sm"
+              variant="outline"
+              title="Force this gate through — advances one stage and records the override on the run log"
+              onClick={onOverrideGate}
+            >
+              Override gate
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 /**
  * The messages-backlog tray: a list of saved, not-yet-sent drafts shown just

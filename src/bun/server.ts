@@ -22,7 +22,9 @@ import {
   dataDir,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus, handBackChild, pausePipelineTask, resumePipelineTask, overridePipelineGate, satisfyPipelineSubtask } from "./orchestrator.ts";
+import { stalledSince } from "./stall-registry.ts";
+import { buildBarrierState } from "./build-scheduler.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
@@ -240,7 +242,23 @@ function blobContentType(relPath: string, kind: "image" | "pdf"): string {
 // query instead of calling this per row.
 function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   const runningSubagents = subagents.listForTask(t.id).filter((s) => s.status === "running").length;
-  return { ...t, runningSubagents };
+  // `stalledSince` rides the same decoration: transient in-memory server
+  // state (the turn-stall watchdog's mark) that the DB-derived Task can't
+  // carry — see stall-registry.ts.
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), unmetSubtasks: unmetSubtasksFor(t) };
+}
+
+/**
+ * `unmetSubtasks` decoration: only computed for a pipeline parent BLOCKED in
+ * its building stage — the one state where the RunPanel's blocked banner
+ * offers per-subtask "Mark satisfied" buttons. Costs one TASKS.json read per
+ * qualifying task per poll; blocked building parents are rare (normally
+ * zero), so this stays off the hot path. Undefined everywhere else.
+ */
+function unmetSubtasksFor(t: Task): string[] | undefined {
+  if (t.pipelineStage !== "building" || t.column !== "blocked" || t.parentTaskId != null) return undefined;
+  const barrier = buildBarrierState(t);
+  return barrier.kind === "incomplete" ? barrier.unmet : undefined;
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -3418,7 +3436,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const counts = subagents.runningCountsByTask();
           return json(
-            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0 })),
+            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0, stalledSince: stalledSince(t.id), unmetSubtasks: unmetSubtasksFor(t) })),
             { headers: corsHeaders(req) },
           );
         }),
@@ -3630,6 +3648,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Explicit hand-back of a build child's finished work: parks the child
+      // as merge-deferred and ticks the parent's build so the deterministic
+      // merge (and, if that was the last subtask, the stage advance) runs.
+      // 409 on guard failures — the button-visible state may have gone stale
+      // between the poll and the click.
+      "/tasks/:id/hand-back": {
+        POST: authed(async (req) => {
+          const result = await handBackChild(req.params.id);
+          return "error" in result
+            ? json(result, { status: 409, headers: corsHeaders(req) })
+            : json(tasks.get(req.params.id), { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
           // Worktree teardown can now be awaited inline (`awaitTeardown`)
@@ -3675,6 +3707,55 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         POST: authed(async (req) => {
           server.timeout(req, 0);
           const result = await unarchiveTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Pause/resume a pipeline task's auto-advance (see advancePipelineStage
+      // in orchestrator.ts). 400 on a non-pipeline task — pausing one has no
+      // meaning. Neither route interrupts an in-flight stage's agent; only
+      // whether the *next* stage auto-spawns.
+      "/tasks/:id/pipeline-pause": {
+        POST: authed((req) => {
+          const result = pausePipelineTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+      "/tasks/:id/pipeline-resume": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const result = await resumePipelineTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+      // Explicit human override of the current pipeline gate — advances
+      // exactly one stage and records a durable audit status event. This is
+      // the ONLY way to force a gate: advancePipelineStage's provenance gate
+      // means a verdict line typed into a conversation turn no longer moves
+      // the pipeline. 400 on artifact-gated stages (nothing to overrule).
+      "/tasks/:id/pipeline-override": {
+        POST: authed((req) => {
+          const result = overridePipelineGate(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+      // Explicit human declaration that one build subtask's work landed some
+      // other way than a merged child (e.g. re-implemented on the parent
+      // branch after a failed merge). Durable: buildBarrierState counts it as
+      // met and tickBuild never spawns a child for it, so a later bounce back
+      // into building can't re-trip the barrier on it. Audited on the run log.
+      "/tasks/:id/satisfy-subtask": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { subtaskId?: string };
+          const result = await satisfyPipelineSubtask(req.params.id, body.subtaskId ?? "");
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
