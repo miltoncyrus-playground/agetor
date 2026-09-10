@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { Folder, Plus } from "lucide-react";
+import { Folder, GitBranch, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { SearchSelect } from "@/components/ui/search-select";
+import { CloneProjectDialog } from "@/components/kanban/CloneProjectDialog";
 import type { Project } from "../../../shared/types.ts";
 
 interface Props {
@@ -46,6 +47,7 @@ export function ProjectPicker({
 }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [picking, setPicking] = useState(false);
+  const [cloneOpen, setCloneOpen] = useState(false);
 
   const refresh = async () => {
     try { setProjects(await api.listProjects()); }
@@ -98,29 +100,49 @@ export function ProjectPicker({
   };
 
   return (
-    <SearchSelect
-      value={value}
-      onChange={onChange}
-      items={items}
-      className={className}
-      disabled={disabled}
-      title={title}
-      placement={placement}
-      placeholder="Search projects…"
-      emptyLabel={emptyLabel ?? "Select project…"}
-      leadingIcon={<Folder className="size-3.5" />}
-      displayValue={(v) => basename(v) || v}
-      footer={
-        <button
-          type="button"
-          onClick={onBrowse}
-          disabled={picking}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/60 disabled:opacity-50"
-        >
-          <Plus className="size-3.5" aria-hidden />
-          {picking ? "Opening folder dialog…" : "Browse for folder…"}
-        </button>
-      }
-    />
+    <>
+      <SearchSelect
+        value={value}
+        onChange={onChange}
+        items={items}
+        className={className}
+        disabled={disabled}
+        title={title}
+        placement={placement}
+        placeholder="Search projects…"
+        emptyLabel={emptyLabel ?? "Select project…"}
+        leadingIcon={<Folder className="size-3.5" />}
+        displayValue={(v) => basename(v) || v}
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={onBrowse}
+              disabled={picking}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/60 disabled:opacity-50"
+            >
+              <Plus className="size-3.5" aria-hidden />
+              {picking ? "Opening folder dialog…" : "Browse for folder…"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setCloneOpen(true)}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/60"
+            >
+              <GitBranch className="size-3.5" aria-hidden />
+              Checkout from GitHub…
+            </button>
+          </>
+        }
+      />
+      {/* Rendered as a sibling of the SearchSelect, not inside its `footer`:
+          the footer lives in the popover, which unmounts the moment the
+          dialog takes focus. */}
+      <CloneProjectDialog
+        open={cloneOpen}
+        onClose={() => setCloneOpen(false)}
+        onCloned={() => { void refresh(); }}
+      />
+    </>
   );
 }
