@@ -57,3 +57,7 @@ skills-lock.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Paid pipeline-eval report (evals/pipeline/run-evals.ts writes it each run;
+# its own header already documents it as gitignored — this makes that true).
+/evals/pipeline/last-report.json
