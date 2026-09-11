@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, Minus, Monitor, Moon, Plus, Sun, Terminal, Trash2, X } from "lucide-react";
+import { BarChart3, ChevronLeft, Minus, Monitor, Moon, Plus, Sun, Terminal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
-import { ApiError, api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
+import { ApiError, api, type AccountUsageDay, type HarnessesPayload, type HarnessInput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -17,7 +17,7 @@ import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/platform";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
-import { abbreviateHome, cn } from "@/lib/utils";
+import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
   activeSection,
@@ -37,6 +37,7 @@ import {
   HARNESS_TEMPLATES,
   THEME_PREFERENCES,
   type AgentKind,
+  type DiscoveredAccount,
   type Harness,
   type HarnessTemplate,
   type ThemePreference,
@@ -822,6 +823,10 @@ function HarnessesSection({
    *  resolves. Missing keys mean "use the server's `h.enabled`". */
   pendingToggle: Record<string, boolean>;
 }) {
+  // Which harness's account-usage panel is expanded (at most one at a time).
+  // Local to this section: the table fetches on expand, and the scan behind
+  // it stats every transcript file — never fetched with the list.
+  const [usageOpenFor, setUsageOpenFor] = useState<string | null>(null);
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-2">
@@ -845,10 +850,11 @@ function HarnessesSection({
               <div
                 key={h.id}
                 className={cn(
-                  "flex items-center gap-2 rounded-md border border-border/60 px-3 py-2",
+                  "space-y-1.5 rounded-md border border-border/60 px-3 py-2",
                   !h.enabled && "opacity-60",
                 )}
               >
+              <div className="flex items-center gap-2">
                 <AgentIcon kind={h.kind} className="size-4 shrink-0" />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
@@ -900,6 +906,20 @@ function HarnessesSection({
                   onCheckedChange={() => onToggleEnabled(h)}
                   aria-label={h.enabled ? `Disable ${h.label}` : `Enable ${h.label}`}
                 />
+                {/* claude-code only: no other kind has a local usage source
+                    wired yet, and the route 400s for them. */}
+                {h.kind === "claude-code" && (
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => setUsageOpenFor((cur) => (cur === h.id ? null : h.id))}
+                    aria-label={`${usageOpenFor === h.id ? "Hide" : "Show"} token usage for ${h.label}`}
+                    aria-expanded={usageOpenFor === h.id}
+                    title="Token usage — this account's local 30-day rollup"
+                  >
+                    <BarChart3 className="size-4" />
+                  </Button>
+                )}
                 <Button
                   size="icon"
                   variant="ghost"
@@ -925,6 +945,8 @@ function HarnessesSection({
                   </>
                 )}
               </div>
+              {usageOpenFor === h.id && <AccountUsageTable harnessId={h.id} />}
+              </div>
             );
           })}
         </div>
@@ -933,12 +955,132 @@ function HarnessesSection({
   );
 }
 
+/**
+ * Per-day, per-model token rollup for one harness's account — fetched on
+ * expand, not with the list, since the scan behind it stats every transcript
+ * file. Numbers come from the account's local JSONL history, so they include
+ * CLI sessions outside agetor (the budget shown is the account's).
+ */
+function AccountUsageTable({ harnessId }: { harnessId: string }) {
+  const [days, setDays] = useState<AccountUsageDay[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setDays(null);
+    setError(null);
+    api.getAccountUsage(harnessId)
+      .then((p) => { if (!cancelled) setDays(p.days); })
+      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)); });
+    return () => { cancelled = true; };
+  }, [harnessId]);
+
+  if (error) {
+    return <p className="px-1 text-[11px] text-danger">{error}</p>;
+  }
+  if (days === null) {
+    return <p className="px-1 text-[11px] text-muted-foreground">Loading usage…</p>;
+  }
+  if (days.length === 0) {
+    return (
+      <p className="px-1 text-[11px] text-muted-foreground">
+        No local usage history for this account (last 30 days).
+      </p>
+    );
+  }
+  return (
+    <div className="max-h-48 overflow-auto rounded-md border border-border/40 bg-muted/20">
+      <table className="w-full text-[11px]">
+        <thead className="sticky top-0 bg-muted/80 text-muted-foreground">
+          <tr>
+            <th className="px-2 py-1 text-left font-medium">Day</th>
+            <th className="px-2 py-1 text-left font-medium">Model</th>
+            <th className="px-2 py-1 text-right font-medium">In</th>
+            <th className="px-2 py-1 text-right font-medium">Out</th>
+            <th className="px-2 py-1 text-right font-medium">Cache w/r</th>
+            <th className="px-2 py-1 text-right font-medium">Msgs</th>
+          </tr>
+        </thead>
+        <tbody>
+          {days.map((d) => (
+            <tr key={`${d.day}:${d.model}`} className="border-t border-border/30">
+              <td className="px-2 py-1 font-mono">{d.day}</td>
+              <td className="max-w-40 truncate px-2 py-1">{d.model}</td>
+              <td className="px-2 py-1 text-right font-mono">{formatTokens(d.inputTokens)}</td>
+              <td className="px-2 py-1 text-right font-mono">{formatTokens(d.outputTokens)}</td>
+              <td className="px-2 py-1 text-right font-mono">
+                {formatTokens(d.cacheWriteTokens)}/{formatTokens(d.cacheReadTokens)}
+              </td>
+              <td className="px-2 py-1 text-right font-mono">{d.messageCount}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Turn a discovered account into a pre-filled editor template. The email
+ *  lands in the label so two claude harnesses stay distinguishable in every
+ *  picker; the config dir becomes the harness home verbatim. */
+function discoveredToTemplate(a: DiscoveredAccount): HarnessTemplate {
+  return {
+    id: `__discovered:${a.configDir}`,
+    label: `Claude (${a.email})`,
+    description: "",
+    kind: "claude-code",
+    suggestedHarnessId: a.suggestedHarnessId,
+    home: a.configDir,
+    bin: null,
+    env: {},
+  };
+}
+
 function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
+  // Existing logged-in Claude config dirs no harness points at yet. Loaded
+  // on open; a failed probe degrades to the static templates only.
+  const [discovered, setDiscovered] = useState<DiscoveredAccount[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    api.discoverAccounts()
+      .then((p) => { if (!cancelled) setDiscovered(p.accounts); })
+      .catch(() => { /* static templates still work */ });
+    return () => { cancelled = true; };
+  }, []);
   return (
     <div className="space-y-2 pt-3">
       <p className="text-xs text-muted-foreground">
         Pick a starting point. You can edit every field before saving.
       </p>
+      {discovered.length > 0 && (
+        <div className="space-y-1.5">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            Detected accounts
+          </p>
+          {discovered.map((a) => (
+            <button
+              key={a.configDir}
+              type="button"
+              onClick={() => onPick(discoveredToTemplate(a))}
+              className={cn(
+                "flex w-full items-start gap-3 rounded-md border border-border/60 px-3 py-2 text-left",
+                "hover:border-primary/60 hover:bg-accent/50",
+              )}
+            >
+              <AgentIcon kind="claude-code" className="mt-0.5 size-4 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium">
+                  Existing Claude account · {a.email}
+                </div>
+                <div className="truncate text-[11px] text-muted-foreground">
+                  {a.configDir}
+                  {a.billingType && <> · {a.billingType}</>}
+                  {" "}· already logged in, no setup needed
+                </div>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
       <div className="space-y-1.5">
         {HARNESS_TEMPLATES.map((t) => {
           const experimental = isExperimentalKind(t.kind);

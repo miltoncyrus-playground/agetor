@@ -5,6 +5,7 @@ import type {
   BranchInfo,
   BranchNamingConfig,
   ColumnId,
+  DiscoveredAccount,
   GlobalEvent,
   GitHubIssueThreadResult,
   GitHubItemKind,
@@ -408,6 +409,17 @@ export interface SentMessageItem {
 }
 
 export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
+/** One day × model row of an account's local token rollup. */
+export interface AccountUsageDay {
+  day: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  messageCount: number;
+}
+export interface AccountUsagePayload { configDir: string; days: AccountUsageDay[] }
 export interface HarnessInput {
   id: string;
   kind: AgentKind;
@@ -465,6 +477,12 @@ export const api = {
    *  cadence floor — the popover's manual Refresh button. */
   refreshHarnessUsage: (id: string) =>
     j<HarnessQuota>(`/harnesses/${encodeURIComponent(id)}/usage/refresh`, { method: "POST" }),
+  /** Claude config dirs with a logged-in account that no harness points at
+   *  yet — the Add-harness picker's "use an existing account" entries. */
+  discoverAccounts: () => j<{ accounts: DiscoveredAccount[] }>("/harness-discovery"),
+  /** Daily per-model token rollup for a claude-code harness's account. */
+  getAccountUsage: (id: string) =>
+    j<AccountUsagePayload>(`/harnesses/${encodeURIComponent(id)}/account-usage`),
   openHarnessTerminal: (id: string) =>
     j<{ ok: true }>(`/harnesses/${encodeURIComponent(id)}/open-terminal`, {
       method: "POST",
