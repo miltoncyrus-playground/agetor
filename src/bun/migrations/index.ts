@@ -82,6 +82,9 @@ import m057 from "./057_satisfied_subtasks.sql" with { type: "text" };
 // (pre-upstream-sync numbering); renumbered to 058 on port, original id kept
 // as an alias (same renumber-with-alias pattern).
 import m058 from "./058_run_usage.sql" with { type: "text" };
+// Pipeline between-stage state was authored as 044 on the token-efficiency
+// branch; renumbered to 059 on port, original id kept as an alias.
+import m059 from "./059_pipeline_stage_state.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -148,4 +151,5 @@ export const migrations: Migration[] = [
   { id: "056_account_usage", sql: m056, aliases: ["040_account_usage"] },
   { id: "057_satisfied_subtasks", sql: m057, aliases: ["042_satisfied_subtasks"] },
   { id: "058_run_usage", sql: m058, aliases: ["043_run_usage"] },
+  { id: "059_pipeline_stage_state", sql: m059, aliases: ["044_pipeline_stage_state"] },
 ];
