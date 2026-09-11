@@ -161,9 +161,22 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen, isOpen, on
           aria-label="New messages"
         />
       )}
-      <div className="flex min-w-0 items-center gap-1.5">
-        <TypeIcon className={cn("size-3 shrink-0", type.iconClass)} aria-label={type.label} />
-        <span className="min-w-0 flex-1 truncate text-xs font-medium leading-tight">{task.title}</span>
+      {/* `items-start`, not `items-center`: the title clamps to TWO lines, so
+          centring would float the type icon and the count badges against the
+          middle of a tall title instead of its first line. */}
+      <div className="flex min-w-0 items-start gap-1.5">
+        <TypeIcon className={cn("mt-px size-3 shrink-0", type.iconClass)} aria-label={type.label} />
+        {/* Two lines, not one. Measured at a 1440px viewport the title box is
+            163px — about 26 characters — and real task titles run 37-57, so a
+            single truncated line hid roughly half of most titles and pushed
+            the user to hover or open the panel just to read what a card IS.
+            The clamp buys that back out of the one axis there is room in:
+            lanes stack vertically and the page scrolls, while a lane with all
+            six columns populated already overflows 1440px horizontally by
+            ~336px, so widening the column instead would make the worse
+            problem worse. Fixed at two lines (not free wrap) so every card
+            stays the same height and the grid still scans. */}
+        <span className="min-w-0 flex-1 line-clamp-2 text-xs font-medium leading-tight">{task.title}</span>
         {/* Two count signals kept on the face rather than folded into the
             state line: both answer "did something land here" for a card the
             user isn't watching, which the state label can't express. Icon +
@@ -172,7 +185,7 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen, isOpen, on
         {todo && todo.total > 0 && (
           <span
             className={cn(
-              "flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums",
+              "mt-px flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums",
               todo.completed === todo.total ? "text-success" : "text-muted-foreground",
             )}
             title={`${todo.completed} of ${todo.total} tasks done`}
@@ -183,7 +196,7 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen, isOpen, on
         )}
         {sentCount > 0 && (
           <span
-            className="flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums text-muted-foreground"
+            className="mt-px flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums text-muted-foreground"
             data-testid="sent-files-badge"
             title={`${sentCount} file${sentCount === 1 ? "" : "s"} sent · ${[...task.sentFiles!]
               .sort((a, b) => b.sentAt - a.sentAt)

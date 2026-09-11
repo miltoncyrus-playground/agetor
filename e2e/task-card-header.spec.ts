@@ -148,10 +148,16 @@ test.describe("task card header layout", () => {
       box(icon), box(cardTitle), box(agent), box(state),
     ]);
 
-    // --- Row 1: type icon and title share a visual row -------------------
-    const iconMidY = iconBox.y + iconBox.height / 2;
-    const titleMidY = titleBox.y + titleBox.height / 2;
-    expect(Math.abs(iconMidY - titleMidY), "type icon and title should sit on the same row").toBeLessThan(8);
+    // --- Row 1: type icon aligns to the title's FIRST line ---------------
+    // Compared by TOP edge, not midpoint: the title clamps to two lines, so
+    // a two-line title's centre necessarily sits below the icon's. The icon
+    // is `items-start`-aligned to the first line, which is the invariant
+    // worth pinning — a midpoint comparison would only hold for the
+    // one-line case and would silently re-break when a title wraps.
+    expect(
+      Math.abs(iconBox.y - titleBox.y),
+      "type icon should align to the title's first line",
+    ).toBeLessThan(6);
     expect(iconBox.x, "type icon should sit left of the title").toBeLessThan(titleBox.x);
 
     // --- Row 2: harness name and state label share a visual row ----------
@@ -167,9 +173,14 @@ test.describe("task card header layout", () => {
     ).toBeLessThanOrEqual(agentBox.y + 2);
 
     // --- The whole card stays compact ------------------------------------
-    // Two short rows and nothing else. A regression that re-adds the prompt
-    // preview, workdir or branch lines would blow straight past this.
+    // The title clamps to at most two lines, plus the one-line harness/state
+    // row. The ceiling is what stops the card quietly re-growing: a regression
+    // that re-adds the prompt preview, workdir or branch lines blows straight
+    // past it. A one-line-title card measures ~46px; a clamped two-line one
+    // adds roughly a line of leading on top of that, so 92 leaves headroom
+    // for the app's font-size setting without going slack enough to miss an
+    // extra row sneaking in.
     const cardBox = await box(card);
-    expect(cardBox.height, "the compact card should stay two rows tall").toBeLessThan(72);
+    expect(cardBox.height, "the compact card should stay at most title(2)+meta tall").toBeLessThan(92);
   });
 });
