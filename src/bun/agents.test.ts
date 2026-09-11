@@ -28,6 +28,9 @@ const {
   isValidEnvKey,
   toTerminalAppleScript,  claudeModelPickerFamily,
   spawnAgent,
+  pipelineToolset,
+  leanContextEnabled,
+  PIPELINE_CLAUDE_TOOLS,
 } = await import("./agents.ts");
 const { dataDir } = await import("./db.ts");
 
@@ -1371,4 +1374,75 @@ test("toTerminalAppleScript escapes quotes/backslashes and wraps in do script + 
   const script = toTerminalAppleScript('echo "hi"; cd /x\\y');
   expect(script).toContain('do script "echo \\"hi\\"; cd /x\\\\y"');
   expect(script).toContain('activate application "Terminal"');
+});
+
+// ─── lean-context launch (pipeline turns; O-1/O-2) ───────────────────────────
+
+test("claude-code leanContext emits --tools + --append-system-prompt-file and the two disable env vars", () => {
+  const { cmd, env } = buildCommand(builtin("claude-code"), "the prompt", {
+    ...claudeDefaults,
+    leanContext: { tools: ["Read", "Edit", "Bash"], appendSystemPromptFile: "/wt/CLAUDE.md" },
+  });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-opus-4-7",
+    "--permission-mode", "auto",
+    "--tools", "Read,Edit,Bash",
+    "--append-system-prompt-file", "/wt/CLAUDE.md",
+    "--", "the prompt",
+  ]);
+  expect(env?.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBe("1");
+  expect(env?.CLAUDE_CODE_DISABLE_BUNDLED_SKILLS).toBe("1");
+});
+
+test("claude-code leanContext without a CLAUDE.md omits the append flag but still disables discovery", () => {
+  const { cmd, env } = buildCommand(builtin("claude-code"), "p", {
+    ...claudeDefaults,
+    leanContext: { tools: ["Read"], appendSystemPromptFile: null },
+  });
+  expect(cmd).toContain("--tools");
+  expect(cmd).not.toContain("--append-system-prompt-file");
+  expect(env?.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBe("1");
+});
+
+test("claude-code without leanContext is byte-identical to before (no --tools, no disable env)", () => {
+  const { cmd, env } = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, leanContext: null });
+  expect(cmd).not.toContain("--tools");
+  expect(cmd).not.toContain("--append-system-prompt-file");
+  expect(env?.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBeUndefined();
+  expect(env?.CLAUDE_CODE_DISABLE_BUNDLED_SKILLS).toBeUndefined();
+});
+
+test("leanContext is ignored by codex and gemini", () => {
+  const lean = { tools: ["Read"], appendSystemPromptFile: "/wt/CLAUDE.md" };
+  const codex = buildCommand(builtin("codex"), "p", { ...codexDefaults, leanContext: lean });
+  expect(codex.cmd.join(" ")).not.toContain("--tools");
+  expect(codex.env?.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBeUndefined();
+  const gemini = buildCommand(builtin("gemini"), "p", { ...geminiDefaults, leanContext: lean });
+  expect(gemini.cmd.join(" ")).not.toContain("--tools");
+  expect(gemini.env?.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBeUndefined();
+});
+
+test("pipelineToolset: clarify is the only stage that gets AskUserQuestion; children (null stage) get the base set", () => {
+  expect(pipelineToolset("clarify")).toEqual([...PIPELINE_CLAUDE_TOOLS, "AskUserQuestion"]);
+  expect(pipelineToolset("planning")).toEqual([...PIPELINE_CLAUDE_TOOLS]);
+  expect(pipelineToolset(null)).toEqual([...PIPELINE_CLAUDE_TOOLS]);
+  // Fresh arrays each call — a caller mutating one must not poison the constant.
+  const a = pipelineToolset("testing"); a.push("Artifact");
+  expect(pipelineToolset("testing")).not.toContain("Artifact");
+  expect(PIPELINE_CLAUDE_TOOLS).not.toContain("Artifact");
+});
+
+test("leanContextEnabled: on by default, off only for the literal '0'", () => {
+  const prior = process.env.AGETOR_PIPELINE_LEAN_CONTEXT;
+  try {
+    delete process.env.AGETOR_PIPELINE_LEAN_CONTEXT;
+    expect(leanContextEnabled()).toBe(true);
+    process.env.AGETOR_PIPELINE_LEAN_CONTEXT = "0";
+    expect(leanContextEnabled()).toBe(false);
+    process.env.AGETOR_PIPELINE_LEAN_CONTEXT = "1";
+    expect(leanContextEnabled()).toBe(true);
+  } finally {
+    if (prior === undefined) delete process.env.AGETOR_PIPELINE_LEAN_CONTEXT; else process.env.AGETOR_PIPELINE_LEAN_CONTEXT = prior;
+  }
 });

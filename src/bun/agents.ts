@@ -132,6 +132,58 @@ export interface AgentRunOptions {
    * of getting its own `buildFxCommand` wrapper.
    */
   runId?: string | null;
+  /**
+   * Lean-context launch for pipeline stage turns and build children
+   * (claude-code only; ignored by codex/gemini). Measured on two real
+   * pipelines (docs/plans/pipeline-token-efficiency.md §1): every fresh
+   * stage session paid a ~54K-token bootstrap that was re-read on every
+   * one of 809 API messages — 62% of all context tokens. Most of it was
+   * 156KB of tool schemas for tools a pipeline agent never uses (Artifact,
+   * Agent, Skill, ScheduleWakeup…), an 11KB skill listing, and the
+   * operator's personal `/home/<user>/CLAUDE.md` pulled in only because
+   * the worktree root (`~/.agetor/worktrees/`) sits under `$HOME`. With
+   * `tools` restricted and
+   * CLAUDE.md auto-discovery off, the same first message costs ~13K.
+   *
+   * `tools` → `--tools <csv>` (claude's built-in-tool selector; the schemas
+   * of unlisted tools leave the prompt entirely, verified against the JSONL
+   * `prompt_snapshot`). `appendSystemPromptFile` → the worktree's own
+   * CLAUDE.md, re-injected via `--append-system-prompt-file` so the target
+   * repo's conventions survive while ancestor files (the operator's) don't.
+   * Sets `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and
+   * `CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1` on the session env.
+   */
+  leanContext?: LeanContext | null;
+}
+
+export interface LeanContext {
+  /** Built-in tool names to expose, in `--tools` order. */
+  tools: string[];
+  /** Absolute path of a CLAUDE.md to append to the system prompt, or null. */
+  appendSystemPromptFile?: string | null;
+}
+
+/** Built-in tools a pipeline stage agent / build child actually uses (from
+ *  the tool_use histogram of the measured runs: Bash, Edit, Read, Write,
+ *  plus Grep/Glob for search). Everything else in claude's default set is
+ *  schema weight the agent never calls. */
+export const PIPELINE_CLAUDE_TOOLS: readonly string[] = ["Read", "Edit", "Write", "Bash", "Grep", "Glob"];
+
+/** The Clarify stage is the one stage that asks the human questions
+ *  (native AskUserQuestion, 4 calls across the measured clarify runs). */
+export const PIPELINE_CLAUDE_TOOLS_CLARIFY: readonly string[] = [...PIPELINE_CLAUDE_TOOLS, "AskUserQuestion"];
+
+/** Pure: which built-in tool set a pipeline turn gets. `stage` is the
+ *  parent's `pipelineStage` (null for a build child). */
+export function pipelineToolset(stage: string | null): string[] {
+  return [...(stage === "clarify" ? PIPELINE_CLAUDE_TOOLS_CLARIFY : PIPELINE_CLAUDE_TOOLS)];
+}
+
+/** Env kill-switch for the lean launch: `AGETOR_PIPELINE_LEAN_CONTEXT=0`
+ *  restores the pre-optimisation full-context spawn for every pipeline
+ *  turn. Read per call so a test (or a live daemon) can flip it. */
+export function leanContextEnabled(): boolean {
+  return process.env.AGETOR_PIPELINE_LEAN_CONTEXT !== "0";
 }
 
 // Map friendly model ids to the exact strings the claude-code CLI expects.
@@ -494,6 +546,18 @@ export function buildCommand(
       // `defaultMode` (e.g. `auto` in ~/.claude/settings.json), silently
       // running the task in a looser mode than the one stored on it.
       args.push("--permission-mode", toClaudeModeString(mode));
+    }
+
+    // Lean-context launch for pipeline turns — see `AgentRunOptions.leanContext`.
+    // Emitted before the operator's AGETOR_CLAUDE_ARGS so an explicit extra
+    // `--tools`/env there still wins (later flag, last write).
+    if (opts.leanContext) {
+      args.push("--tools", opts.leanContext.tools.join(","));
+      if (opts.leanContext.appendSystemPromptFile) {
+        args.push("--append-system-prompt-file", opts.leanContext.appendSystemPromptFile);
+      }
+      env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
+      env.CLAUDE_CODE_DISABLE_BUNDLED_SKILLS = "1";
     }
 
     args.push(...extra);
