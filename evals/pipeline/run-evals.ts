@@ -13,6 +13,9 @@
  *                       TASKS.json that parses, declares non-overlapping
  *                       per-subtask `files`, covers every AC, and is
  *                       committed. (The 2dot2dot-redesign conflict class.)
+ *   decompose-single  — decomposePrompt on a 2-AC / 2-file fixture emits
+ *                       exactly ONE subtask (O-3 right-sizing; the
+ *                       "ten children for a colour change" class).
  *   merge-resolution  — mergeResolutionPrompt on a repo with a real parked
  *                       conflicted merge concludes the merge (git-verified
  *                       via isBranchMerged), preserves BOTH sides' intent,
@@ -214,6 +217,69 @@ async function evalDecomposeFiles(run: number): Promise<EvalResult> {
   return { eval: "decompose-files", run, score: score(checks), pass: score(checks) >= PASS_THRESHOLD, checks };
 }
 
+// ─── eval: decompose-single ──────────────────────────────────────────────────
+// O-3 (docs/plans/pipeline-token-efficiency.md): a small ticket — 2 ACs, a
+// plan naming 2 files — must come back as exactly ONE subtask. The failure
+// this guards is the "ten children for a background-colour change" class,
+// where each child pays a full bootstrap for no parallelism gain.
+
+const DECOMPOSE_SINGLE_SPEC = `# Recipe box — SPEC
+
+A tiny recipe-collection web app that already renders a list of recipes.
+
+AC-1: The home route shows a "Recipe box" heading above the list.
+AC-2: Each recipe title in the list links to \`#/recipe/<id>\`.
+`;
+
+const DECOMPOSE_SINGLE_PLAN = `# Recipe box — PLAN
+
+Two small edits, both in the existing home route. In \`src/routes/home.js\`
+render an \`<h1>Recipe box</h1>\` before the list and wrap each title in an
+\`<a href="#/recipe/<id>">\`. Add a matching \`h1\` rule to \`src/styles.css\`.
+No new files, no new dependencies, no other routes touched.
+`;
+
+async function evalDecomposeSingle(run: number): Promise<EvalResult> {
+  const repo = await makeRepo("feature/eval");
+  writeFileSync(path.join(repo, "SPEC.md"), DECOMPOSE_SINGLE_SPEC);
+  writeFileSync(path.join(repo, "PLAN.md"), DECOMPOSE_SINGLE_PLAN);
+  await commitAllIn(repo, "chore: fixture spec + plan");
+
+  const prompt = stagePrompt(fakeTask({ pipelineStage: "decompose" }), "decompose");
+  const invoked = await runClaude(prompt, repo);
+  if (!invoked.ok) return { eval: "decompose-single", run, score: 0, pass: false, checks: [], error: invoked.detail };
+
+  const checks: Check[] = [];
+  const tasksPath = path.join(repo, "TASKS.json");
+  checks.push({ name: "TASKS.json exists", pass: existsSync(tasksPath) });
+  if (existsSync(tasksPath)) {
+    const plan = parseBuildPlan(readFileSync(tasksPath, "utf8"));
+    checks.push({
+      name: "parses + no cross-subtask file overlap",
+      pass: plan.ok,
+      note: plan.ok ? undefined : plan.reason,
+    });
+    if (plan.ok) {
+      const subs = plan.plan.subtasks;
+      checks.push({
+        name: "exactly 1 subtask (2 files, 2 ACs is below the split threshold)",
+        pass: subs.length === 1,
+        note: `subtasks: ${subs.length}`,
+      });
+      const coverage = analyzeCoverage(parseSpecAcceptanceCriteria(DECOMPOSE_SINGLE_SPEC), plan.plan);
+      checks.push({
+        name: "AC coverage clean (no gaps, no phantoms)",
+        pass: coverage.ok,
+        note: coverage.ok ? undefined : coverage.reason,
+      });
+    }
+  }
+  const status = await git(["status", "--porcelain"], repo);
+  checks.push({ name: "artifacts committed (clean tree)", pass: status.stdout.trim() === "" });
+
+  return { eval: "decompose-single", run, score: score(checks), pass: score(checks) >= PASS_THRESHOLD, checks };
+}
+
 // ─── eval: merge-resolution ──────────────────────────────────────────────────
 
 async function evalMergeResolution(run: number): Promise<EvalResult> {
@@ -280,6 +346,7 @@ async function evalBuilderCommit(run: number): Promise<EvalResult> {
 
 const EVALS: Record<string, (run: number) => Promise<EvalResult>> = {
   "decompose-files": evalDecomposeFiles,
+  "decompose-single": evalDecomposeSingle,
   "merge-resolution": evalMergeResolution,
   "builder-commit": evalBuilderCommit,
 };

@@ -7,6 +7,10 @@ import {
   childBuildPrompt,
   mergeResolutionPrompt,
   stagePrompt,
+  buildPlanWarnings,
+  DECOMPOSE_SINGLE_SUBTASK_MAX_FILES,
+  DECOMPOSE_SOFT_MAX_SUBTASKS,
+  CHILD_SUBTASK_PROMPT_MAX_BYTES,
   PIPELINE_PLAN_FILE,
   PIPELINE_TASKS_FILE,
   PIPELINE_SPEC_FILE,
@@ -637,4 +641,109 @@ test("mergeResolutionPrompt: names the branch and subtask, forbids re-implementa
   expect(p).toContain("git commit");
   expect(p.toLowerCase()).toContain("do not push");
   expect(p).toContain("IN PROGRESS");
+});
+
+// --- O-3 / O-9: decomposition sizing + prompt/result bounds -------------------
+
+test("sizing constants hold the values the plan doc specifies", () => {
+  expect(DECOMPOSE_SINGLE_SUBTASK_MAX_FILES).toBe(6);
+  expect(DECOMPOSE_SOFT_MAX_SUBTASKS).toBe(8);
+  expect(CHILD_SUBTASK_PROMPT_MAX_BYTES).toBe(2048);
+});
+
+test("decompose prompt: states the sizing rules with the literal numbers", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
+  expect(p).toContain("Sizing rules");
+  expect(p).toContain("touches fewer than 6 files");
+  expect(p).toContain("emit exactly ONE subtask");
+  expect(p).toContain("one component area");
+  expect(p).toContain("2 to 4 slices");
+  expect(p).toContain("never one slice per file");
+  expect(p).toContain("8 subtasks as the ceiling");
+});
+
+test("decompose prompt: states the per-subtask prompt byte budget", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
+  expect(p).toContain('Keep each subtask\'s "prompt" under 2048 bytes');
+});
+
+test("decompose prompt: sizing rules do not disturb the TASKS.json shape example", () => {
+  const p = stagePrompt(task({ pipelineStage: "decompose" }), "decompose");
+  expect(p).toContain('"acceptanceCriteria": ["AC-1", "AC-2"], "files": ["src/feature-a/", "src/routes/A.tsx"]');
+  expect(p).not.toContain(PIPELINE_VERDICT_PREFIX);
+});
+
+test("code-review prompt: Read ranges for files over 300 lines and tail long output", () => {
+  const p = stagePrompt(task({ pipelineStage: "code-review" }), "code-review");
+  expect(p).toContain("over 300 lines");
+  expect(p).toContain("offset/limit");
+  expect(p).toContain("| tail -200");
+  // Verdict contract untouched.
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} approve`);
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} revise`);
+});
+
+test("testing prompt: tail test/typecheck output and Read ranges for files over 300 lines", () => {
+  const p = stagePrompt(task({ pipelineStage: "testing" }), "testing");
+  expect(p).toContain("| tail -200");
+  expect(p).toContain("over 300 lines");
+  expect(p).toContain("offset/limit");
+  // Verdict contract untouched.
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} pass`);
+  expect(p).toContain(`${PIPELINE_VERDICT_PREFIX} fail`);
+});
+
+test("early-stage prompts do not carry the Read-range/tail instruction (it is a late-stage cost control)", () => {
+  for (const stage of ["specify", "planning", "plan-review"] as const) {
+    const p = stagePrompt(task({ pipelineStage: stage }), stage);
+    expect(p).not.toContain("| tail -200");
+  }
+});
+
+function sub(id: string, prompt = "do the thing"): Parameters<typeof buildPlanWarnings>[0]["subtasks"][number] {
+  return { id, title: id, prompt, dependsOn: [], acceptanceCriteria: [], files: [] };
+}
+
+test("buildPlanWarnings: a 3-subtask plan with short prompts yields no warnings", () => {
+  expect(buildPlanWarnings({ subtasks: [sub("a"), sub("b"), sub("c")] })).toEqual([]);
+});
+
+test("buildPlanWarnings: exactly the soft max (8) is still clean; 9 warns once with the count", () => {
+  const eight = Array.from({ length: DECOMPOSE_SOFT_MAX_SUBTASKS }, (_, i) => sub(`s${i}`));
+  expect(buildPlanWarnings({ subtasks: eight })).toEqual([]);
+  const nine = [...eight, sub("s8")];
+  const w = buildPlanWarnings({ subtasks: nine });
+  expect(w).toHaveLength(1);
+  expect(w[0]).toContain("9 subtasks");
+  expect(w[0]).toContain("soft maximum of 8");
+});
+
+test("buildPlanWarnings: an oversized subtask prompt warns, naming the subtask id and the byte count", () => {
+  const big = "x".repeat(CHILD_SUBTASK_PROMPT_MAX_BYTES + 1);
+  const w = buildPlanWarnings({ subtasks: [sub("small"), sub("huge", big)] });
+  expect(w).toHaveLength(1);
+  expect(w[0]).toContain('subtask "huge"');
+  expect(w[0]).toContain(`${CHILD_SUBTASK_PROMPT_MAX_BYTES + 1} bytes`);
+  expect(w[0]).toContain("2048-byte budget");
+  expect(w[0]).not.toContain('"small"');
+});
+
+test("buildPlanWarnings: exactly at the byte budget is not a warning; multibyte text is measured in bytes", () => {
+  const exact = "x".repeat(CHILD_SUBTASK_PROMPT_MAX_BYTES);
+  expect(buildPlanWarnings({ subtasks: [sub("ok", exact)] })).toEqual([]);
+  // 1025 two-byte chars = 2050 bytes but only 1025 characters — must warn.
+  const multibyte = "é".repeat(CHILD_SUBTASK_PROMPT_MAX_BYTES / 2 + 1);
+  expect(buildPlanWarnings({ subtasks: [sub("mb", multibyte)] })).toHaveLength(1);
+});
+
+test("buildPlanWarnings: count and size breaches stack; parseBuildPlan still accepts such a plan", () => {
+  const big = "x".repeat(CHILD_SUBTASK_PROMPT_MAX_BYTES + 100);
+  const subtasks = Array.from({ length: 9 }, (_, i) => ({ id: `s${i}`, prompt: i === 4 ? big : "p" }));
+  const parsed = parseBuildPlan(JSON.stringify({ subtasks }));
+  expect(parsed.ok).toBe(true);
+  if (!parsed.ok) return;
+  const w = buildPlanWarnings(parsed.plan);
+  expect(w).toHaveLength(2);
+  expect(w[0]).toContain("9 subtasks");
+  expect(w[1]).toContain('subtask "s4"');
 });
