@@ -297,10 +297,23 @@ test("050 is registered right after 049", () => {
   expect(prev?.sql).toContain("gemini-3.1-pro-preview");
 });
 
-test("057 (pipeline branch) is registered last in the migrations index, right after 056", () => {
-  const last = migrations[migrations.length - 1];
-  expect(last?.id).toBe("057_satisfied_subtasks");
-  expect(last?.sql).toContain("ADD COLUMN satisfied_subtasks TEXT");
-  const prev = migrations[migrations.length - 2];
-  expect(prev?.id).toBe("056_account_usage");
+test("token-efficiency migrations 058/059 are registered last, in order, right after the pipeline branch's 057", () => {
+  const ids = migrations.map((m) => m.id);
+  expect(ids.slice(-4)).toEqual([
+    "056_account_usage",
+    "057_satisfied_subtasks",
+    "058_run_usage",
+    "059_pipeline_stage_state",
+  ]);
+  const m057 = migrations.find((m) => m.id === "057_satisfied_subtasks");
+  expect(m057?.sql).toContain("ADD COLUMN satisfied_subtasks TEXT");
+  // Both were authored as 043/044 on the pre-upstream-sync lineage and
+  // renumbered on port; the old ids stay as aliases so a DB that applied
+  // them under the old numbering is not re-migrated.
+  const m058 = migrations.find((m) => m.id === "058_run_usage");
+  expect(m058?.aliases).toEqual(["043_run_usage"]);
+  expect(m058?.sql).toContain("CREATE TABLE IF NOT EXISTS run_usage");
+  const m059 = migrations.find((m) => m.id === "059_pipeline_stage_state");
+  expect(m059?.aliases).toEqual(["044_pipeline_stage_state"]);
+  expect(m059?.sql).toContain("CREATE TABLE IF NOT EXISTS pipeline_stage_state");
 });
