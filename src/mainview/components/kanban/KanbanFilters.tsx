@@ -37,7 +37,7 @@ interface Props {
   searchInputRef?: React.Ref<HTMLInputElement>;
 }
 
-const basename = (p: string) => {
+export const basename = (p: string) => {
   const trimmed = p.replace(/\/+$/, "");
   const idx = trimmed.lastIndexOf("/");
   return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;

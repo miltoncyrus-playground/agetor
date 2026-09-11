@@ -1,41 +1,49 @@
-import { memo } from "react";
+import { memo, useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import type { ColumnId, Task } from "../../../shared/types.ts";
+import type { Task } from "../../../shared/types.ts";
+import type { DisplayColumnId } from "@/lib/display-columns";
+import { partitionRecentDone } from "@/lib/board-status";
+import { useMinuteNow } from "@/lib/minute-tick";
 import { TaskCard } from "./TaskCard";
 
 interface Props {
-  id: ColumnId;
+  id: DisplayColumnId;
+  /** The dnd-kit droppable id — namespaced per-lane by the caller
+   *  (`` `${workdir}::${columnId}` ``) since a swimlane board has one
+   *  `Column` per (project, stage) pair and every `id: DisplayColumnId`
+   *  value repeats once per lane; the bare id would collide across
+   *  lanes if used directly as the droppable id. `id` itself stays the
+   *  plain display-column id for column-identity/label/comparator
+   *  purposes. */
+  droppableId: string;
   label: string;
+  /** Whether this column accepts drops. Defaults to true; the caller
+   *  (SwimLane.tsx) passes false for the merged "in-progress" bucket,
+   *  which maps to 6 different real columns with no single unambiguous
+   *  drop destination. */
+  droppable?: boolean;
   tasks: Task[];
-  homeDir: string;
-  onStart: (t: Task) => void;
-  onCancel: (t: Task) => void;
-  onDelete: (t: Task) => void;
+  /** taskId -> Task, over the FULL task list (not just this column) — lets
+   *  a child card look up its parent's title regardless of which column
+   *  the parent is currently in. Stable reference across renders where the
+   *  underlying task list didn't change (see App.tsx). */
+  tasksById: Map<string, Task>;
+  /** parentTaskId -> { merged, total } sub-task counts, for the parent
+   *  card's progress badge. Same stability guarantee as `tasksById`. */
+  childCountsByParent: Map<string, { merged: number; total: number }>;
+  /** The only interaction a compact TaskCard offers directly — everything
+   *  else (Run/Stop/Archive/Diff/Delete/Mark-Done/Retry) lives in RunPanel,
+   *  reached by clicking the tile. See TaskCard.tsx's doc comment. */
   onOpen: (t: Task) => void;
-  onDiff: (t: Task) => void;
-  onMarkDone: (t: Task) => void;
-  onArchive: (t: Task) => void;
-  onUnarchive: (t: Task) => void;
-  /** Muted one-line hint shown in place of the (empty) task list, while
-   *  onboarding's checklist is visible. Only rendered when `tasks.length ===
-   *  0` — never overlays real cards. Non-interactive (`pointer-events-none`)
-   *  and stays inside the existing droppable container so dnd-kit's drop
-   *  zone is unaffected. */
-  emptyHint?: string;
-  /** Id of the task currently open in the run panel (App.tsx's `selected`),
-   *  or null/undefined when no panel is open. Threaded down to each
-   *  `TaskCard` as `isOpen` so the unread dot is suppressed for the task
-   *  being actively watched. */
+  /** Id of the task currently open in the run panel — threaded to each card
+   *  as `isOpen` so the unread dot is suppressed for the task being watched. */
   selectedTaskId?: string | null;
-  /** Right-click on a card within this column — forwarded verbatim to every
-   *  `TaskCard`. See `TaskCard`'s doc comment for the payload shape. */
+  /** Right-click on a card in this column, forwarded verbatim to every
+   *  `TaskCard`. This is the card's action surface now that the compact
+   *  tile carries no buttons — see TaskCard.tsx's doc comment. */
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
-  /** parentTaskId -> merged/total sub-task counts, forwarded verbatim to
-   *  every `TaskCard`. App.tsx memoizes it over the full task list, so the
-   *  reference is stable and the comparator below can compare it by identity. */
-  childCountsByParent?: Map<string, { merged: number; total: number }>;
 }
 
 /** Array is considered unchanged when same length and every element is the
@@ -50,44 +58,78 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu, childCountsByParent }: Props) {
-  const { setNodeRef, isOver } = useDroppable({ id });
+function ColumnImpl({ id, droppableId, label, droppable = true, tasks, tasksById, childCountsByParent, onOpen, selectedTaskId, onContextMenu }: Props) {
+  const { setNodeRef, isOver } = useDroppable({ id: droppableId, disabled: !droppable });
+  const now = useMinuteNow();
+  // Done is the one column that grows forever — show only recent finishes,
+  // collapse the rest behind a "+N older" toggle. Other columns pass through.
+  const { recent, olderCount } = id === "done"
+    ? partitionRecentDone(tasks, now)
+    : { recent: tasks, olderCount: 0 };
+  const [showAllDone, setShowAllDone] = useState(false);
+  const shown = showAllDone ? tasks : recent;
+
+  // Empty column → slim stub. It keeps its droppable registration (drops
+  // land normally; isOver highlights it) but shrinks to a vertical strip so
+  // an idle lane doesn't spend 224px per empty column. Deliberately NOT
+  // expanded on drag-hover: growing a column mid-drag shifts every sibling
+  // droppable's cached rect and misaligns the rest of the drag. The stub
+  // expands the natural way — by gaining a card.
+  if (tasks.length === 0) {
+    return (
+      <div
+        ref={setNodeRef}
+        className={cn(
+          "flex w-9 shrink-0 flex-col items-center gap-2 rounded-lg border border-border/40 bg-muted/20 px-1.5 py-2",
+          isOver && "border-primary/60 bg-muted/60",
+        )}
+      >
+        <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground [writing-mode:vertical-rl]">
+          {label}
+        </h2>
+        <Badge variant="outline" className="h-4 px-1 text-[10px] opacity-60">0</Badge>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={setNodeRef}
       className={cn(
-        "flex w-72 shrink-0 flex-col gap-3 rounded-lg border border-border/40 bg-muted/30 p-3",
+        "flex w-56 shrink-0 flex-col gap-2 rounded-lg border border-border/40 bg-muted/30 p-2",
         isOver && "border-primary/60 bg-muted/60",
       )}
     >
       <div className="flex items-center justify-between">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
           {label}
         </h2>
-        <Badge variant="outline">{tasks.length}</Badge>
+        {/* Total count, not the windowed count — the badge answers "how many
+            are done", the window only limits what's painted. */}
+        <Badge variant="outline" className="h-4 px-1.5 text-[10px]">{tasks.length}</Badge>
       </div>
-      <div className="flex flex-col gap-2">
-        {tasks.length === 0 && emptyHint && (
-          <p className="pointer-events-none px-1 text-xs text-muted-foreground">{emptyHint}</p>
-        )}
-        {tasks.map((t) => (
+      {/* min-h keeps a nearly-empty column a comfortable drop target. */}
+      <div className="flex min-h-10 flex-col gap-1">
+        {shown.map((t) => (
           <TaskCard
             key={t.id}
             task={t}
-            homeDir={homeDir}
-            onStart={onStart}
-            onCancel={onCancel}
-            onDelete={onDelete}
+            tasksById={tasksById}
+            childCountsByParent={childCountsByParent}
             onOpen={onOpen}
-            onDiff={onDiff}
-            onMarkDone={onMarkDone}
-            onArchive={onArchive}
-            onUnarchive={onUnarchive}
             isOpen={t.id === selectedTaskId}
             onContextMenu={onContextMenu}
-            childCountsByParent={childCountsByParent}
           />
         ))}
+        {olderCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowAllDone((v) => !v)}
+            className="rounded-md px-2 py-1 text-left text-[10px] text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+          >
+            {showAllDone ? "Show recent only" : `+${olderCount} older`}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -101,27 +143,22 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
  *  member tasks are all reference-unchanged bails out — so a single task
  *  update (which only changes that one task's object identity, per
  *  App.tsx's `reconcileById`) only re-renders the column(s) that actually
- *  contain the changed task.
- *
- *  `selectedTaskId` is compared explicitly (primitive, cheap). App passes
- *  the same value to every column, so opening/switching/closing the run
- *  panel re-renders every column — the inner `TaskCard` memo then keeps the
- *  actual DOM work to the card(s) whose `isOpen` flips. */
+ *  contain the changed task. */
 export const Column = memo(ColumnImpl, (prev, next) => (
   prev.id === next.id &&
+  prev.droppableId === next.droppableId &&
   prev.label === next.label &&
-  prev.homeDir === next.homeDir &&
-  prev.onStart === next.onStart &&
-  prev.onCancel === next.onCancel &&
-  prev.onDelete === next.onDelete &&
+  prev.droppable === next.droppable &&
   prev.onOpen === next.onOpen &&
-  prev.onDiff === next.onDiff &&
-  prev.onMarkDone === next.onMarkDone &&
-  prev.onArchive === next.onArchive &&
-  prev.onUnarchive === next.onUnarchive &&
-  prev.emptyHint === next.emptyHint &&
+  // App passes the same value to every column, so opening/switching/closing
+  // the run panel re-renders every column — TaskCard's own memo then keeps
+  // the DOM work to the card(s) whose `isOpen` actually flips.
   prev.selectedTaskId === next.selectedTaskId &&
   prev.onContextMenu === next.onContextMenu &&
+  // Both are useMemo'd in App.tsx off `tasks` — reference-stable whenever
+  // the underlying task list didn't actually change, same guarantee
+  // `sameTasks` below relies on for the `tasks` prop itself.
+  prev.tasksById === next.tasksById &&
   prev.childCountsByParent === next.childCountsByParent &&
   sameTasks(prev.tasks, next.tasks)
 ));
