@@ -6585,6 +6585,25 @@ const DEFERRED_PROMPT_POLL_MS = 400;
  *  naturally, but they're independent constants — there's no shared source
  *  and no requirement to change one when the other changes. */
 const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
+/** Cadence of the post-paste submit-verification loop: after the deferred
+ *  prompt is pasted + Enter'd, we poll until claude's JSONL appears (proof
+ *  the turn was actually submitted). Each tick that still finds the
+ *  `[Pasted text …]` placeholder sitting in the composer re-sends Enter —
+ *  the submit `\r` can be absorbed while claude's Ink TUI is still booting
+ *  (the same coalescing window `bracketedEnterGapMs` covers for idle
+ *  sessions, but boot-time rendering can exceed any fixed gap). Verification
+ *  is the fix, not a bigger gap — a check-and-retry loop can't be
+ *  out-tuned. */
+const PASTE_SUBMIT_VERIFY_MS = 1_000;
+/** Bound on the submit-verification loop — 15 ticks ≈ 15s past the paste.
+ *  If the JSONL still hasn't appeared by then, the loop hands the failure
+ *  back to the boot JSONL wait, which reports the pane content as usual. */
+const PASTE_SUBMIT_VERIFY_ATTEMPTS = 15;
+/** A composer line still holding an unsubmitted paste placeholder:
+ *  claude renders the prompt char `❯` followed by `[Pasted text #N +M
+ *  lines]` until the paste is actually submitted (a SUBMITTED paste shows
+ *  in the transcript with a different prefix). Exported for tests. */
+export const UNSUBMITTED_PASTE_RE = /❯[^\n]*\[Pasted text/;
 
 /**
  * Start a new claude tmux session for the task. Two delivery modes for the
@@ -6763,6 +6782,13 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // never become an unhandled rejection (mirrors the boot-dialog poller's
   // posture a few lines down) — this must never affect the JSONL boot wait
   // itself.
+  // True once the deferred-paste flow has fully settled (prompt pasted,
+  // submit verified or given up) — or immediately for the argv-prompt path,
+  // which has no paste to wait for. The boot JSONL wait below re-arms its
+  // window while this is false, so the paste flow and the boot timeout can
+  // never race each other: both clocks used to start together at 30s, and
+  // the boot wait would kill a healthy session whose paste hadn't submitted.
+  let deferredPasteSettled = !opts.deferredPrompt;
   if (opts.deferredPrompt) {
     const deferredPrompt = opts.deferredPrompt;
     opts.onChunk(
@@ -6824,7 +6850,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
         // run yet at this point — `rearmPollTimerFast` would no-op — so only
         // the idle-clock bump applies here.
         bumpActivity(state);
-        void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
+        await queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
           bracketed: true,
           // The boot poller above already owns deciding when the pane is
           // safe to paste into: it only reaches this call once
@@ -6859,7 +6885,37 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
             reject(new Error("paste failed"));
           },
         });
+        // Submit verification: the paste + Enter above only proves tmux
+        // delivered keystrokes, not that claude SUBMITTED the turn — during
+        // boot, the trailing `\r` can be absorbed by the still-rendering TUI
+        // and the prompt parks in the composer as `[Pasted text #N +M
+        // lines]` indefinitely. Claude creates its session JSONL when the
+        // first turn actually starts, so JSONL-exists is the deterministic
+        // "submitted" signal; while it's absent and the placeholder is
+        // visibly parked in the composer, re-send Enter and check again.
+        let resendAnnounced = false;
+        for (let i = 0; i < PASTE_SUBMIT_VERIFY_ATTEMPTS; i++) {
+          await Bun.sleep(PASTE_SUBMIT_VERIFY_MS);
+          if (existsSync(jsonlPath)) return; // submitted — boot wait takes it from here
+          if (!(await tmux(["has-session", "-t", "=" + sessionName])).ok) return;
+          if (sessions.get(opts.taskId) !== state) return;
+          if (!slotLive()) return;
+          const pane = (await tmux(["capture-pane", "-p", "-t", sessionName])).stdout;
+          if (UNSUBMITTED_PASTE_RE.test(pane)) {
+            if (!resendAnnounced) {
+              opts.onChunk("status", "pasted prompt still unsubmitted — re-sending Enter until claude accepts it");
+              resendAnnounced = true;
+            }
+            await tmux(["send-keys", "-t", sessionName, "Enter"]);
+          }
+        }
       } catch { /* never let the deferred-paste poller crash the spawn */ }
+      finally {
+        // Always release the boot JSONL wait, on every exit path — a paste
+        // flow that bailed (session died, superseded, cancelled) must not
+        // hold the boot window open forever.
+        deferredPasteSettled = true;
+      }
     })();
   }
 
@@ -7014,8 +7070,17 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
       sawStartupPromptThisWindow = false;
       found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
       if (found) break;
+      // Re-arm while the deferred-paste flow hasn't settled, exactly like an
+      // unanswered startup prompt: on the deferred path the JSONL only
+      // appears AFTER the paste submits, so this window is measuring paste
+      // latency, not boot — expiring it would kill a healthy session out
+      // from under its own prompt delivery. The paste flow is itself bounded
+      // (readiness windows + the submit-verification loop), so this can't
+      // re-arm forever on its account.
       const blockedOnUser =
-        sawStartupPromptThisWindow || activeTmuxPromptsForTask(opts.taskId).length > 0;
+        sawStartupPromptThisWindow
+        || activeTmuxPromptsForTask(opts.taskId).length > 0
+        || !deferredPasteSettled;
       if (blockedOnUser && (await tmux(["has-session", "-t", "=" + sessionName])).ok) continue;
       break;
     }
@@ -8064,29 +8129,41 @@ let captureModePane: (state: SessionState) => Promise<string> = captureTail;
  * `permission-mode` event, the bar reflects an *idle* Shift+Tab immediately;
  * claude doesn't journal an idle mode switch until the next turn starts.
  *
- * We only read the *trailing* non-empty line of the captured tail and, for
- * the four explicit modes, require the banner's `(shift+tab to cycle)` hint.
+ * We scan the last few trailing non-empty lines of the captured tail (not
+ * just the very last one — see `MODE_BAR_SCAN_LINES`) and, for the four
+ * explicit modes, require the banner's `(shift+tab to cycle)` hint.
  * `captureModePane` returns the whole visible-pane tail, so a bare phrase like
  * "auto mode on" sitting in assistant/user output above the bar would
- * otherwise be mis-read as the live mode.
+ * otherwise be mis-read as the live mode — the bounded backward scan keeps
+ * that guard while tolerating a line or two of chrome claude renders below
+ * its own bar. Claude Code 2.1.226 added a persistent "/rc" hint line under
+ * the bar once a "Now using usage credits" notice is showing, which silently
+ * broke a last-line-only read: `readPaneMode` returned null for the entire
+ * session, so nothing waiting on a confirmed-idle composer — most
+ * consequentially the deferred large-prompt paste in `spawnClaudeViaTmux` —
+ * could ever fire.
  */
+const MODE_BAR_SCAN_LINES = 4;
+
 async function readPaneMode(state: SessionState): Promise<string | null> {
   const lines = (await captureModePane(state)).split("\n");
-  let bar = "";
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i]!.trim() !== "") { bar = lines[i]!; break; }
+  let scanned = 0;
+  for (let i = lines.length - 1; i >= 0 && scanned < MODE_BAR_SCAN_LINES; i--) {
+    const bar = lines[i]!;
+    if (bar.trim() === "") continue;
+    scanned++;
+    if (/shift\+tab to cycle/i.test(bar)) {
+      if (/accept edits on/i.test(bar)) return CLAUDE_MODE_ACCEPT_EDITS;
+      if (/plan mode on/i.test(bar)) return CLAUDE_MODE_PLAN;
+      if (/auto mode on/i.test(bar)) return CLAUDE_MODE_AUTO;
+      if (/bypass permissions on/i.test(bar)) return CLAUDE_MODE_BYPASS;
+    }
+    // No mode banner on this line. Default mode shows the "? for shortcuts"
+    // hint instead; require that positive marker rather than inferring
+    // default from mere absence, so a half-painted frame doesn't read as a
+    // spurious switch.
+    if (/\? for shortcuts/i.test(bar)) return CLAUDE_MODE_DEFAULT;
   }
-  if (/shift\+tab to cycle/i.test(bar)) {
-    if (/accept edits on/i.test(bar)) return CLAUDE_MODE_ACCEPT_EDITS;
-    if (/plan mode on/i.test(bar)) return CLAUDE_MODE_PLAN;
-    if (/auto mode on/i.test(bar)) return CLAUDE_MODE_AUTO;
-    if (/bypass permissions on/i.test(bar)) return CLAUDE_MODE_BYPASS;
-  }
-  // No mode banner. Default mode shows the "? for shortcuts" hint on the
-  // trailing line instead; require that positive marker rather than inferring
-  // default from mere absence, so a half-painted frame doesn't read as a
-  // spurious switch.
-  if (/\? for shortcuts/i.test(bar)) return CLAUDE_MODE_DEFAULT;
   return null;
 }
 

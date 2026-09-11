@@ -1892,6 +1892,72 @@ test("readPaneMode: default mode recognised via the '? for shortcuts' trailing h
   }
 });
 
+test("readPaneMode: finds the banner with a '/rc' credits hint rendered BELOW the bar (2.1.226)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-below-bar";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  // Claude Code 2.1.226 keeps a "Now using usage credits" notice plus a
+  // persistent "/rc" hint UNDER the status bar. A last-non-empty-line-only
+  // read lands on the hint and returns null for the whole session, which
+  // strands everything that waits on a confirmed-idle composer — most
+  // consequentially the deferred large-prompt paste in `spawnClaudeViaTmux`.
+  const prevPane = __forTest.setCaptureModePane(async () =>
+    [
+      "❯ ",
+      "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+      "  Now using usage credits",
+      "  /rc to change",
+    ].join("\n"),
+  );
+  try {
+    expect(await __forTest.readPaneMode(state)).toBe(CLAUDE_MODE_PLAN);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("readPaneMode: the same below-bar chrome still resolves DEFAULT via '? for shortcuts'", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-below-bar-default";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const prevPane = __forTest.setCaptureModePane(async () =>
+    ["❯ ", "  ? for shortcuts · ← for agents", "  Now using usage credits", "  /rc to change"].join("\n"),
+  );
+  try {
+    expect(await __forTest.readPaneMode(state)).toBe(CLAUDE_MODE_DEFAULT);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("readPaneMode: the backward scan is BOUNDED — a decoy further above the bar never wins", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-bounded";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  // This is what keeps the widened scan honest: an old banner scrolled up in
+  // the transcript is 5 non-empty lines above the bottom, past
+  // MODE_BAR_SCAN_LINES, so it must NOT be adopted as the live mode. Without
+  // a bound, widening the scan would trade one bug for a worse one.
+  const prevPane = __forTest.setCaptureModePane(async () =>
+    [
+      "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+      "  filler one",
+      "  filler two",
+      "  filler three",
+      "  filler four",
+      "  filler five",
+    ].join("\n"),
+  );
+  try {
+    expect(await __forTest.readPaneMode(state)).toBeNull();
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
 test("readPaneMode: null when a mode phrase lacks the cycle-hint banner (e.g. modal covering the bar)", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
   const taskId = "task-readpane-null";
