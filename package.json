@@ -20,6 +20,7 @@
     "release:upload-only": "bun scripts/upload-release.ts",
     "typecheck": "tsc --noEmit",
     "eval:pipeline": "bun evals/pipeline/run-evals.ts",
+    "eval:pipeline:tokens": "bun evals/pipeline/token-report.ts",
     "test": "bun test"
   },
   "devDependencies": {
