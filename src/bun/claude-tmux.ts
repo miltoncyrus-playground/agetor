@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tasks } from "./db.ts";
+import { recordRunUsageFromEvent } from "./run-usage-hook.ts";
 import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, subagentActivityWithin, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
@@ -3126,6 +3127,10 @@ function dispatchLine(state: SessionState, line: string): void {
   // recently popped slot's handler so trailing metadata still reaches the
   // correct run. If neither exists it's safe to drop.
   const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  // Per-run token accounting (O-10). Deliberately below the seenLineUuids
+  // return above: see run-usage-hook.ts for why replayed lines must not be
+  // re-attributed to the current run. Fail-open inside the hook.
+  recordRunUsageFromEvent(state.taskId, evt);
   const { endOfTurn } = mapParsedEventToChunks(evt, onChunk, false, prevAnnouncedPermissionMode);
   if (uuid) state.seenLineUuids.add(uuid);
   if (endOfTurn) {
