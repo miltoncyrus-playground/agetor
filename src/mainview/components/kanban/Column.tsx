@@ -32,6 +32,10 @@ interface Props {
   /** Right-click on a card within this column — forwarded verbatim to every
    *  `TaskCard`. See `TaskCard`'s doc comment for the payload shape. */
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
+  /** parentTaskId -> merged/total sub-task counts, forwarded verbatim to
+   *  every `TaskCard`. App.tsx memoizes it over the full task list, so the
+   *  reference is stable and the comparator below can compare it by identity. */
+  childCountsByParent?: Map<string, { merged: number; total: number }>;
 }
 
 /** Array is considered unchanged when same length and every element is the
@@ -46,7 +50,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu, childCountsByParent }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -81,6 +85,7 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
             onUnarchive={onUnarchive}
             isOpen={t.id === selectedTaskId}
             onContextMenu={onContextMenu}
+            childCountsByParent={childCountsByParent}
           />
         ))}
       </div>
@@ -117,5 +122,6 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.emptyHint === next.emptyHint &&
   prev.selectedTaskId === next.selectedTaskId &&
   prev.onContextMenu === next.onContextMenu &&
+  prev.childCountsByParent === next.childCountsByParent &&
   sameTasks(prev.tasks, next.tasks)
 ));

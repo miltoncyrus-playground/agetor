@@ -1,13 +1,13 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Package, Paperclip, Pause, Play, Square, Terminal, Trash2, Workflow } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
-import { taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { AgentIcon } from "./AgentIcon";
 
@@ -31,15 +31,24 @@ interface Props {
    *  task context menu should anchor — omitted entirely when the caller
    *  doesn't wire it up (no menu to open). */
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
+  /** parentTaskId -> merged/total sub-task counts over the whole board.
+   *  Only read for a PARENT pipeline task (one with `pipelineStage` set), to
+   *  render its build progress. App.tsx memoizes the map, so a column whose
+   *  cards are otherwise unchanged still bails out of re-rendering. */
+  childCountsByParent?: Map<string, { merged: number; total: number }>;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
+function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu, childCountsByParent }: Props) {
   const archived = task.archivedAt != null;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
-    // the user has to take the explicit unarchive action first.
-    disabled: archived,
+    // the user has to take the explicit unarchive action first. A pipeline
+    // task sitting on one of the stage columns is undraggable for a
+    // different reason: a human yanking it elsewhere mid-auto-advance would
+    // desync `pipelineStage` from `column`. Once it lands on
+    // blocked/ready/review/done it's an ordinary draggable card again.
+    disabled: archived || PIPELINE_STAGE_COLUMNS.includes(task.column),
   });
 
   const style = transform
@@ -65,7 +74,15 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   // the panel can't deliver.
   const pendingCount = task.pendingInteractionCount;
   const blocked = task.column === "blocked";
-  const awaiting = pendingCount > 0 || blocked;
+  // Three pipeline states join the amber-ring club, because in every one of
+  // them the human is the only thing that moves the task forward and the
+  // card would otherwise read as a healthy "running":
+  //  - awaitingHandBack: a build child whose work is done but not handed back.
+  //  - gateParked: a parent parked at its stage gate by a conversation turn
+  //    (RC-6 refuses to advance a run whose origin isn't "pipeline-stage").
+  //  - stalledSince: the turn-stall watchdog's soft "may be stuck" mark.
+  const awaiting = pendingCount > 0 || blocked || task.awaitingHandBack === true
+    || task.gateParked === true || task.stalledSince != null;
   const awaitingLabel =
     pendingCount > 1 ? `Answer (${pendingCount})`
     : pendingCount === 1 ? "Answer"
@@ -74,6 +91,9 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
   const runningSubagents = task.runningSubagents ?? 0;
+  // Build progress for a PARENT pipeline task. Children carry
+  // `parentTaskId`, so a child never looks itself up here.
+  const childProgress = task.pipelineStage != null ? childCountsByParent?.get(task.id) : undefined;
 
   return (
     <Card
@@ -140,6 +160,37 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               className={cn("size-3.5 shrink-0", type.iconClass)}
               aria-label={type.label}
             />
+            {task.pipelineStage != null && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  "gap-1 text-[10px] shrink-0",
+                  task.pausedAt != null ? "text-warning" : "text-muted-foreground",
+                )}
+                title={
+                  task.pausedAt != null
+                    ? `Pipeline paused at the "${task.pipelineStage}" stage — auto-advance is off`
+                    : `Pipeline stage: ${task.pipelineStage}`
+                }
+              >
+                {task.pausedAt != null ? <Pause className="size-3" /> : <Workflow className="size-3" />}
+                {task.pipelineStage}
+                {task.revisionCount > 0 && <span className="opacity-70">· rev {task.revisionCount}</span>}
+              </Badge>
+            )}
+            {childProgress && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  "gap-1 text-[10px] shrink-0",
+                  childProgress.merged === childProgress.total ? "text-success" : "text-muted-foreground",
+                )}
+                title={`${childProgress.merged} of ${childProgress.total} sub-tasks merged back`}
+              >
+                <Package className="size-3" />
+                {childProgress.merged}/{childProgress.total}
+              </Badge>
+            )}
             {runningSubagents > 0 && (
               <Badge
                 variant="outline"

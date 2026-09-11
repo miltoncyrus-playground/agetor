@@ -882,6 +882,26 @@ function AppInner() {
     return cancel;
   }, []);
 
+  // Build progress per parent pipeline task, for `TaskCard`'s sub-task
+  // badge — computed once here (not per-card) and threaded down as a
+  // stable-identity Map prop via Column, so Column's and TaskCard's existing
+  // memoization only re-renders cards when `tasks` itself actually changed
+  // (`reconcileById` already guarantees `tasks` keeps its own reference when
+  // nothing changed at all). Built off the full `tasks`, not `visibleTasks`
+  // — a child temporarily filtered out of view shouldn't skew its parent's
+  // progress count.
+  const childCountsByParent = useMemo(() => {
+    const m = new Map<string, { merged: number; total: number }>();
+    for (const t of tasks) {
+      if (!t.parentTaskId) continue;
+      const cur = m.get(t.parentTaskId) ?? { merged: 0, total: 0 };
+      cur.total += 1;
+      if (t.childMergeStatus === "merged") cur.merged += 1;
+      m.set(t.parentTaskId, cur);
+    }
+    return m;
+  }, [tasks]);
+
   // Text + repo filter applied here; status filter narrows the rendered
   // columns (not the task list) so an unselected status disappears entirely
   // rather than rendering an empty column.
@@ -1582,6 +1602,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                       emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
                       selectedTaskId={selected?.id ?? null}
                       onContextMenu={openTaskMenu}
+                      childCountsByParent={childCountsByParent}
                     />
                   ))}
                 </div>

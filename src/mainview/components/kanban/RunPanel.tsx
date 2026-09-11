@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, AlertTriangle, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Pause, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
-  Sparkles, Square, Terminal, Trash2, Wrench, X,
+  Play, RotateCcw, Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
@@ -2352,6 +2352,28 @@ function RunPanelBody({
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
   };
 
+  // Pause/resume a pipeline task's auto-advance. Doesn't touch anything
+  // locally — the board's own 2s poll picks up the new pausedAt/column via
+  // the same path every other task mutation already relies on (see `stop`
+  // above for the same fire-and-forget shape).
+  const togglePipelinePause = async () => {
+    try {
+      if (task.pausedAt != null) await api.resumePipelineTask(task.id);
+      else await api.pausePipelineTask(task.id);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // Re-run the stage turn that died, for a pipeline task sitting in
+  // `blocked`. `startTask` is the same route the board card's Run button
+  // hits; the panel has no `onStart` prop, so it calls it directly (same
+  // shape as `stop`, which likewise owns its own API call).
+  const retryPipelineStage = async () => {
+    try { await api.startTask(task.id); }
+    catch (e) { toast(e instanceof Error ? e.message : String(e)); }
+  };
+
   // Park the current composer content on the backlog instead of sending it —
   // "a message that came to mind but isn't ready to send yet." Consumes the
   // composer (text + refs) exactly like `send()` does, so the two actions feel
@@ -2818,6 +2840,40 @@ function RunPanelBody({
             <Tooltip align="end" label="Stop">
               <Button size="icon" variant="destructive" onClick={stop} aria-label="Stop">
                 <Square className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+          {/* Pipeline auto-advance control. Pausing lets the CURRENT stage's
+              run finish — only the next stage won't auto-start — so it's
+              additive to Stop, not a replacement for it. */}
+          {!archived && task.pipelineStage != null && (
+            <Tooltip
+              align="end"
+              label={
+                task.pausedAt != null
+                  ? "Resume auto-advance — starts the current stage's run if none is active"
+                  : "Pause auto-advance — the current stage's run still finishes; only the next stage won't auto-start"
+              }
+            >
+              <Button
+                size="icon"
+                variant="outline"
+                onClick={togglePipelinePause}
+                aria-label={task.pausedAt != null ? "Resume pipeline" : "Pause pipeline"}
+              >
+                {task.pausedAt != null ? <Play className="size-4" /> : <Pause className="size-4" />}
+              </Button>
+            </Tooltip>
+          )}
+          {!archived && task.column === "blocked" && task.pipelineStage != null && (
+            <Tooltip align="end" label="Retry this pipeline stage — re-runs the agent turn that died here">
+              <Button
+                size="icon"
+                variant="outline"
+                onClick={retryPipelineStage}
+                aria-label="Retry pipeline stage"
+              >
+                <RotateCcw className="size-4" />
               </Button>
             </Tooltip>
           )}
