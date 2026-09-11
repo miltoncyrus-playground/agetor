@@ -61,3 +61,5 @@ skills-lock.json
 # Paid pipeline-eval report (evals/pipeline/run-evals.ts writes it each run;
 # its own header already documents it as gitignored — this makes that true).
 /evals/pipeline/last-report.json
+# Deterministic token report (evals/pipeline/token-report.ts), per-run output.
+/evals/pipeline/token-report.json

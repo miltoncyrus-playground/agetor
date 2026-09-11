@@ -20,7 +20,8 @@
     "release:upload-only": "bun scripts/upload-release.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "eval:pipeline": "bun evals/pipeline/run-evals.ts"
+    "eval:pipeline": "bun evals/pipeline/run-evals.ts",
+    "eval:pipeline:tokens": "bun evals/pipeline/token-report.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
