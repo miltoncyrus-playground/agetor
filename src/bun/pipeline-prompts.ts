@@ -346,6 +346,51 @@ export function parseBuildPlan(raw: string): { ok: true; plan: BuildPlan } | { o
   return { ok: true, plan: { subtasks } };
 }
 
+/**
+ * Sizing knobs for the Decompose stage (docs/plans/pipeline-token-efficiency.md,
+ * O-3 / O-9). Every child slice costs one agent bootstrap plus a reread of
+ * SPEC.md, PLAN.md and the touched files, so over-splitting a small ticket
+ * multiplies tokens for no parallelism win. `decomposePrompt` interpolates
+ * these literals; {@link buildPlanWarnings} reports breaches as warnings —
+ * never rejections, `parseBuildPlan` keeps accepting.
+ */
+/** A plan touching fewer than this many files should be ONE subtask. */
+export const DECOMPOSE_SINGLE_SUBTASK_MAX_FILES = 6;
+/** Soft upper bound on subtasks per plan. Exceeding it is a warning. */
+export const DECOMPOSE_SOFT_MAX_SUBTASKS = 8;
+/** Soft budget for each subtask's `prompt`, in bytes. A slice prompt rides
+ *  inside childBuildPrompt (argv-delivered when small enough) and is re-read
+ *  on every child turn, so bloat here is paid many times over. */
+export const CHILD_SUBTASK_PROMPT_MAX_BYTES = 2048;
+
+/**
+ * Advisory checks over an already-parsed {@link BuildPlan}. Pure; returns
+ * human-readable warnings, never an error — an empty array means the plan
+ * is inside every soft bound. The orchestrator surfaces these as status
+ * events so the operator can see when the Decomposer ignored its sizing
+ * rules, without blocking the build.
+ */
+export function buildPlanWarnings(plan: BuildPlan): string[] {
+  const warnings: string[] = [];
+  const n = plan.subtasks.length;
+  if (n > DECOMPOSE_SOFT_MAX_SUBTASKS) {
+    warnings.push(
+      `${n} subtasks exceeds the soft maximum of ${DECOMPOSE_SOFT_MAX_SUBTASKS} — ` +
+      `each child costs a full agent bootstrap; consider merging slices`,
+    );
+  }
+  for (const s of plan.subtasks) {
+    const bytes = Buffer.byteLength(s.prompt, "utf8");
+    if (bytes > CHILD_SUBTASK_PROMPT_MAX_BYTES) {
+      warnings.push(
+        `subtask "${s.id}" prompt is ${bytes} bytes, over the ${CHILD_SUBTASK_PROMPT_MAX_BYTES}-byte budget — ` +
+        `move detail into ${PIPELINE_PLAN_FILE} and keep the slice prompt to instructions`,
+      );
+    }
+  }
+  return warnings;
+}
+
 // ─── Prompt builders ──────────────────────────────────────────────────────────
 
 const TICKET_HEADER = "## Original ticket";
@@ -497,6 +542,15 @@ function decomposePrompt(task: Task): string {
     `be independent, since independent subtasks run in parallel. ` +
     `If the plan doesn't decompose naturally, that's fine: emit exactly one subtask ` +
     `covering the whole implementation.\n\n` +
+    `Sizing rules — every subtask costs a full agent bootstrap plus a reread of ` +
+    `${PIPELINE_SPEC_FILE}, ${PIPELINE_PLAN_FILE} and the touched files, so over-splitting ` +
+    `wastes far more than it parallelises. Count the files the plan touches first. If it ` +
+    `touches fewer than ${DECOMPOSE_SINGLE_SUBTASK_MAX_FILES} files, or stays within one ` +
+    `component area, emit exactly ONE subtask. Otherwise emit 2 to 4 slices sized by files ` +
+    `touched — never one slice per file. Treat ${DECOMPOSE_SOFT_MAX_SUBTASKS} subtasks as the ` +
+    `ceiling; going above it is flagged. Keep each subtask's "prompt" under ` +
+    `${CHILD_SUBTASK_PROMPT_MAX_BYTES} bytes: instructions only, since the implementing agent ` +
+    `already has ${PIPELINE_PLAN_FILE} for the detail.\n\n` +
     `Also read ${PIPELINE_SPEC_FILE} (at the repository root) to understand the acceptance ` +
     `criteria. Before assigning ACs to subtasks, enumerate EVERY "AC-N:" line in ` +
     `${PIPELINE_SPEC_FILE} — that exact list is the ONLY valid set of AC ids. ` +
@@ -690,7 +744,9 @@ function codeReviewPrompt(task: Task): string {
     `check: (1) does the diff correctly implement ${PIPELINE_PLAN_FILE}? (2) does it satisfy ` +
     `every AC-N in ${PIPELINE_SPEC_FILE} at a code level? (3) code quality — correctness, ` +
     `no obvious regressions. Do not write or change any files yourself, and do not run the ` +
-    `test suite or linters — a Tester agent does that next.\n\n` +
+    `test suite or linters — a Tester agent does that next. Keep your context small: for ` +
+    `any file over 300 lines, Read only the relevant ranges with offset/limit instead of ` +
+    `the whole file, and pipe long shell output through \`| tail -200\`.\n\n` +
     `Be concise — write at most three bullet points (one per check above: diff vs PLAN.md, ` +
     `diff vs SPEC.md AC items, code quality), then end with exactly one line in this form:\n` +
     `${PIPELINE_VERDICT_PREFIX} approve\n` +
@@ -723,7 +779,10 @@ function testingPrompt(task: Task): string {
     `and verify that every AC-N in its acceptance-criteria list is actually exercised — by an ` +
     `assertion in the test suite, or by a manual check you perform yourself. If something ` +
     `fails and the fix is small and obviously correct, fix it directly; for anything larger, ` +
-    `leave it and report it in your verdict instead of guessing at a bigger change.\n\n` +
+    `leave it and report it in your verdict instead of guessing at a bigger change. Keep ` +
+    `your context small: pipe test, lint and typecheck output through \`| tail -200\` (or ` +
+    `the equivalent) so the transcript stays short, and for any file over 300 lines Read ` +
+    `only the relevant ranges with offset/limit instead of the whole file.\n\n` +
     `If you changed anything, commit it locally with a clear commit message (prefix the ` +
     `subject with "${ccType}:", e.g. "${ccType}: ..."). Do NOT push, do not open a pull ` +
     `request, do not run any git command that touches a remote — this commit stays local, ` +
