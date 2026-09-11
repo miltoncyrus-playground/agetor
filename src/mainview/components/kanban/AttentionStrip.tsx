@@ -1,14 +1,17 @@
 import { cn } from "@/lib/utils";
-import type { Task } from "../../../shared/types.ts";
+import type { ColumnId, Task } from "../../../shared/types.ts";
 import { attentionSummary } from "@/lib/board-status";
-import { displayColumnMeta, type DisplayColumnId } from "@/lib/display-columns";
+import { displayColumnMeta, isDisplayColumnFilter, type DisplayColumnId } from "@/lib/display-columns";
 
 interface Props {
   /** The filter-respecting task list (App's `visibleTasks`) — the strip
    *  summarizes what the board below it actually shows, minus the status
    *  filter (which the strip itself drives). */
   tasks: Task[];
-  statusFilter: DisplayColumnId[];
+  /** App's real status filter. The strip compares against it through
+   *  `isDisplayColumnFilter` rather than holding its own display-level
+   *  copy, so the chips stay in sync with the column filter menu. */
+  statusFilter: ColumnId[];
   /** Toggle-filter: focus the board on one status, click again to clear. */
   onToggleStatus: (id: DisplayColumnId) => void;
 }
@@ -31,7 +34,7 @@ export function AttentionStrip({ tasks, statusFilter, onToggleStatus }: Props) {
   return (
     <div className="flex items-center gap-2 border-b border-border/40 px-4 py-1.5 text-[11px]">
       {chips.map((c) => {
-        const active = statusFilter.length === 1 && statusFilter[0] === c.id;
+        const active = isDisplayColumnFilter(statusFilter, c.id);
         return (
           <button
             key={c.id}
@@ -53,11 +56,11 @@ export function AttentionStrip({ tasks, statusFilter, onToggleStatus }: Props) {
       <span
         className={cn(
           "flex items-center gap-1.5 rounded-full px-2 py-0.5",
-          s.waiting > 0 ? "font-medium text-amber-500" : "text-muted-foreground/60",
+          s.waiting > 0 ? "font-medium text-warning" : "text-muted-foreground/60",
         )}
         title="Tasks with a question waiting on you (amber-ringed cards)"
       >
-        <span className={cn("size-1.5 shrink-0 rounded-full", s.waiting > 0 ? "bg-amber-500" : "bg-muted-foreground/40")} />
+        <span className={cn("size-1.5 shrink-0 rounded-full", s.waiting > 0 ? "bg-warning-solid" : "bg-muted-foreground/40")} />
         {s.waiting} waiting on you
       </span>
     </div>
