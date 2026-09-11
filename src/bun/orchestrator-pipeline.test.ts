@@ -1126,3 +1126,123 @@ test("pipeline: restarting a revision-capped task blocks again WITHOUT growing t
   expect(task.blockReason).toBe("revision-cap");
   expect(task.revisionCount).toBe(PIPELINE_REVISION_CAP + 1); // clamped, not 8, 9, …23
 });
+
+// ─── lean-context selection (O-1/O-2) ────────────────────────────────────────
+
+test("pipelineLeanContext: pipeline stage on claude-code gets the stage toolset and the worktree CLAUDE.md when present", async () => {
+  const { pipelineLeanContext } = await import("./orchestrator.ts");
+  const base: Parameters<typeof pipelineLeanContext>[0] = {
+    id: "t", title: "", prompt: "", column: "planning", agent: "claude-code",
+    workdir: "/tmp", isolation: "worktree", taskType: "task", branch: null,
+    branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: null, model: "opus-5", effort: null,
+    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: 0, updatedAt: 0, archivedAt: null,
+    pipelineStage: "planning", planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
+    parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  };
+  const withMd = await makeWorkdir(false);
+  writeFileSync(path.join(withMd, "CLAUDE.md"), "# repo rules\n");
+  const withoutMd = await makeWorkdir(false);
+
+  const lean = pipelineLeanContext(base, "claude-code", withMd);
+  expect(lean?.tools).toEqual(["Read", "Edit", "Write", "Bash", "Grep", "Glob"]);
+  expect(lean?.appendSystemPromptFile).toBe(path.join(withMd, "CLAUDE.md"));
+  expect(pipelineLeanContext(base, "claude-code", withoutMd)?.appendSystemPromptFile).toBeNull();
+  // clarify is the one stage that talks to the human.
+  expect(pipelineLeanContext({ ...base, pipelineStage: "clarify" }, "claude-code", withoutMd)?.tools).toContain("AskUserQuestion");
+  // A build child (no stage, has a parent) is a pipeline turn too.
+  expect(pipelineLeanContext({ ...base, pipelineStage: null, parentTaskId: "parent" }, "claude-code", withoutMd)?.tools).toEqual(["Read", "Edit", "Write", "Bash", "Grep", "Glob"]);
+});
+
+test("pipelineLeanContext: plain tasks, codex/gemini, and AGETOR_PIPELINE_LEAN_CONTEXT=0 all get null (full-context spawn)", async () => {
+  const { pipelineLeanContext } = await import("./orchestrator.ts");
+  const base: Parameters<typeof pipelineLeanContext>[0] = {
+    id: "t", title: "", prompt: "", column: "planning", agent: "claude-code",
+    workdir: "/tmp", isolation: "worktree", taskType: "task", branch: null,
+    branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: null, model: "opus-5", effort: null,
+    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: 0, updatedAt: 0, archivedAt: null,
+    pipelineStage: "planning", planApproved: false, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null,
+    parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  };
+  expect(pipelineLeanContext({ ...base, pipelineStage: null }, "claude-code", "/tmp")).toBeNull();
+  expect(pipelineLeanContext(base, "codex", "/tmp")).toBeNull();
+  expect(pipelineLeanContext(base, "gemini", "/tmp")).toBeNull();
+  const prior = process.env.AGETOR_PIPELINE_LEAN_CONTEXT;
+  try {
+    process.env.AGETOR_PIPELINE_LEAN_CONTEXT = "0";
+    expect(pipelineLeanContext(base, "claude-code", "/tmp")).toBeNull();
+  } finally {
+    if (prior === undefined) delete process.env.AGETOR_PIPELINE_LEAN_CONTEXT; else process.env.AGETOR_PIPELINE_LEAN_CONTEXT = prior;
+  }
+});
+
+// ─── stage session closed at settle (O-7) ────────────────────────────────────
+
+test("pipeline: a settled stage's session is closed on advance and on done, recorded as a status event on the settled run", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(true);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "o7", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "code-review", planApproved: true, implementationApproved: false,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  // code-review approve → testing: the code-review session is closed.
+  const reviewRunId = await startAndGetRunId(startTask, taskId);
+  runs.appendEvent(reviewRunId, "assistant", "ok\nPIPELINE_VERDICT: approve");
+  await settle();
+  expect(tasks.get(taskId)!.pipelineStage).toBe("testing");
+  const reviewStatus = runs.events(reviewRunId).filter((e) => e.stream === "status").map((e) => e.data);
+  expect(reviewStatus.some((d) => d.includes('stage "code-review" settled') && d.includes("session was closed"))).toBe(true);
+
+  // testing pass → done: terminal, the tester session is closed too.
+  const testRunId = tasks.get(taskId)!.runId!;
+  runs.appendEvent(testRunId, "assistant", "green\nPIPELINE_VERDICT: pass");
+  await settle();
+  expect(tasks.get(taskId)!.column).toBe("done");
+  const testStatus = runs.events(testRunId).filter((e) => e.stream === "status").map((e) => e.data);
+  expect(testStatus.some((d) => d.includes('stage "testing" settled') && d.includes("session was closed"))).toBe(true);
+});
+
+test("pipeline: a blocked stage keeps its session (no close status on a revise past the cap)", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const { PIPELINE_REVISION_CAP } = await import("../shared/types.ts");
+
+  const workdir = await makeWorkdir(true);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "o7-blocked", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "plan-review", planApproved: false, implementationApproved: false,
+    revisionCount: PIPELINE_REVISION_CAP, pipelineFeedback: "old", pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+  const runId = await startAndGetRunId(startTask, taskId);
+  runs.appendEvent(runId, "assistant", "PIPELINE_VERDICT: revise still wrong");
+  await settle();
+  expect(tasks.get(taskId)!.column).toBe("blocked");
+  expect(runs.events(runId).some((e) => e.stream === "status" && e.data.includes("session was closed"))).toBe(false);
+});

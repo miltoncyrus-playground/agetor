@@ -4,7 +4,7 @@ import { rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
-import { spawnAgent, toClaudeModelArg } from "./agents.ts";
+import { spawnAgent, toClaudeModelArg, pipelineToolset, leanContextEnabled, type LeanContext } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import {
   AGENT_OPTIONS,
@@ -924,6 +924,29 @@ export function resolveRunModel(
   return task.model;
 }
 
+/**
+ * Lean-context launch options for a pipeline turn (stage turn or build
+ * child) on claude-code — see `AgentRunOptions.leanContext` in agents.ts for
+ * the measurements behind it. Plain tasks, codex/gemini, and
+ * `AGETOR_PIPELINE_LEAN_CONTEXT=0` all get `null` (today's full-context
+ * spawn). The worktree's own `CLAUDE.md` (at `cwd`, the prepared worktree
+ * or raw workdir) is re-injected so the target repo's conventions survive
+ * while ancestor files — the operator's personal `$HOME/CLAUDE.md`, pulled
+ * in only because worktrees live under `$HOME` — are dropped.
+ *
+ * Exported so the selection is directly unit-testable.
+ */
+export function pipelineLeanContext(task: Task, harnessKind: AgentKind, cwd: string): LeanContext | null {
+  if (harnessKind !== "claude-code") return null;
+  if (task.pipelineStage == null && task.parentTaskId == null) return null;
+  if (!leanContextEnabled()) return null;
+  const claudeMd = join(cwd, "CLAUDE.md");
+  return {
+    tools: pipelineToolset(task.pipelineStage),
+    appendSystemPromptFile: existsSync(claudeMd) ? claudeMd : null,
+  };
+}
+
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
@@ -1073,7 +1096,12 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
         ? { codexSessionId: sessionId }
         : { geminiSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: resolveRunModel(task, harness.kind), effort: task.effort },
+    opts: {
+      mode: task.mode,
+      model: resolveRunModel(task, harness.kind),
+      effort: task.effort,
+      leanContext: pipelineLeanContext(task, harness.kind, prepared.cwd),
+    },
   });
   registerActiveRun(runId, taskId, task, agent);
   const runModel = resolveRunModel(task, harness.kind);
@@ -1425,6 +1453,38 @@ function lastPipelineVerdict(
 }
 
 /**
+ * Close a pipeline stage's claude session once the stage has settled. Every
+ * stage runs in a fresh session (startTask → spawnClaudeViaTmux kills the
+ * same-named session before `tmux new-session`), so a settled stage's REPL
+ * has no future — yet it lingered for the whole of the next stage (or the
+ * whole build, for the decompose session while children ran), holding
+ * 300–500MB and, worse, staying eligible for claude's own auto-continuation:
+ * a background task left over from the turn finishes, claude auto-continues,
+ * and a full-context `continuation` run burns tokens on a stage the
+ * pipeline already left (2.3M tokens across two measured pipelines; RC-6
+ * refuses to *act* on such runs but can't stop them being *spent*). See
+ * docs/plans/pipeline-token-efficiency.md O-7.
+ *
+ * Never on `blocked` (the human may want to talk to the failed session) and
+ * never while a turn is in flight (`active`) — this is called strictly on
+ * the settle → next-stage / done edges. claude-code only: codex/gemini
+ * sessions are one-shot per turn and already gone. Emits a status line on
+ * the settled run so the run log (and the gate tests) can see it happened.
+ */
+function dropSettledStageSession(taskId: string, runId: string | null): void {
+  const task = tasks.get(taskId);
+  if (!task || task.parentTaskId != null) return; // children settle through completeChildBuild → archive
+  if (resolveHarness(task.agent)?.kind !== "claude-code") return;
+  if (task.runId && active.has(task.runId)) return;
+  try {
+    dropSession(taskId);
+    if (runId) pipelineStatus(runId, taskId, `stage "${task.pipelineStage}" settled — its agent session was closed (a fresh session runs the next stage)`);
+  } catch (err) {
+    console.error(`[agetor] dropSettledStageSession failed for task ${taskId}:`, err);
+  }
+}
+
+/**
  * Move a pipeline task to `nextStage`, persisting `patch` first so
  * `startTask` (which re-reads the task row) picks up the new stage's
  * prompt and, on a resume, the new `pipelineFeedback`. If the task was
@@ -1446,6 +1506,10 @@ export function spawnPipelineStage(
   nextStage: NonNullable<Task["pipelineStage"]>,
   patch: Partial<Task> = {},
 ): void {
+  // Close the settled stage's session BEFORE the stage flip is observable
+  // as "running the next stage" — the previous stage is over either way,
+  // paused or not (O-7).
+  dropSettledStageSession(taskId, runId);
   tasks.update(taskId, { pipelineStage: nextStage, ...patch });
   updateColumn(taskId, runId, nextStage, "stage-advance");
   if (tasks.get(taskId)?.pausedAt != null) return;
@@ -2044,6 +2108,7 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
           // is `done`, not `ready`: `ready` reads as "waiting to run" and a
           // finished pipeline parked there is indistinguishable from a task
           // that never started (the 2dot2dot-fresh confusion, 2026-08-19).
+          dropSettledStageSession(taskId, runId);
           updateColumn(taskId, runId, "done", "stage-advance");
           return;
         }
@@ -2116,6 +2181,10 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
       }
       // Coverage OK — fresh entry into building (same pattern as the old
       // pre-builder case: no agent turn of its own, hand off to DAG scheduler).
+      // The decompose session is the one that used to linger for the whole
+      // build — the parent has no turn of its own while children run, so
+      // nothing else would ever close it until the next stage spawned (O-7).
+      dropSettledStageSession(taskId, runId);
       tasks.update(taskId, { pipelineStage: "building", pipelineFeedback: null });
       updateColumn(taskId, runId, "building", "stage-advance");
       if (tasks.get(taskId)?.pausedAt == null) {
@@ -2209,7 +2278,9 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
         // planApproved is true by construction here — testing is only
         // reachable after an approved plan (see the plan-review case above).
         // `done` is the pipeline's terminal column (see the plan-review
-        // case above for why not `ready`).
+        // case above for why not `ready`). Terminal → the tester's session
+        // has nothing left to do either (O-7).
+        dropSettledStageSession(taskId, runId);
         updateColumn(taskId, runId, "done", "stage-advance");
         return;
       }
