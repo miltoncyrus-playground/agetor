@@ -26,6 +26,11 @@
  * Run:  bun run eval:pipeline            (all evals, 1 run each)
  *       bun evals/pipeline/run-evals.ts --only decompose --runs 3
  *       bun evals/pipeline/run-evals.ts --model claude-sonnet-5
+ *       bun evals/pipeline/run-evals.ts --effort low --only tester-precheck
+ *
+ *   tester-precheck   — testingPrompt with a real precheck summary folded in
+ *                       (O-5) fixes the failing test it was handed, commits,
+ *                       and emits PIPELINE_VERDICT: pass.
  *
  * Pass threshold: every eval run must score >= PASS_THRESHOLD (0.8). The
  * process exits non-zero if any run fails — wire into pre-ship / nightly.
@@ -46,8 +51,10 @@ import path from "node:path";
 // would open the real ~/.agetor db.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-eval-data-"));
 
-const { stagePrompt, mergeResolutionPrompt, parseBuildPlan, parseSpecAcceptanceCriteria, analyzeCoverage } =
+const { stagePrompt, mergeResolutionPrompt, parseBuildPlan, parseSpecAcceptanceCriteria, analyzeCoverage, parsePipelineVerdict } =
   await import("../../src/bun/pipeline-prompts.ts");
+const { runPipelinePrecheck } = await import("../../src/bun/pipeline-precheck.ts");
+const { readRepoProfile } = await import("../../src/bun/repo-profile.ts");
 const { isBranchMerged } = await import("../../src/bun/worktree.ts");
 type Task = import("../../src/shared/types.ts").Task;
 
@@ -63,6 +70,10 @@ const ONLY = argValue("--only");
 const RUNS = Number(argValue("--runs") ?? "1") || 1;
 // Best available model by default — same as agetor's own claude-code default.
 const MODEL = argValue("--model") ?? "claude-opus-5";
+// Effort for every eval call. O-8 tiers verdict stages to "low" and build
+// children to "medium" in production; `--effort low` here is how that
+// tiering earns its place (the builder/decompose evals must still hold 0.8).
+const EFFORT = argValue("--effort") ?? "high";
 const CLAUDE_BIN = process.env.AGETOR_CLAUDE_BIN ?? "claude";
 
 // ─── plumbing ────────────────────────────────────────────────────────────────
@@ -89,7 +100,7 @@ async function commitAllIn(repo: string, message: string): Promise<void> {
 
 /** One headless claude call with the REAL prompt, tools enabled, in the
  *  fixture repo. Returns stderr+stdout tail for the report on failure. */
-async function runClaude(prompt: string, cwd: string): Promise<{ ok: boolean; detail: string }> {
+async function runClaude(prompt: string, cwd: string): Promise<{ ok: boolean; detail: string; stdout: string }> {
   const proc = Bun.spawn(
     [CLAUDE_BIN, "-p", prompt, "--model", MODEL, "--dangerously-skip-permissions"],
     {
@@ -97,7 +108,7 @@ async function runClaude(prompt: string, cwd: string): Promise<{ ok: boolean; de
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, CLAUDE_CODE_EFFORT_LEVEL: "high" },
+      env: { ...process.env, CLAUDE_CODE_EFFORT_LEVEL: EFFORT },
     },
   );
   const timer = setTimeout(() => proc.kill(), CLAUDE_TIMEOUT_MS);
@@ -108,7 +119,7 @@ async function runClaude(prompt: string, cwd: string): Promise<{ ok: boolean; de
   ]);
   clearTimeout(timer);
   const tail = (stderr || stdout).slice(-500);
-  return { ok: code === 0, detail: code === 0 ? "" : `claude exited ${code}: ${tail}` };
+  return { ok: code === 0, detail: code === 0 ? "" : `claude exited ${code}: ${tail}`, stdout };
 }
 
 /** Minimal Task shape the prompt builders need — mirrors the test fixtures. */
@@ -342,6 +353,43 @@ async function evalBuilderCommit(run: number): Promise<EvalResult> {
   return { eval: "builder-commit", run, score: score(checks), pass: score(checks) >= PASS_THRESHOLD, checks };
 }
 
+// ─── eval: tester-precheck ───────────────────────────────────────────────────
+//
+// O-5: agetor runs the project's checks BEFORE the Tester and folds the
+// failures into testingPrompt. Fixture: a one-function lib with a bug and a
+// node test that catches it. Score: the Tester fixes the bug (the test now
+// passes), commits, and ends with PIPELINE_VERDICT: pass — starting from the
+// failure it was handed rather than re-discovering the project.
+
+async function evalTesterPrecheck(run: number): Promise<EvalResult> {
+  const repo = await makeRepo("feature/eval");
+  writeFileSync(path.join(repo, "SPEC.md"), "# SPEC\n\nAC-1: add(a, b) returns the arithmetic sum of its two arguments.\n");
+  writeFileSync(path.join(repo, "PLAN.md"), "# PLAN\n\n`lib.js` exports add(); `test.js` exercises AC-1.\n");
+  writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "fixture", private: true, scripts: { test: "node test.js" } }, null, 2));
+  writeFileSync(path.join(repo, "lib.js"), "module.exports.add = (a, b) => a + b + 1;\n"); // the bug
+  writeFileSync(path.join(repo, "test.js"),
+    "// AC-1\nconst { add } = require('./lib.js');\nif (add(2, 2) !== 4) { console.error('AC-1 failed: add(2,2) =', add(2, 2)); process.exit(1); }\nconsole.log('ok');\n");
+  await commitAllIn(repo, "chore: fixture with a failing test");
+
+  const precheck = await runPipelinePrecheck({ cwd: repo, profile: readRepoProfile(repo), specAcIds: ["AC-1"] });
+  const prompt = stagePrompt(fakeTask({ pipelineStage: "testing", planApproved: true }), "testing", null, { precheck });
+  const invoked = await runClaude(prompt, repo);
+  if (!invoked.ok) return { eval: "tester-precheck", run, score: 0, pass: false, checks: [], error: invoked.detail };
+
+  const checks: Check[] = [];
+  checks.push({ name: "precheck handed the Tester the failing test output", pass: prompt.includes("## Pre-run checks") && prompt.includes("AC-1 failed") });
+  const testProc = Bun.spawn(["node", "test.js"], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+  await new Response(testProc.stdout).text();
+  checks.push({ name: "the failing test now passes", pass: (await testProc.exited) === 0 });
+  checks.push({ name: "the fix landed in lib.js (not by weakening the test)", pass: readFileSync(path.join(repo, "test.js"), "utf8").includes("!== 4") && !readFileSync(path.join(repo, "lib.js"), "utf8").includes("+ 1") });
+  const status = await git(["status", "--porcelain"], repo);
+  checks.push({ name: "fix committed (clean tree)", pass: status.stdout.trim() === "" });
+  const verdict = parsePipelineVerdict("testing", invoked.stdout);
+  checks.push({ name: "ends with PIPELINE_VERDICT: pass", pass: verdict.ok && verdict.kind === "pass", note: verdict.ok ? verdict.kind : "no verdict" });
+
+  return { eval: "tester-precheck", run, score: score(checks), pass: score(checks) >= PASS_THRESHOLD, checks };
+}
+
 // ─── runner ──────────────────────────────────────────────────────────────────
 
 const EVALS: Record<string, (run: number) => Promise<EvalResult>> = {
@@ -349,6 +397,7 @@ const EVALS: Record<string, (run: number) => Promise<EvalResult>> = {
   "decompose-single": evalDecomposeSingle,
   "merge-resolution": evalMergeResolution,
   "builder-commit": evalBuilderCommit,
+  "tester-precheck": evalTesterPrecheck,
 };
 
 const selected = Object.entries(EVALS).filter(([name]) => !ONLY || name.includes(ONLY));
@@ -357,7 +406,7 @@ if (selected.length === 0) {
   process.exit(2);
 }
 
-console.log(`pipeline evals — model ${MODEL}, ${RUNS} run(s) each: ${selected.map(([n]) => n).join(", ")}\n`);
+console.log(`pipeline evals — model ${MODEL}, effort ${EFFORT}, ${RUNS} run(s) each: ${selected.map(([n]) => n).join(", ")}\n`);
 const results: EvalResult[] = [];
 for (const [name, fn] of selected) {
   for (let run = 1; run <= RUNS; run++) {
@@ -377,7 +426,7 @@ for (const [name, fn] of selected) {
 }
 
 const reportPath = path.join(import.meta.dir, "last-report.json");
-writeFileSync(reportPath, JSON.stringify({ model: MODEL, runs: RUNS, at: new Date().toISOString(), results }, null, 2));
+writeFileSync(reportPath, JSON.stringify({ model: MODEL, effort: EFFORT, runs: RUNS, at: new Date().toISOString(), results }, null, 2));
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} eval runs passed (threshold ${PASS_THRESHOLD * 100}%) — report: ${reportPath}`);
 process.exit(failed.length === 0 ? 0 : 1);

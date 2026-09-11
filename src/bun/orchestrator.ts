@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
+import { db, dataDir, tasks, runs, harnesses, projects, subagents } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, pipelineToolset, leanContextEnabled, type LeanContext } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
@@ -133,9 +133,17 @@ import {
   analyzeCoverage,
   stagePrompt,
   mergeResolutionPrompt,
+  buildPlanWarnings,
+  appendPromptExtras,
+  type StageExtras,
   type PlanReviewVerdict,
   type TestingVerdict,
 } from "./pipeline-prompts.ts";
+import { pipelineState } from "./pipeline-state.ts";
+import { readRepoProfile, renderProjectCommands, ensureDependenciesInstalled } from "./repo-profile.ts";
+import { extractHandoff, renderHandoff } from "./stage-handoff.ts";
+import { writeReviewDiff, removeReviewDiff } from "./review-diff.ts";
+import { runPipelinePrecheck, precheckPasses, precheckEnabled, testerSkipEnabled } from "./pipeline-precheck.ts";
 import { tickBuild, completeChildBuild, buildBarrierState } from "./build-scheduler.ts";
 
 type Listener = (e: RunEvent) => void;
@@ -947,6 +955,114 @@ export function pipelineLeanContext(task: Task, harnessKind: AgentKind, cwd: str
   };
 }
 
+/**
+ * Effort tiering next to model tiering (O-8). Effort drives thinking tokens
+ * AND tool-call count, and both measured pipelines ran every stage and
+ * every child at the parent's `high`. Verdict stages read and judge → `low`;
+ * build children implement a bounded slice → `medium`; everything else
+ * keeps the task's own effort. Only when the task HAS an effort (a null
+ * effort means the model declines the flag, and inventing one would change
+ * behaviour), and only for kinds whose effort ids share the low/medium/high
+ * vocabulary (claude-code, codex; gemini ignores effort entirely).
+ * `AGETOR_PIPELINE_EFFORT_TIERING=0` disables it. Exported for tests.
+ */
+export function resolveRunEffort(task: Task, harnessKind: AgentKind): string | null | undefined {
+  if (task.effort == null) return task.effort;
+  if (harnessKind !== "claude-code" && harnessKind !== "codex") return task.effort;
+  if (process.env.AGETOR_PIPELINE_EFFORT_TIERING === "0") return task.effort;
+  if (task.pipelineStage != null && PIPELINE_VERDICT_STAGES.has(task.pipelineStage)) return "low";
+  if (task.parentTaskId != null) return "medium";
+  return task.effort;
+}
+
+/** Env kill-switch for the pre-spawn dependency install (O-4). */
+function autoInstallEnabled(): boolean {
+  return process.env.AGETOR_PIPELINE_AUTO_INSTALL !== "0";
+}
+
+/** Stages whose agent runs project commands and so benefits from knowing
+ *  them up front. Planner/Critic/Decomposer only read code. */
+const COMMAND_RUNNING_STAGES = new Set<NonNullable<Task["pipelineStage"]>>(["building", "code-review", "testing"]);
+const STAGE_HANDOFF_CHAR_BUDGET = 1500;
+
+/**
+ * Deterministic prompt extras for a pipeline turn (O-4 project commands +
+ * dependency install, O-6 precomputed review diff, O-11 stage handoff,
+ * O-5 precheck hand-over). Every block is independent and fail-open: an
+ * exception in one leaves the others intact and the prompt otherwise
+ * identical to the pre-optimisation one. `log` lands status lines on the
+ * run being spawned, so a two-minute `npm ci` is visible in the run log
+ * rather than looking like a hung spawn.
+ */
+async function pipelinePromptExtras(
+  task: Task,
+  cwd: string,
+  log: (line: string) => void,
+): Promise<StageExtras> {
+  const extras: StageExtras = {};
+  const isChild = task.parentTaskId != null;
+  const stage = task.pipelineStage;
+
+  // O-4: repo profile + one-time install. Children each get their own
+  // worktree, so each installs once (lockfile-hash marker makes re-runs a
+  // no-op) — the same install the agent used to run itself, minus the
+  // discovery turns around it.
+  if (isChild || (stage != null && COMMAND_RUNNING_STAGES.has(stage))) {
+    try {
+      const profile = readRepoProfile(cwd);
+      let installed = existsSync(join(cwd, "node_modules"));
+      if (profile.install && autoInstallEnabled()) {
+        log(`preparing worktree: ${profile.install}`);
+        const r = await ensureDependenciesInstalled(cwd, profile);
+        if (r.ran) log(r.ok ? "dependencies installed" : `dependency install failed — leaving it to the agent: ${r.detail.slice(-400)}`);
+        installed = installed || r.ok;
+      }
+      extras.projectCommands = renderProjectCommands(profile, { installed }) || null;
+    } catch (err) {
+      console.error(`[agetor] repo profile failed for task ${task.id}:`, err);
+    }
+  }
+
+  // O-11: what earlier stages already Read / ran. Children get theirs at
+  // creation time (build-scheduler folds a lane-filtered block into the
+  // stored prompt), so only stage turns look it up here.
+  if (!isChild && stage != null && stage !== "specify") {
+    try {
+      extras.handoff = renderHandoff(pipelineState.getHandoffs(task.id), { charBudget: STAGE_HANDOFF_CHAR_BUDGET }) || null;
+    } catch (err) {
+      console.error(`[agetor] handoff render failed for task ${task.id}:`, err);
+    }
+  }
+
+  // O-6: the Code Reviewer's diff, taken once, outside the worktree. A
+  // revision pass diffs from the sha reviewed last time.
+  if (stage === "code-review") {
+    try {
+      const since = (task.revisionCount > 0 ? pipelineState.getReviewSha(task.id) : null) ?? task.baseRef;
+      if (since) {
+        const diff = await writeReviewDiff({ cwd, taskId: task.id, sinceSha: since, dataDir });
+        if (diff) {
+          extras.reviewDiff = diff;
+          pipelineState.setReviewSha(task.id, diff.headSha);
+          log(`review diff precomputed since ${since.slice(0, 7)}: ${Math.round(diff.bytes / 1024)} KB → ${diff.file}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[agetor] review diff failed for task ${task.id}:`, err);
+    }
+  }
+
+  // O-5: hand the Tester agetor's own check results (set by runTesterGate).
+  if (stage === "testing") {
+    try {
+      extras.precheck = pipelineState.getPrecheck(task.id);
+    } catch (err) {
+      console.error(`[agetor] precheck read failed for task ${task.id}:`, err);
+    }
+  }
+  return extras;
+}
+
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
@@ -1068,12 +1184,25 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
       try { constitutionRaw = readFileSync(constitutionPath, "utf8"); } catch { /* proceed without */ }
     }
   }
+
+  // The chunk handler exists before prompt assembly so the deterministic
+  // pre-spawn work below (dependency install, diff precompute) can report
+  // progress on the run it belongs to.
+  const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
+
+  // Deterministic prompt extras for pipeline turns (stage turns AND build
+  // children) — docs/plans/pipeline-token-efficiency.md O-4/O-6/O-11. Each
+  // one is fail-open: an error degrades to "the prompt looks like today's".
+  const extras = (task.pipelineStage != null || task.parentTaskId != null)
+    ? await pipelinePromptExtras(task, prepared.cwd, (line) => onChunk("status", line))
+    : null;
+
   const promptWithRefs = appendReferences(
-    task.pipelineStage ? stagePrompt(task, task.pipelineStage, constitutionRaw) : task.prompt,
+    task.pipelineStage
+      ? stagePrompt(task, task.pipelineStage, constitutionRaw, extras)
+      : appendPromptExtras(task.prompt, extras),
     task.references,
   );
-
-  const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
   // Echo the initial prompt as a "user" event so the panel renders a
   // bubble for it right away — claude won't transcribe the prompt into
   // its JSONL until it boots (can take a few seconds). The JSONL-flush
@@ -1099,7 +1228,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     opts: {
       mode: task.mode,
       model: resolveRunModel(task, harness.kind),
-      effort: task.effort,
+      effort: resolveRunEffort(task, harness.kind),
       leanContext: pipelineLeanContext(task, harness.kind, prepared.cwd),
     },
   });
@@ -1481,6 +1610,75 @@ function dropSettledStageSession(taskId: string, runId: string | null): void {
     if (runId) pipelineStatus(runId, taskId, `stage "${task.pipelineStage}" settled — its agent session was closed (a fresh session runs the next stage)`);
   } catch (err) {
     console.error(`[agetor] dropSettledStageSession failed for task ${taskId}:`, err);
+  }
+}
+
+/**
+ * The Tester gate (O-5): after the Code Reviewer approves, run the repo's
+ * typecheck/lint/test ourselves (deterministic space) before spending an
+ * agent turn on it. Three outcomes:
+ *   - no known commands / precheck disabled → spawn the Tester as before;
+ *   - all commands green AND every SPEC.md AC id is referenced from a test
+ *     file → skip the Tester: `implementationApproved`, `done`, with the
+ *     command tails recorded as status events (unless
+ *     AGETOR_PIPELINE_TESTER_SKIP=0);
+ *   - anything red, or an AC no test mentions → spawn the Tester with the
+ *     summary folded into its prompt (pipelineState.precheck), so it starts
+ *     from the failures instead of rediscovering how to run the project.
+ * Fail-open: any exception falls back to spawning the Tester untouched.
+ */
+async function runTesterGate(taskId: string, runId: string): Promise<void> {
+  const spawnTester = () => spawnPipelineStage(taskId, runId, "testing", { pipelineFeedback: null, pipelineBounceFingerprint: null });
+  const task = tasks.get(taskId);
+  if (!task) return;
+  if (!precheckEnabled()) { pipelineState.setPrecheck(taskId, null); spawnTester(); return; }
+  try {
+    const cwd = task.worktreePath ?? task.workdir;
+    const profile = readRepoProfile(cwd);
+    if (!profile.typecheck && !profile.lint && !profile.test) {
+      pipelineState.setPrecheck(taskId, null);
+      spawnTester();
+      return;
+    }
+    const specPath = join(cwd, PIPELINE_SPEC_FILE);
+    let specAcIds: string[] = [];
+    if (existsSync(specPath)) {
+      try { specAcIds = parseSpecAcceptanceCriteria(readFileSync(specPath, "utf8")); } catch { /* no ACs */ }
+    }
+    pipelineStatus(runId, taskId, "code review approved — running the project's own checks before the Tester");
+    const summary = await runPipelinePrecheck({
+      cwd, profile, specAcIds,
+      onProgress: (line) => pipelineStatus(runId, taskId, line),
+    });
+    // The world may have moved while the checks ran (delete, pause, a human
+    // override). Only act if the task is still where we left it.
+    const now = tasks.get(taskId);
+    if (!now || now.pipelineStage !== "code-review" || now.runId !== runId) return;
+    if (precheckPasses(summary) && testerSkipEnabled()) {
+      pipelineStatus(
+        runId, taskId,
+        `precheck green (${summary.results.map((r) => r.name).join(", ")}) and every AC-N is referenced from a test file — ` +
+        `Tester turn skipped; pipeline complete`,
+      );
+      pipelineState.setPrecheck(taskId, null);
+      tasks.update(taskId, { implementationApproved: true, pipelineFeedback: null, pipelineBounceFingerprint: null });
+      dropSettledStageSession(taskId, runId);
+      updateColumn(taskId, runId, "done", "stage-advance");
+      return;
+    }
+    const failed = summary.results.filter((r) => !r.ok).map((r) => r.name);
+    pipelineStatus(
+      runId, taskId,
+      failed.length > 0
+        ? `precheck: ${failed.join(", ")} failed — spawning the Tester with the failure output`
+        : `precheck green but ${summary.unreferencedAcs.join(", ")} not referenced by any test — spawning the Tester to verify`,
+    );
+    pipelineState.setPrecheck(taskId, summary);
+    spawnTester();
+  } catch (err) {
+    console.error(`[agetor] tester precheck failed for task ${taskId}; spawning the Tester untouched:`, err);
+    pipelineState.setPrecheck(taskId, null);
+    if (tasks.get(taskId)?.pipelineStage === "code-review") spawnTester();
   }
 }
 
@@ -1954,6 +2152,17 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
     return;
   }
 
+  // O-11: harvest what this stage Read and ran, for the next stage's prompt.
+  // Deterministic extraction over the persisted events; fail-open.
+  try {
+    pipelineState.appendHandoff(
+      taskId,
+      extractHandoff(runs.events(runId), { stage: task.pipelineStage, worktreeRoot: task.worktreePath ?? task.workdir }),
+    );
+  } catch (err) {
+    console.error(`[agetor] handoff capture failed for task ${taskId}:`, err);
+  }
+
   const spawnStage = (nextStage: NonNullable<Task["pipelineStage"]>, patch: Partial<Task> = {}) =>
     spawnPipelineStage(taskId, runId, nextStage, patch);
 
@@ -2144,6 +2353,11 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
         updateColumn(taskId, runId, "blocked", "pipeline-failed");
         return;
       }
+      // O-3/O-9: soft sizing warnings (too many subtasks, oversized subtask
+      // prompts) — status events, never a gate; the plan still runs.
+      for (const warning of buildPlanWarnings(parsed.plan)) {
+        pipelineStatus(runId, taskId, `decomposition warning: ${warning}`);
+      }
       // Inline the analyze step — no agent turn needed, just a deterministic
       // AC-coverage check. Advance column to "analyze" for UI visibility of
       // this (instant) stage, then immediately resolve it.
@@ -2249,9 +2463,17 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
         return;
       }
       if (verdict.kind === "approve") {
-        // Fingerprint cleared: an approve is confirmed progress, so the
-        // next bounce (if any) starts a fresh no-progress baseline.
-        spawnStage("testing", { pipelineFeedback: null, pipelineBounceFingerprint: null });
+        // Fingerprint cleared inside the gate: an approve is confirmed
+        // progress, so the next bounce (if any) starts a fresh no-progress
+        // baseline. The gate runs the deterministic checks first and either
+        // skips the Tester or hands it the failures (O-5); fire-and-forget
+        // like every other next-stage spawn.
+        void runTesterGate(taskId, runId).catch((err) => {
+          console.error(`[agetor] runTesterGate failed for task ${taskId}:`, err);
+          if (tasks.get(taskId)?.pipelineStage === "code-review") {
+            spawnStage("testing", { pipelineFeedback: null, pipelineBounceFingerprint: null });
+          }
+        });
         return;
       }
       // Revise bounces to "building" — a plain single-agent fixup when the
@@ -2273,6 +2495,7 @@ export function advancePipelineStage(taskId: string, runId: string, outcome: Pip
         updateColumn(taskId, runId, "blocked", "pipeline-failed");
         return;
       }
+      pipelineState.setPrecheck(taskId, null);
       if (verdict.kind === "pass") {
         tasks.update(taskId, { implementationApproved: true, pipelineFeedback: null, pipelineBounceFingerprint: null });
         // planApproved is true by construction here — testing is only
@@ -3834,6 +4057,9 @@ export async function deleteTask(taskId: string): Promise<void> {
   // children blocked on agetor unblock immediately. Done before dropSession
   // so the curl / fetch awaiters return before tmux kills them.
   cancelPendingForTask(taskId, "task deleted");
+  // The precomputed review diff (O-6) lives outside the worktree, so the
+  // worktree teardown below never sees it — remove it here. Best-effort.
+  removeReviewDiff(dataDir, taskId);
   // Kill the task's tmux session before tearing down the worktree so we don't
   // leave an orphaned session behind. For claude it outlives individual runs;
   // for codex/gemini it only exists during an in-flight turn —

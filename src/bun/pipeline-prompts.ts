@@ -1,4 +1,35 @@
 import { branchCommitType, type Task } from "../shared/types.ts";
+import { renderPrecheck } from "./pipeline-precheck.ts";
+import type { PrecheckSummary } from "./pipeline-state.ts";
+import type { ReviewDiff } from "./review-diff.ts";
+
+/**
+ * Deterministic blocks the orchestrator computes at spawn and hands to the
+ * prompt builders (docs/plans/pipeline-token-efficiency.md O-4/O-5/O-6/
+ * O-11). Every field is optional and every builder renders nothing for an
+ * absent one, so a caller passing no extras gets exactly the pre-O prompt.
+ */
+export interface StageExtras {
+  /** `renderProjectCommands` output: install state + the repo's known
+   *  typecheck/lint/test commands, so the agent doesn't rediscover them. */
+  projectCommands?: string | null;
+  /** `renderHandoff` output: files earlier stages Read and commands that
+   *  worked, so this stage doesn't re-Read what the Planner already did. */
+  handoff?: string | null;
+  /** Code Reviewer only: the precomputed diff file (see review-diff.ts). */
+  reviewDiff?: ReviewDiff | null;
+  /** Tester only: agetor's own typecheck/lint/test results. */
+  precheck?: PrecheckSummary | null;
+}
+
+/** Pure: append the handoff + project-commands blocks to a prompt body.
+ *  Order is fixed (handoff first — it's about THIS codebase's files; then
+ *  commands) and empty blocks vanish, so the result is byte-identical to
+ *  `body` when there is nothing to add. */
+export function appendPromptExtras(body: string, extras?: StageExtras | null): string {
+  const blocks = [extras?.handoff, extras?.projectCommands].filter((b): b is string => typeof b === "string" && b.trim().length > 0);
+  return blocks.length === 0 ? body : `${body}\n\n${blocks.join("\n\n")}`;
+}
 
 /**
  * Fixed filename the Specify stage writes its spec to, at the worktree root.
@@ -687,6 +718,7 @@ export function mergeResolutionPrompt(
 export function childBuildPrompt(
   parentTask: Task,
   subtask: BuildSubtask,
+  extras?: StageExtras | null,
 ): string {
   const ccType = branchCommitType(parentTask.branch, parentTask.taskType);
   const acBlock = subtask.acceptanceCriteria.length > 0
@@ -701,7 +733,7 @@ export function childBuildPrompt(
       `describe the exact needed change in your final message instead, so the integration ` +
       `slice can apply it.`
     : "";
-  return (
+  const body =
     `You are one of several agents implementing independent slices of a larger plan in ` +
     `parallel, each in your own git worktree branched off the same commit. Your slice: ` +
     `"${subtask.title}".\n\n` +
@@ -715,8 +747,8 @@ export function childBuildPrompt(
     `open a pull request, do not run any git command that touches a remote — this commit ` +
     `stays local and gets merged into the parent branch by the pipeline itself. Do not ` +
     `include any AI attribution in the commit message. Then stop — do not ask a question, ` +
-    `do not wait for confirmation.`
-  );
+    `do not wait for confirmation.`;
+  return appendPromptExtras(body, extras);
 }
 
 /**
@@ -724,8 +756,18 @@ export function childBuildPrompt(
  * <reason>. Review scope grows: check off each AC-N the diff's subtasks
  * claimed, not just "does this match PLAN.md."
  */
-function codeReviewPrompt(task: Task): string {
+function codeReviewPrompt(task: Task, reviewDiff?: ReviewDiff | null): string {
   const base = task.baseRef ?? "the branch's base commit";
+  // O-6: the diff was taken ONCE by the pipeline and written outside the
+  // worktree; on a revision pass it starts at the sha this reviewer last
+  // saw, so "check only that issue" is also what the reviewer is shown.
+  const diffInstruction = reviewDiff && !reviewDiff.empty
+    ? `The diff since ${reviewDiff.sinceSha === task.baseRef ? "this branch's base" : `your previous review (${reviewDiff.sinceSha.slice(0, 7)})`} ` +
+      `has already been written to \`${reviewDiff.file}\` (${Math.max(1, Math.round(reviewDiff.bytes / 1024))} KB) — Read that file ` +
+      `(with offset/limit if it is large) instead of running git diff yourself; every hunk is in it. Diffstat:\n${reviewDiff.stat}\n\n`
+    : `Review the actual code changes on this branch — run ` +
+      `\`git diff ${base}\` (or \`git log -p ${base}..HEAD\`) to see everything that's landed ` +
+      `since this branch started. `;
   const isRevision = task.revisionCount > 0 && task.pipelineFeedback != null;
   const revisionContext = isRevision
     ? `\n\nThis is revision pass #${task.revisionCount}. Your previous feedback was:\n\n` +
@@ -738,9 +780,8 @@ function codeReviewPrompt(task: Task): string {
   return (
     `You are the Code Reviewer in an automated spec-driven pipeline: ` +
     `Specify → Clarify → Plan → Plan Review → Decompose → Analyze → Build → Code Review → Test. ` +
-    `Review the actual code changes on this branch — run ` +
-    `\`git diff ${base}\` (or \`git log -p ${base}..HEAD\`) to see everything that's landed ` +
-    `since this branch started. Read ${PIPELINE_SPEC_FILE} for the acceptance criteria, and ` +
+    diffInstruction +
+    `Read ${PIPELINE_SPEC_FILE} for the acceptance criteria, and ` +
     `check: (1) does the diff correctly implement ${PIPELINE_PLAN_FILE}? (2) does it satisfy ` +
     `every AC-N in ${PIPELINE_SPEC_FILE} at a code level? (3) code quality — correctness, ` +
     `no obvious regressions. Do not write or change any files yourself, and do not run the ` +
@@ -761,8 +802,15 @@ function codeReviewPrompt(task: Task): string {
 /** Tester stage — must end with PIPELINE_VERDICT: pass|fail <reason>. Hands
  *  the Tester the full AC checklist so it verifies each criterion is actually
  *  exercised, not just that lint/typecheck pass. */
-function testingPrompt(task: Task): string {
+function testingPrompt(task: Task, precheck?: PrecheckSummary | null): string {
   const ccType = branchCommitType(task.branch, task.taskType);
+  // O-5: agetor already ran the deterministic checks. The Tester starts from
+  // the failures (and any AC no test mentions) instead of rediscovering how
+  // to install and run the project — the single largest cost of this stage.
+  const precheckBlock = precheck && precheck.results.length > 0
+    ? `\n\n${renderPrecheck(precheck)}\n\nStart from the failures listed above. Do not reinstall dependencies ` +
+      `and do not re-run a check that already passed unless your fix could plausibly break it.`
+    : "";
   const isRevision = task.revisionCount > 0 && task.pipelineFeedback != null;
   const revisionContext = isRevision
     ? `\n\nThis is retry pass #${task.revisionCount}. Your previous failure report was:\n\n` +
@@ -782,7 +830,7 @@ function testingPrompt(task: Task): string {
     `leave it and report it in your verdict instead of guessing at a bigger change. Keep ` +
     `your context small: pipe test, lint and typecheck output through \`| tail -200\` (or ` +
     `the equivalent) so the transcript stays short, and for any file over 300 lines Read ` +
-    `only the relevant ranges with offset/limit instead of the whole file.\n\n` +
+    `only the relevant ranges with offset/limit instead of the whole file.${precheckBlock}\n\n` +
     `If you changed anything, commit it locally with a clear commit message (prefix the ` +
     `subject with "${ccType}:", e.g. "${ccType}: ..."). Do NOT push, do not open a pull ` +
     `request, do not run any git command that touches a remote — this commit stays local, ` +
@@ -809,20 +857,24 @@ export function stagePrompt(
   task: Task,
   stage: NonNullable<Task["pipelineStage"]>,
   constitutionRaw?: string | null,
+  extras?: StageExtras | null,
 ): string {
-  switch (stage) {
-    case "specify": return specifyPrompt(task, constitutionRaw ?? null);
-    case "clarify": return clarifyPrompt(task);
-    case "planning": return planningPrompt(task);
-    case "plan-review": return planReviewPrompt(task);
-    case "decompose": return decomposePrompt(task);
-    case "analyze":
-      // analyze is handled inline in advancePipelineStage (no agent turn) —
-      // this branch is unreachable in production but must not be a compile
-      // error in the switch.
-      return "";
-    case "building": return buildingPrompt(task);
-    case "code-review": return codeReviewPrompt(task);
-    case "testing": return testingPrompt(task);
-  }
+  const body = ((): string => {
+    switch (stage) {
+      case "specify": return specifyPrompt(task, constitutionRaw ?? null);
+      case "clarify": return clarifyPrompt(task);
+      case "planning": return planningPrompt(task);
+      case "plan-review": return planReviewPrompt(task);
+      case "decompose": return decomposePrompt(task);
+      case "analyze":
+        // analyze is handled inline in advancePipelineStage (no agent turn) —
+        // this branch is unreachable in production but must not be a compile
+        // error in the switch.
+        return "";
+      case "building": return buildingPrompt(task);
+      case "code-review": return codeReviewPrompt(task, extras?.reviewDiff);
+      case "testing": return testingPrompt(task, extras?.precheck);
+    }
+  })();
+  return body === "" ? body : appendPromptExtras(body, extras);
 }
