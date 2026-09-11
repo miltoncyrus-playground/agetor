@@ -1,8 +1,12 @@
 /* ────────────────────────────────────────────────────────────────────────────
  * Pipeline token report — deterministic, free, local. Reads the agetor
  * sqlite (read-only) to find every pipeline stage / build-child run with a
- * claude session id, then sums `message.usage` out of claude's own JSONL
- * transcript for that session. No LLM calls, no network. This is the
+ * claude session id, then takes its token totals from the `run_usage`
+ * table (recorded live by the claude tail, O-10) and falls back to summing
+ * `message.usage` out of claude's own JSONL transcript when the table has
+ * no row for the run. The JSON report says which per run (`source`). The
+ * transcript is still walked when present for tool counts and Read paths.
+ * No LLM calls, no network. This is the
  * measurement that docs/plans/pipeline-token-efficiency.md ties every
  * optimisation to: run it before and after a change, compare the columns.
  *
@@ -140,6 +144,11 @@ export interface RunRow {
   status: string;
   promptBytes: number;
   summary: TranscriptSummary;
+  /** Where the token numbers came from: the `run_usage` table (O-10, fed
+   *  live by the claude tail — survives claude's transcript retention
+   *  deleting the JSONL) or a walk of the JSONL transcript (older runs,
+   *  pre-migration-058 data). Optional: the pure aggregators never read it. */
+  source?: "db" | "jsonl";
 }
 
 export interface StageAgg {
@@ -235,26 +244,51 @@ async function main(): Promise<void> {
     order by r.started_at`).all() as Array<{ run_id: string; task_id: string; sid: string; status: string; origin: string | null; title: string; parent_task_id: string | null; harness_home: string | null }>;
   const firstUser = db.query(`select data from run_events where run_id = ? and stream = 'user' order by id limit 1`);
 
+  // Per-run totals recorded live by the claude tail (`run_usage`, migration
+  // 058). Preferred over the JSONL walk: they survive claude's transcript
+  // retention and cost one indexed read. A pre-058 sqlite has no table —
+  // fall back to the walk for every run rather than fail.
+  type UsageRow = { messages: number; input: number; cacheWrite: number; cacheRead: number; output: number; bootstrap: number };
+  const usageStmt = (() => {
+    try {
+      return db.query(`select messages, input_tokens input, cache_write_tokens "cacheWrite", cache_read_tokens "cacheRead",
+                              output_tokens output, bootstrap_tokens bootstrap from run_usage where run_id = ?`);
+    } catch { return null; }
+  })();
+  const dbUsage = (runId: string): UsageRow | null => (usageStmt?.get(runId) as UsageRow | null) ?? null;
+
   const rows: RunRow[] = [];
   let missing = 0;
+  let fromDb = 0;
   for (const r of runs) {
     const parentId = r.parent_task_id ?? r.task_id;
     if (onlyParent && !parentId.startsWith(onlyParent)) continue;
     const text = (firstUser.get(r.run_id) as { data: string } | null)?.data ?? "";
     const path = jsonlIndex(r.harness_home ?? join(homedir(), ".claude")).get(r.sid);
-    if (!path) { missing++; continue; }
+    const usage = dbUsage(r.run_id);
+    if (!path && !usage) { missing++; continue; }
+    // The transcript still supplies what the table doesn't hold (tool
+    // counts, Read paths for the duplicate-read metric, result bytes);
+    // when the table has the run, its token columns win over the walk's.
+    const walked = path ? summarizeTranscript(readFileSync(path, "utf8")) : summarizeTranscript("");
+    const summary: TranscriptSummary = usage
+      ? { ...walked, messages: usage.messages, input: usage.input, cacheWrite: usage.cacheWrite, cacheRead: usage.cacheRead,
+          output: usage.output, context: usage.input + usage.cacheWrite + usage.cacheRead, bootstrap: usage.bootstrap }
+      : walked;
+    if (usage) fromDb++;
     rows.push({
       runId: r.run_id, taskId: r.task_id, parentId, title: r.title, status: r.status,
       stage: classifyStage(text, { isChild: r.parent_task_id != null, origin: r.origin }),
       promptBytes: Buffer.byteLength(text),
-      summary: summarizeTranscript(readFileSync(path, "utf8")),
+      summary,
+      source: usage ? "db" : "jsonl",
     });
   }
 
   const agg = aggregateByStage(rows);
   const T = agg.reduce((a, s) => ({ context: a.context + s.context, output: a.output + s.output, messages: a.messages + s.messages, cacheRead: a.cacheRead + s.cacheRead, bootstrap: a.bootstrap + s.bootstrapSum }), { context: 0, output: 0, messages: 0, cacheRead: 0, bootstrap: 0 });
 
-  console.log(`pipeline token report — data ${dataDir}, ${rows.length} runs (${missing} without a transcript)\n`);
+  console.log(`pipeline token report — data ${dataDir}, ${rows.length} runs (${fromDb} from run_usage, ${rows.length - fromDb} from JSONL, ${missing} with neither)\n`);
   console.log("stage            runs  msgs   context      cache-read   output    share  bootstrap/run");
   for (const s of agg) {
     console.log(`${s.stage.padEnd(16)} ${String(s.runs).padStart(4)} ${String(s.messages).padStart(5)}  ${fmt(s.context).padStart(11)}  ${fmt(s.cacheRead).padStart(11)}  ${fmt(s.output).padStart(7)}  ${(s.share * 100).toFixed(1).padStart(5)}%  ${fmt(s.bootstrapSum / s.runs).padStart(8)}`);

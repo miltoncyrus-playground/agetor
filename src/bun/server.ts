@@ -11,6 +11,7 @@ import {
   backlog,
   drafts,
   runs,
+  runUsage,
   subagents,
   projects,
   preferences,
@@ -3904,6 +3905,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
       },
 
+      // Per-run token accounting (`run_usage`, O-10): every recorded run of
+      // the task plus the summed totals. 404 on an unknown task so a typo
+      // doesn't read as "a task with zero usage".
+      "/tasks/:id/usage": {
+        GET: authed((req) => {
+          if (!tasks.get(req.params.id)) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          return json(
+            { runs: runUsage.forTask(req.params.id), totals: runUsage.totalsForTask(req.params.id) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
       // Snapshot of the background/sub agents tracked for a task — drives the
       // run panel's read-only tab strip on open, and is polled (like /runs)
       // as a backstop to the live `subagent` SSE deltas.
@@ -4140,6 +4154,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             } satisfies TaskGitStatus,
             { headers: corsHeaders(req) },
           );
+        }),
+      },
+
+      // One run's token totals, or `null` when the run exists but nothing
+      // has been recorded yet (no assistant message so far, or a
+      // codex/gemini run — only the claude tail feeds `run_usage`).
+      "/runs/:id/usage": {
+        GET: authed((req) => {
+          if (!runs.get(req.params.id)) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          return json(runUsage.get(req.params.id), { headers: corsHeaders(req) });
         }),
       },
 

@@ -27,6 +27,7 @@ import { fxUsageChipText, fxUsageTitle, mergeFxUsage, parseFxUsage } from "@/lib
 import { reconcileById } from "@/lib/reconcile";
 import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
+import { formatUsageLabel, formatUsageTitle, sumRunUsage } from "@/lib/token-format";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -4249,9 +4250,25 @@ function RunsList({
   const ordinalFor = (id: string) => runs.length - runs.findIndex((r) => r.id === id);
   const latest = runs[0]!;
   const canExpand = runs.length > 1;
+  // Per-task token total, summed from the `usage` each run row already
+  // carries (`GET /tasks/:id/runs`) — rides the existing 2s runs poll, no
+  // extra request. Null until the first assistant message is recorded.
+  const totalUsage = sumRunUsage(runs);
+  const latestUsageLabel = formatUsageLabel(latest.usage);
 
   return (
     <div className="border-b border-border/60">
+      {totalUsage && (
+        <div
+          className="flex items-center justify-between gap-2 border-b border-border/40 px-3 py-1 text-[10px] text-muted-foreground"
+          data-testid="task-usage-total"
+        >
+          <span className="uppercase tracking-wide">Tokens · {runs.length === 1 ? "1 run" : `${runs.length} runs`}</span>
+          <span className="font-mono" title={formatUsageTitle(totalUsage)}>
+            {formatUsageLabel(totalUsage)}
+          </span>
+        </div>
+      )}
       <button
         type="button"
         onClick={() => canExpand && setOpen((o) => !o)}
@@ -4286,6 +4303,9 @@ function RunsList({
           )}
         </span>
         <span className="flex shrink-0 items-center gap-2 font-mono text-[10px] text-muted-foreground">
+          {latestUsageLabel && latest.usage && (
+            <span title={formatUsageTitle(latest.usage)}>{latestUsageLabel}</span>
+          )}
           <span>{formatDuration(latest)}</span>
           {latest.exitCode !== null && latest.exitCode !== 0 && (
             <span className="text-destructive">exit {latest.exitCode}</span>
@@ -4329,6 +4349,9 @@ function RunsList({
                     <span className="ml-1 text-destructive">exit {r.exitCode}</span>
                   )}
                 </span>
+                {r.usage && formatUsageLabel(r.usage) && (
+                  <span title={formatUsageTitle(r.usage)}>{formatUsageLabel(r.usage)}</span>
+                )}
                 {usageByRun?.get(r.id) && <UsageChip usage={usageByRun.get(r.id)!} />}
                 {providerByRun?.get(r.id) && <ProviderChip provider={providerByRun.get(r.id)!} />}
                 {titleByRun?.get(r.id) && <SessionTitleChip title={titleByRun.get(r.id)!} />}

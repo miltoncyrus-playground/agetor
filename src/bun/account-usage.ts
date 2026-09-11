@@ -1,6 +1,6 @@
 import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import * as path from "node:path";
-import type { AccountUsageSummary, TokenTotals } from "../shared/types.ts";
+import type { AccountUsageSummary, RunUsageSample, TokenTotals } from "../shared/types.ts";
 import { db } from "./db.ts";
 
 /**
@@ -125,21 +125,43 @@ export function parseUsageLine(line: string): UsageEvent | { error: true } | nul
   if (!trimmed) return null;
   let d: any;
   try { d = JSON.parse(trimmed); } catch { return { error: true }; }
-  const msg = d?.message;
-  const usage = msg?.usage;
-  if (!usage || typeof usage !== "object" || typeof msg.id !== "string" || !msg.id) return null;
+  const sample = usageFromParsedLine(d);
+  if (!sample) return null;
+  const msg = d.message;
   const ts = typeof d.timestamp === "string" ? d.timestamp : "";
   // A malformed/absent timestamp can't be bucketed into a day — skip rather
   // than invent one (Date.now-style stamping would make re-scans non-idempotent).
   if (!/^\d{4}-\d{2}-\d{2}/.test(ts)) return null;
   return {
-    key: `${msg.id}:${typeof d.requestId === "string" ? d.requestId : ""}`,
+    key: `${sample.messageId}:${typeof d.requestId === "string" ? d.requestId : ""}`,
     day: ts.slice(0, 10),
     model: typeof msg.model === "string" && msg.model ? msg.model : "unknown",
-    inputTokens: num(usage.input_tokens),
-    outputTokens: num(usage.output_tokens),
-    cacheWriteTokens: num(usage.cache_creation_input_tokens),
-    cacheReadTokens: num(usage.cache_read_input_tokens),
+    inputTokens: sample.input,
+    outputTokens: sample.output,
+    cacheWriteTokens: sample.cacheWrite,
+    cacheReadTokens: sample.cacheRead,
+  };
+}
+
+/**
+ * The usage block of an ALREADY-PARSED JSONL line, or null when the line
+ * carries none (user/system/tool lines, summaries, assistant lines with no
+ * `message.id`). The single place agetor reads `message.usage`: the
+ * account-level rollup above goes through it via `parseUsageLine`, and the
+ * per-run recorder (`run-usage-hook.ts`, fed from the claude-tmux tailer
+ * which has the parsed event in hand already) calls it directly so neither
+ * side re-parses JSON or re-spells the field names. Pure.
+ */
+export function usageFromParsedLine(d: unknown): RunUsageSample | null {
+  const msg = (d as { message?: any } | null)?.message;
+  const usage = msg?.usage;
+  if (!usage || typeof usage !== "object" || typeof msg.id !== "string" || !msg.id) return null;
+  return {
+    messageId: msg.id,
+    input: num(usage.input_tokens),
+    cacheWrite: num(usage.cache_creation_input_tokens),
+    cacheRead: num(usage.cache_read_input_tokens),
+    output: num(usage.output_tokens),
   };
 }
 

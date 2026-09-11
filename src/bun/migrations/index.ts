@@ -78,6 +78,10 @@ import m054 from "./054_sdd_pipeline_stages.sql" with { type: "text" };
 import m055 from "./055_pipeline_bounce_fingerprint.sql" with { type: "text" };
 import m056 from "./056_account_usage.sql" with { type: "text" };
 import m057 from "./057_satisfied_subtasks.sql" with { type: "text" };
+// O-10 per-run token usage was authored as 043 on the token-efficiency branch
+// (pre-upstream-sync numbering); renumbered to 058 on port, original id kept
+// as an alias (same renumber-with-alias pattern).
+import m058 from "./058_run_usage.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -143,4 +147,5 @@ export const migrations: Migration[] = [
   { id: "055_pipeline_bounce_fingerprint", sql: m055, aliases: ["039_pipeline_bounce_fingerprint"] },
   { id: "056_account_usage", sql: m056, aliases: ["040_account_usage"] },
   { id: "057_satisfied_subtasks", sql: m057, aliases: ["042_satisfied_subtasks"] },
+  { id: "058_run_usage", sql: m058, aliases: ["043_run_usage"] },
 ];

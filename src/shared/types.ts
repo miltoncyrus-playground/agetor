@@ -408,6 +408,39 @@ export interface TokenTotals {
 }
 
 /**
+ * One assistant API response's token usage, as extracted from a claude JSONL
+ * line (`message.usage` + `message.id`). The unit `runUsage.record` consumes;
+ * `messageId` is the idempotence key.
+ */
+export interface RunUsageSample {
+  messageId: string;
+  input: number;
+  cacheWrite: number;
+  cacheRead: number;
+  output: number;
+}
+
+/**
+ * Per-run token totals (table `run_usage`, migration 058). Summed once per
+ * distinct `message.id` over the run's claude JSONL. `context` is derived
+ * (input + cacheWrite + cacheRead): the total context the model processed
+ * across the run — THE number pipeline-token-efficiency.md minimises.
+ * `bootstrap` is the context of the run's first message (fixed per-session
+ * cost). `updatedAt` is the ms timestamp of the last recorded message.
+ */
+export interface RunUsage {
+  runId: string;
+  messages: number;
+  input: number;
+  cacheWrite: number;
+  cacheRead: number;
+  output: number;
+  context: number;
+  bootstrap: number;
+  updatedAt: number;
+}
+
+/**
  * Per-account LOCAL token-usage rollup attached to a claude-code harness's
  * status — fed by an incremental scan of the account's own
  * `<configDir>/projects/**\/*.jsonl` transcripts (src/bun/account-usage.ts),
@@ -2823,6 +2856,14 @@ export interface Run {
    * compiling unchanged; DB rows predating migration 023 read back as null.
    */
   origin?: "continuation" | "pipeline-stage" | "pipeline-merge" | null;
+  /**
+   * Token totals for this run (`run_usage`, migration 058), attached by
+   * `runs.listForTask` so the RunPanel's 2s runs poll carries them without a
+   * second request. `null` when nothing has been recorded yet (a run that
+   * hasn't produced an assistant message, codex/gemini runs, legacy rows).
+   * Optional so the many `runs.insert(r)` call sites keep compiling.
+   */
+  usage?: RunUsage | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */
