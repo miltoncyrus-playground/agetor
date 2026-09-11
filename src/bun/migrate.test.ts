@@ -312,7 +312,7 @@ test("token-efficiency migrations 058/059 are registered last, in order, right a
   // them under the old numbering is not re-migrated.
   const m058 = migrations.find((m) => m.id === "058_run_usage");
   expect(m058?.aliases).toEqual(["043_run_usage"]);
-  expect(m058?.sql).toContain("CREATE TABLE IF NOT EXISTS run_usage");
+  expect(m058?.sql).toContain("CREATE TABLE run_usage (");
   const m059 = migrations.find((m) => m.id === "059_pipeline_stage_state");
   expect(m059?.aliases).toEqual(["044_pipeline_stage_state"]);
   expect(m059?.sql).toContain("CREATE TABLE IF NOT EXISTS pipeline_stage_state");
