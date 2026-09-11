@@ -42,7 +42,7 @@ test("writeReviewDiff writes the diff outside the worktree and reports stat, byt
   expect(r!.stat).toContain("a.txt");
   expect(r!.stat).toContain("2 files changed");
   expect(r!.sinceSha).toBe(base);
-  expect(r!.headSha).toBe(await currentHeadSha(dir));
+  expect(r!.headSha).toBe((await currentHeadSha(dir))!);
   expect(r!.empty).toBe(false);
   // The worktree stays clean — nothing for commitAll to sweep up.
   expect(await git(["status", "--porcelain"], dir)).toBe("");

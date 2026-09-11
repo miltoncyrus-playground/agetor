@@ -4,7 +4,16 @@ import { tasks, runs } from "./db.ts";
 import { createTask, startTask, spawnPipelineStage, blockPipelineTask, cancelSiblingChildren, archiveTask, spawnMergeResolution } from "./orchestrator.ts";
 import { parseBuildPlan, childBuildPrompt, PIPELINE_BUILD_PLAN_FILE } from "./pipeline-prompts.ts";
 import { mergeBranch, abortMerge, commitAll } from "./worktree.ts";
+import { renderHandoff } from "./stage-handoff.ts";
+import { pipelineState } from "./pipeline-state.ts";
 import type { Task } from "../shared/types.ts";
+
+/** Char budget for the handoff block folded into a child's prompt. The
+ *  fixed template already sits under half of CLAUDE_PROMPT_ARGV_MAX_BYTES
+ *  (4096) and `subtask.prompt` is unbounded, so the handoff gets what's
+ *  left of a conservative share — a child that falls off the argv fast path
+ *  takes the fragile deferred-paste route (postmortem RC-1). */
+export const CHILD_HANDOFF_CHAR_BUDGET = 700;
 
 /**
  * DAG scheduler for a "building" stage's FRESH entry (from pre-builder
@@ -260,9 +269,22 @@ async function doTick(parentTaskId: string): Promise<void> {
     const depsSatisfied = subtask.dependsOn.every(subtaskMet);
     if (!depsSatisfied) continue;
 
+    // O-11: hand the child what the Planner/Decomposer already Read, filtered
+    // to the paths it owns, so it doesn't re-Read the plan's supporting
+    // files from scratch. Small budget — the child prompt must stay under the
+    // argv fast-path ceiling (see childBuildPrompt's doc).
+    let handoff: string | null = null;
+    try {
+      handoff = renderHandoff(pipelineState.getHandoffs(parent.id), {
+        charBudget: CHILD_HANDOFF_CHAR_BUDGET,
+        onlyPaths: subtask.files.length > 0 ? subtask.files : undefined,
+      }) || null;
+    } catch (err) {
+      console.error(`[agetor] child handoff render failed for ${parent.id}/${subtask.id}:`, err);
+    }
     const created = await createTask({
       title: `${parent.title} — ${subtask.title}`,
-      prompt: childBuildPrompt(parent, subtask),
+      prompt: childBuildPrompt(parent, subtask, { handoff }),
       agent: parent.agent,
       workdir: parent.workdir,
       // Mirrors the parent's own isolation mode rather than hardcoding

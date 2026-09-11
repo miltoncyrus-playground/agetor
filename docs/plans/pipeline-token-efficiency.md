@@ -7,7 +7,7 @@
 | Evidence base | The two complete pipeline runs in `~/.agetor-dev` (tasks `acb8dbf7` "shortlist" and `154f4379` "change background to grey", same target repo): 41 claude sessions, 809 API messages, `message.usage` summed from each session's JSONL transcript |
 | Measurement | `bun run eval:pipeline:tokens` (`evals/pipeline/token-report.ts`, deterministic, free, gate-tested). Every optimisation below is judged by re-running it |
 | Branch | `feature/pipeline-token-efficiency` — optimisations are tried here and pulled into `main` individually once the numbers hold |
-| Status | **Design + measurement tool shipped. No optimisation implemented yet.** Each O-n below is its own commit with its own before/after numbers |
+| Status | **Implemented on the branch (O-1 … O-11), gate-tested; awaiting the before/after re-run of the two baseline tickets.** See §8 for what shipped where and the kill switch per item |
 
 ## 1. Where the tokens go (as measured)
 
@@ -213,3 +213,25 @@ Quality gate for every wave: `bun test` green, `bun run eval:pipeline` at or abo
 2. **Subscription accounting of cache reads.** If the interactive quota discounts cache reads the way the API does, message count matters less and bootstrap cache writes matter more. The report prints both; decide once Anthropic's usage endpoint (already polled by `account-usage.ts`) is compared against the report over a week.
 3. **Tester skip threshold** (O-5): skip only when every AC id appears in a test file name or body, or also when the Code Reviewer's approve message ticks every AC? The first is deterministic and conservative; start there.
 4. **Effort for children** (O-8): `medium` is a guess. Run the builder eval at `low`, `medium`, `high` three times each and pick the cheapest that holds 0.8.
+
+## 8. As built (2026-09-11)
+
+Everything below is on `feature/pipeline-token-efficiency`, typechecked and covered by `bun test`. The measurement in §1 is the baseline; §6's targets are checked by re-running the same two tickets against the same repo with `bun run eval:pipeline:tokens`.
+
+| Item | Where | Verified by | Kill switch |
+| --- | --- | --- | --- |
+| O-1 tool set | `agents.ts` `leanContext` / `pipelineToolset`; `orchestrator.ts` `pipelineLeanContext` | live interactive probe: tool schemas 156KB → 43KB, first message 54.5K → 14.3K tokens; `agents.test.ts`, `orchestrator-pipeline.test.ts` | `AGETOR_PIPELINE_LEAN_CONTEXT=0` |
+| O-2 CLAUDE.md ancestry | same launch: `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` + `--append-system-prompt-file <worktree>/CLAUDE.md` | probe: repo marker present, `$HOME/CLAUDE.md` text absent | same |
+| O-3 decomposition sizing | `pipeline-prompts.ts` `decomposePrompt`, `buildPlanWarnings` → status events at decompose settle | `pipeline-prompts.test.ts`, `orchestrator-pipeline-token.test.ts`; eval `decompose-single` (paid, not yet run) | none (prompt text) |
+| O-4 repo profile + install + `## Project commands` | `repo-profile.ts`; `pipelinePromptExtras` in `orchestrator.ts` | `repo-profile.test.ts`, token test file | `AGETOR_PIPELINE_AUTO_INSTALL=0` |
+| O-5 tester precheck / skip | `pipeline-precheck.ts`; `runTesterGate` in `orchestrator.ts`; `testingPrompt(task, precheck)` | `pipeline-precheck.test.ts`, 5 gate scenarios in the token test file; eval `tester-precheck` (paid, not yet run) | `AGETOR_PIPELINE_PRECHECK=0`, `AGETOR_PIPELINE_TESTER_SKIP=0` |
+| O-6 precomputed review diff | `review-diff.ts`; `codeReviewPrompt(task, reviewDiff)`; `pipeline_stage_state.review_sha` | `review-diff.test.ts`, token test file (base pass + revision delta) | none (falls back when git fails) |
+| O-7 close settled session | `dropSettledStageSession` in `orchestrator.ts` | `orchestrator-pipeline.test.ts` | none |
+| O-8 effort tiering | `resolveRunEffort` in `orchestrator.ts` | token test file; `run-evals.ts --effort` (paid) | `AGETOR_PIPELINE_EFFORT_TIERING=0` |
+| O-9 prompt / result bounds | `pipeline-prompts.ts` (2KB subtask prompt budget, offset/limit + tail instructions) | `pipeline-prompts.test.ts` | none |
+| O-10 per-run token usage | migration 043, `run-usage-hook.ts`, `db.ts` `runUsage`, `GET /runs/:id/usage`, `GET /tasks/:id/usage`, RunPanel labels; `token-report.ts` prefers the table | `run-usage.test.ts`, `run-usage-endpoint.test.ts`, `token-format.test.ts` | none |
+| O-11 stage handoff pack | `stage-handoff.ts`; capture in `advancePipelineStage`, render in `pipelinePromptExtras` and `build-scheduler.ts` (children, lane-filtered, 700-char budget) | `stage-handoff.test.ts`, token test file | none (empty block when nothing to say) |
+
+Open question 1 is settled: `--tools <csv>` removes unlisted schemas from the prompt snapshot (verified in both `-p` and interactive tmux sessions); `CLAUDE_CODE_DISABLE_CLAUDE_MDS` removes every CLAUDE.md, so the worktree's own is re-injected via `--append-system-prompt-file`. One side finding while probing: a claude launched in a never-seen directory shows two trust dialogs before its first turn (folder trust, then bypass-permissions), which agetor's pane scraper already drives.
+
+Not yet done, in order: (1) run the paid evals `bun run eval:pipeline` and `bun evals/pipeline/run-evals.ts --effort low --only decompose` to confirm O-3/O-5/O-8 hold the 0.8 threshold; (2) re-run the two baseline tickets and fill in §6's target column with measured values; (3) pull the branch into `main` commit by commit.
