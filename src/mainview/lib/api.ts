@@ -69,6 +69,7 @@ import type {
   Project,
   Run,
   RunEvent,
+  RunUsage,
   Subagent,
   Task,
   TaskDiff,
@@ -1203,6 +1204,12 @@ export const api = {
   terminalSocketUrl: (id: string) =>
     `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  /** Per-run token totals for a task plus the sum (`run_usage`, O-10). The
+   *  RunPanel doesn't call this — `listRuns` already carries `run.usage` on
+   *  each row — it exists for callers that want totals without run rows. */
+  getTaskUsage: (taskId: string) => j<{ runs: RunUsage[]; totals: RunUsage }>(`/tasks/${taskId}/usage`),
+  /** One run's token totals; `null` until its first assistant message. */
+  getRunUsage: (runId: string) => j<RunUsage | null>(`/runs/${runId}/usage`),
   /** Backward page of a task's persisted events, older than `beforeId`
    *  (exclusive) — drives the run panel's "Load earlier" affordance once the
    *  bounded SSE replay window (`EVENTS_REPLAY_LIMIT`) has been exhausted.

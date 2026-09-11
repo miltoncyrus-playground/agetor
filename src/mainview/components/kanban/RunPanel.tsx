@@ -15,6 +15,7 @@ import { latestPrProposal } from "@/lib/pr-proposal";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
+import { formatUsageLabel, formatUsageTitle, sumRunUsage } from "@/lib/token-format";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -3772,9 +3773,25 @@ function RunsList({ runs }: { runs: Run[] }) {
   const ordinalFor = (id: string) => runs.length - runs.findIndex((r) => r.id === id);
   const latest = runs[0]!;
   const canExpand = runs.length > 1;
+  // Per-task token total, summed from the `usage` each run row already
+  // carries (`GET /tasks/:id/runs`) — rides the existing 2s runs poll, no
+  // extra request. Null until the first assistant message is recorded.
+  const totalUsage = sumRunUsage(runs);
+  const latestUsageLabel = formatUsageLabel(latest.usage);
 
   return (
     <div className="border-b border-border/60">
+      {totalUsage && (
+        <div
+          className="flex items-center justify-between gap-2 border-b border-border/40 px-3 py-1 text-[10px] text-muted-foreground"
+          data-testid="task-usage-total"
+        >
+          <span className="uppercase tracking-wide">Tokens · {runs.length === 1 ? "1 run" : `${runs.length} runs`}</span>
+          <span className="font-mono" title={formatUsageTitle(totalUsage)}>
+            {formatUsageLabel(totalUsage)}
+          </span>
+        </div>
+      )}
       <button
         type="button"
         onClick={() => canExpand && setOpen((o) => !o)}
@@ -3809,6 +3826,9 @@ function RunsList({ runs }: { runs: Run[] }) {
           )}
         </span>
         <span className="flex shrink-0 items-center gap-2 font-mono text-[10px] text-muted-foreground">
+          {latestUsageLabel && latest.usage && (
+            <span title={formatUsageTitle(latest.usage)}>{latestUsageLabel}</span>
+          )}
           <span>{formatDuration(latest)}</span>
           {latest.exitCode !== null && latest.exitCode !== 0 && (
             <span className="text-destructive">exit {latest.exitCode}</span>
@@ -3843,6 +3863,9 @@ function RunsList({ runs }: { runs: Run[] }) {
                 </span>
               </span>
               <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+                {r.usage && formatUsageLabel(r.usage) && (
+                  <span className="mr-2" title={formatUsageTitle(r.usage)}>{formatUsageLabel(r.usage)}</span>
+                )}
                 {formatDuration(r)}
                 {r.exitCode !== null && r.exitCode !== 0 && (
                   <span className="ml-1 text-destructive">exit {r.exitCode}</span>

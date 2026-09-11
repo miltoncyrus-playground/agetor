@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, RunUsage, RunUsageSample, Subagent, SubagentStatus } from "../shared/types.ts";
 import { isAwaitingHandBack, isGateParked } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
@@ -808,10 +808,14 @@ const toRun = (r: RunRow): Run => ({
 });
 
 export const runs = {
+  /** Newest first. Each run carries its `run_usage` row as `usage` (null
+   *  when nothing recorded) — one extra indexed query per call, so the
+   *  RunPanel's 2s runs poll shows tokens without a second request. */
   listForTask(taskId: string): Run[] {
+    const usageByRun = new Map(runUsage.forTask(taskId).map((u) => [u.runId, u]));
     return db.query<RunRow, [string]>(
       `SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC`,
-    ).all(taskId).map(toRun);
+    ).all(taskId).map((row) => ({ ...toRun(row), usage: usageByRun.get(row.id) ?? null }));
   },
   get(id: string): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
@@ -1051,6 +1055,107 @@ function toSubagent(r: SubagentRow): Subagent {
     endedAt: r.ended_at,
   };
 }
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Per-run token accounting (`run_usage`, migration 043 — O-10 in
+ * docs/plans/pipeline-token-efficiency.md).
+ *
+ * Fed by `run-usage-hook.ts` from the claude-tmux JSONL tail: one
+ * `record` per assistant line that carries `message.usage`. Idempotent on
+ * (run_id, message_id) via `run_usage_seen` — claude writes one JSONL line
+ * per content block (same message.id, same usage block), and a boot
+ * reattach replays the file from offset 0, so the same message reaches the
+ * recorder many times. The first recorded message of a run fixes
+ * `bootstrap_tokens` (its full context = the per-session fixed cost) and it
+ * is never rewritten. No process side effect, pure SQL — server.ts reads it
+ * directly, no orchestrator involvement.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+type RunUsageRow = {
+  run_id: string; messages: number; input_tokens: number; cache_write_tokens: number;
+  cache_read_tokens: number; output_tokens: number; bootstrap_tokens: number; updated_at: number;
+};
+
+const toRunUsage = (r: RunUsageRow): RunUsage => ({
+  runId: r.run_id,
+  messages: r.messages,
+  input: r.input_tokens,
+  cacheWrite: r.cache_write_tokens,
+  cacheRead: r.cache_read_tokens,
+  output: r.output_tokens,
+  context: r.input_tokens + r.cache_write_tokens + r.cache_read_tokens,
+  bootstrap: r.bootstrap_tokens,
+  updatedAt: r.updated_at,
+});
+
+const RUN_USAGE_COLS = `run_id, messages, input_tokens, cache_write_tokens, cache_read_tokens, output_tokens, bootstrap_tokens, updated_at`;
+
+export const runUsage = {
+  /**
+   * Fold one assistant message's usage into the run's totals. Returns true
+   * when the message was counted, false when `(runId, messageId)` had
+   * already been seen (no-op) or the run row doesn't exist (the FK would
+   * reject the insert; a usage line for an unknown run is a caller bug we
+   * refuse to turn into a crash of the JSONL tailer).
+   */
+  record(runId: string, sample: RunUsageSample, now: number = Date.now()): boolean {
+    if (!sample.messageId) return false;
+    return db.transaction((): boolean => {
+      const exists = db.query<{ id: string }, [string]>(`SELECT id FROM runs WHERE id = ?`).get(runId);
+      if (!exists) return false;
+      const seen = db.run(
+        `INSERT OR IGNORE INTO run_usage_seen (run_id, message_id) VALUES (?, ?)`,
+        [runId, sample.messageId],
+      );
+      if (seen.changes === 0) return false;
+      const context = sample.input + sample.cacheWrite + sample.cacheRead;
+      // INSERT sets bootstrap from this (first) message; the ON CONFLICT
+      // branch deliberately leaves bootstrap_tokens untouched so only the
+      // first message of the run ever defines it.
+      db.run(
+        `INSERT INTO run_usage (${RUN_USAGE_COLS}) VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(run_id) DO UPDATE SET
+           messages = messages + 1,
+           input_tokens = input_tokens + excluded.input_tokens,
+           cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+           cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+           output_tokens = output_tokens + excluded.output_tokens,
+           updated_at = excluded.updated_at`,
+        [runId, sample.input, sample.cacheWrite, sample.cacheRead, sample.output, context, now],
+      );
+      return true;
+    })();
+  },
+  get(runId: string): RunUsage | null {
+    const row = db.query<RunUsageRow, [string]>(`SELECT ${RUN_USAGE_COLS} FROM run_usage WHERE run_id = ?`).get(runId);
+    return row ? toRunUsage(row) : null;
+  },
+  /** Every recorded run of a task, newest run first (same order as `runs.listForTask`). */
+  forTask(taskId: string): RunUsage[] {
+    return db.query<RunUsageRow, [string]>(
+      `SELECT u.run_id, u.messages, u.input_tokens, u.cache_write_tokens, u.cache_read_tokens, u.output_tokens, u.bootstrap_tokens, u.updated_at
+       FROM run_usage u JOIN runs r ON r.id = u.run_id
+       WHERE r.task_id = ? ORDER BY r.started_at DESC`,
+    ).all(taskId).map(toRunUsage);
+  },
+  /** Sum over every run of the task. `runId` is the task id (the total has
+   *  no run of its own); `bootstrap` sums each run's bootstrap — the total
+   *  fixed cost the task paid across its sessions; `updatedAt` is the
+   *  latest. All zeros when nothing has been recorded. */
+  totalsForTask(taskId: string): RunUsage {
+    return this.forTask(taskId).reduce<RunUsage>((acc, u) => ({
+      runId: taskId,
+      messages: acc.messages + u.messages,
+      input: acc.input + u.input,
+      cacheWrite: acc.cacheWrite + u.cacheWrite,
+      cacheRead: acc.cacheRead + u.cacheRead,
+      output: acc.output + u.output,
+      context: acc.context + u.context,
+      bootstrap: acc.bootstrap + u.bootstrap,
+      updatedAt: Math.max(acc.updatedAt, u.updatedAt),
+    }), { runId: taskId, messages: 0, input: 0, cacheWrite: 0, cacheRead: 0, output: 0, context: 0, bootstrap: 0, updatedAt: 0 });
+  },
+};
 
 export const subagents = {
   /** Every tracked subagent for a task, oldest first (spawn order — that's how
