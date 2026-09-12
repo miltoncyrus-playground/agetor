@@ -35,10 +35,13 @@ import { UsageMeter } from "@/components/usage/UsageMeter";
 import { UsagePopover } from "@/components/usage/UsagePopover";
 import { visibleTopbarAgents } from "@/lib/usage";
 import { KanbanFilters, basename } from "@/components/kanban/KanbanFilters";
+import { AttentionStrip } from "@/components/kanban/AttentionStrip";
 import { SwimLane } from "@/components/kanban/SwimLane";
 import {
   DISPLAY_COLUMNS,
+  columnIdsFor,
   filterLaneColumns,
+  isDisplayColumnFilter,
   toDisplayColumn,
   type DisplayColumnId,
 } from "@/lib/display-columns";
@@ -880,6 +883,17 @@ function AppInner() {
     return cancel;
   }, []);
 
+  // Attention-strip chip → the existing `statusFilter`. A chip stands for a
+  // DISPLAY bucket, so "in-progress" expands to plain `running` plus all six
+  // pipeline-stage columns (`columnIdsFor`); clicking the chip that's
+  // already the whole filter clears it, so the chips toggle rather than
+  // accumulate. Deliberately REPLACES the filter instead of unioning: the
+  // strip is a "focus the board on this" affordance, and the column filter
+  // menu remains the way to build a multi-status selection by hand.
+  const toggleAttentionStatus = useCallback((display: DisplayColumnId) => {
+    setStatusFilter((cur) => (isDisplayColumnFilter(cur, display) ? [] : columnIdsFor(display)));
+  }, []);
+
   // Build progress per parent pipeline task, for `TaskCard`'s sub-task
   // badge — computed once here (not per-card) and threaded down as a
   // stable-identity Map prop via Column, so Column's and TaskCard's existing
@@ -1641,6 +1655,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             projects={projects}
             harnesses={harnesses}
             taskAgentIds={taskAgentIds}
+          />
+          <AttentionStrip
+            tasks={visibleTasks}
+            statusFilter={statusFilter}
+            onToggleStatus={toggleAttentionStatus}
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />

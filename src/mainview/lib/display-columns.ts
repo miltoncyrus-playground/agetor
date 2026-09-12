@@ -1,4 +1,4 @@
-import { isActiveColumn, type ColumnId } from "../../shared/types.ts";
+import { COLUMNS, isActiveColumn, type ColumnId } from "../../shared/types.ts";
 
 /**
  * The reduced 6-bucket taxonomy the swimlane board renders against, distinct
@@ -13,17 +13,21 @@ import { isActiveColumn, type ColumnId } from "../../shared/types.ts";
 export type DisplayColumnId = "backlog" | "ready" | "in-progress" | "blocked" | "review" | "done";
 
 export const DISPLAY_COLUMNS: { id: DisplayColumnId; label: string; dotClass: string }[] = [
-  { id: "backlog", label: "Backlog", dotClass: "bg-zinc-500" },
-  { id: "ready", label: "Ready", dotClass: "bg-sky-500" },
-  // Matches the existing pulsing "actively working" dot's color (TaskCard.tsx)
-  // so an in-progress task's dot is emerald whether pulsing or resting.
-  { id: "in-progress", label: "In Progress", dotClass: "bg-emerald-500" },
-  // Deliberately not amber — the card's outer ring already uses amber for
-  // "waiting on a human" (pendingInteractionCount > 0); a blocked dot in the
-  // same color would collide with that unrelated signal.
-  { id: "blocked", label: "Blocked", dotClass: "bg-red-500" },
-  { id: "review", label: "Review", dotClass: "bg-violet-500" },
-  { id: "done", label: "Done", dotClass: "bg-slate-400" },
+  // Semantic tokens only — literal palette classes (bg-emerald-500 and
+  // friends) are tuned to one background and silently break in the other
+  // theme (CLAUDE.md, UI conventions). The two states with no semantic
+  // token of their own (backlog, done) use the neutral muted-foreground.
+  { id: "backlog", label: "Backlog", dotClass: "bg-muted-foreground/50" },
+  { id: "ready", label: "Ready", dotClass: "bg-info" },
+  // Matches the existing pulsing "actively working" dot (TaskCard.tsx) so an
+  // in-progress task's dot reads the same whether pulsing or resting.
+  { id: "in-progress", label: "In Progress", dotClass: "bg-success-solid" },
+  // Deliberately not the warning token — the card's outer ring already uses
+  // it for "waiting on a human" (pendingInteractionCount > 0); a blocked dot
+  // in the same color would collide with that unrelated signal.
+  { id: "blocked", label: "Blocked", dotClass: "bg-danger-solid" },
+  { id: "review", label: "Review", dotClass: "bg-primary" },
+  { id: "done", label: "Done", dotClass: "bg-muted-foreground/40" },
 ];
 
 /**
@@ -73,4 +77,26 @@ export function toDisplayColumn(column: ColumnId): DisplayColumnId {
   // every pipeline-stage id), kept for exhaustiveness safety against a
   // future ColumnId addition.
   return "in-progress";
+}
+
+/**
+ * The real `ColumnId`s a display bucket stands for — the inverse of
+ * `toDisplayColumn`. The attention strip's chips drive App's existing
+ * `statusFilter: ColumnId[]`, and "in-progress" covers plain `running` plus
+ * all six pipeline stages, so a chip click has to expand to that whole set
+ * rather than a single id. Derived from `toDisplayColumn` over `COLUMNS`
+ * instead of re-listing the stages, so the two can't drift.
+ */
+export function columnIdsFor(display: DisplayColumnId): ColumnId[] {
+  return COLUMNS.filter((c) => toDisplayColumn(c.id) === display).map((c) => c.id);
+}
+
+/** True when `filter` is exactly the set `display` expands to — i.e. the
+ *  board is currently focused on that one bucket and clicking its chip
+ *  again should clear the filter. Order-insensitive. */
+export function isDisplayColumnFilter(filter: ColumnId[], display: DisplayColumnId): boolean {
+  const ids = columnIdsFor(display);
+  if (filter.length !== ids.length) return false;
+  const set = new Set(filter);
+  return ids.every((id) => set.has(id));
 }
