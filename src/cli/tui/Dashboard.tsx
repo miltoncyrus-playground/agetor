@@ -1,8 +1,9 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
-import type { Task, RunEvent } from "../../shared/types.ts";
+import type { Task, RunEvent, TaskReference } from "../../shared/types.ts";
 import { commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
+import { appendReferences } from "../../shared/refs.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import {
   parseSentFilesToolUse,
@@ -18,6 +19,7 @@ import { useSpinner } from "./useSpinner.ts";
 import { useGlobalEvents, type Toast } from "./useGlobalEvents.ts";
 import { Composer } from "./Composer.tsx";
 import { AnswerOverlay } from "./AnswerOverlay.tsx";
+import { DirPickerOverlay } from "./DirPickerOverlay.tsx";
 import { runControl, resumableRunId } from "../run-logic.ts";
 import { Logo } from "./logo.tsx";
 import { fileScopeForTask } from "./at-complete.ts";
@@ -25,7 +27,7 @@ import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts
 // `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
 
-type Mode = "nav" | "compose" | "answer";
+type Mode = "nav" | "compose" | "answer" | "pick";
 
 // Surface the most actionable columns first.
 const COLUMN_ORDER = ["running", "blocked", "review", "ready", "backlog", "done"];
@@ -242,6 +244,10 @@ export function Dashboard({
       setTargetId(selected.id);
       return setMode("compose");
     }
+    if (input === "r" && selected) {
+      setTargetId(selected.id);
+      return setMode("pick");
+    }
     if (input === "g" && selected) {
       if (selected.pendingInteractionCount > 0) {
         setTargetId(selected.id);
@@ -369,6 +375,22 @@ export function Dashboard({
           onSubmit={(t) => sendMessage(target, t)}
           onCancel={() => setMode("nav")}
         />
+      ) : null}
+      {mode === "pick" && target ? (
+        <Box borderStyle="round" borderColor="cyan" paddingX={1} overflow="hidden">
+          <DirPickerOverlay
+            client={client}
+            onDone={(refs: TaskReference[]) => {
+              setMode("nav");
+              if (!refs.length) {
+                setStatus("no reference selected");
+                return;
+              }
+              const label = `→ attached ${refs.length} reference${refs.length > 1 ? "s" : ""}`;
+              sendMessage(target, appendReferences("", refs), label);
+            }}
+          />
+        </Box>
       ) : null}
       {mode === "answer" && target ? (
         <Box borderStyle="round" borderColor="yellow" paddingX={1} overflow="hidden">
@@ -685,7 +707,9 @@ function Footer({
       ? "type a message · enter send · esc cancel"
       : mode === "answer"
         ? "↑/↓ move · space toggle · enter submit · esc cancel"
-        : "↑/↓ select · s run · x stop · m msg · c commit · g answer · q quit";
+        : mode === "pick"
+          ? "↑/↓ move · type to filter · enter select · esc back"
+          : "↑/↓ nav · s run · x stop · m msg · c commit · g answer · r ref · q quit";
   return (
     <Box justifyContent="space-between" paddingX={1}>
       <Text dimColor>{hint}</Text>
