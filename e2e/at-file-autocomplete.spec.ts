@@ -606,7 +606,11 @@ test.describe("@ file references", () => {
     await gotoApp(page, backend.bootBase);
     const card = taskCard(page, startedTaskTitle);
     await expect(card).toBeVisible();
-    await card.getByTitle("View changes (git diff)").click();
+    // The compact card carries no action buttons — "View changes" lives in
+    // the right-click context menu (see e2e/task-context-menu.spec.ts).
+    await card.scrollIntoViewIfNeeded();
+    await card.click({ button: "right" });
+    await page.locator('[data-testid="task-context-menu-diff"]').click();
     const dialog = page.getByRole("dialog");
     await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 

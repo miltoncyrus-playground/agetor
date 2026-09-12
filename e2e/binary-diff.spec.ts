@@ -226,13 +226,18 @@ function taskCard(page: Page, title: string): Locator {
   return page.locator('[class*="cursor-grab"]').filter({ hasText: title });
 }
 
-/** Click a task card's "View changes (git diff)" icon button (present on
- *  every card, independent of column/run state — TaskCard.tsx:198) and wait
- *  for the resulting dialog to render. */
+/** Open a task's diff dialog through the board card's CONTEXT MENU. The
+ *  compact card carries no action buttons — every action moved to the
+ *  right-click menu (`buildTaskContextMenu`), which is the card's action
+ *  surface now. "View changes" is in the menu's `inspect` group and, like
+ *  the old icon button, is present for every task regardless of column or
+ *  run state. Test-id convention matches `e2e/task-context-menu.spec.ts`. */
 async function openDiffDialog(page: Page, title: string): Promise<Locator> {
   const card = taskCard(page, title);
   await expect(card).toBeVisible();
-  await card.getByTitle("View changes (git diff)").click();
+  await card.scrollIntoViewIfNeeded();
+  await card.click({ button: "right" });
+  await page.locator('[data-testid="task-context-menu-diff"]').click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("Changes")).toBeVisible();

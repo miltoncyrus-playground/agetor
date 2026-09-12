@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -34,7 +34,15 @@ import { GitHubDialog, type GitHubItemDetailPrefill, type GitHubPullPrefill } fr
 import { UsageMeter } from "@/components/usage/UsageMeter";
 import { UsagePopover } from "@/components/usage/UsagePopover";
 import { visibleTopbarAgents } from "@/lib/usage";
-import { KanbanFilters } from "@/components/kanban/KanbanFilters";
+import { KanbanFilters, basename } from "@/components/kanban/KanbanFilters";
+import { SwimLane } from "@/components/kanban/SwimLane";
+import {
+  DISPLAY_COLUMNS,
+  filterLaneColumns,
+  toDisplayColumn,
+  type DisplayColumnId,
+} from "@/lib/display-columns";
+import { sortWaitingFirst } from "@/lib/board-status";
 import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
@@ -111,16 +119,6 @@ function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () 
     </div>
   );
 }
-
-/** Muted one-line hints shown in empty columns while onboarding's checklist
- *  is visible (see `Column`'s `emptyHint` prop). Review/done intentionally
- *  have no entry — an empty Review/Done column needs no explanation. */
-const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
-  backlog: "Ideas you haven't queued yet",
-  ready: "Tasks return here when a run needs another go",
-  running: "Agents working right now",
-  blocked: "Needs your attention",
-};
 
 /** One icon per `TaskMenuAction`, for the task context menu built from
  *  `buildTaskContextMenu`'s pure entries (see the `taskMenuItems` memo
@@ -921,10 +919,72 @@ function AppInner() {
     });
   }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView]);
 
-  const visibleColumns = useMemo(
-    () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
+  // The board renders against the reduced 6-bucket DISPLAY taxonomy, not
+  // `task.column`'s full 12-value ColumnId — see lib/display-columns.ts. A
+  // display column is kept when the user's status filter selects ANY of the
+  // real columns it stands for, so filtering to "Building" still shows the
+  // In Progress bucket (which is where a building task actually renders).
+  const visibleDisplayColumns = useMemo(
+    () => (statusFilter.length === 0
+      ? DISPLAY_COLUMNS
+      : DISPLAY_COLUMNS.filter((c) => statusFilter.some((id) => toDisplayColumn(id) === c.id))),
     [statusFilter],
   );
+
+  // Groups `visibleTasks` into one swimlane per project (task.workdir), each
+  // further bucketed by display column. Registered projects first (in
+  // `projects`' own order, skipping any with zero currently-visible tasks —
+  // an empty lane is noise), then any workdir present in tasks but not a
+  // registered project (ad-hoc/typed-in workdirs), alphabetically. Each lane
+  // also gets its OWN visible-column list via `filterLaneColumns`. No
+  // stability trick is needed for the per-cell arrays beyond what
+  // `visibleTasks.filter(...)` already relied on for the flat board:
+  // `Column`'s memo comparator compares elements, not the array reference,
+  // and elements stay stable via `reconcileById`.
+  const lanes = useMemo(() => {
+    const byWorkdir = new Map<string, Task[]>();
+    for (const t of visibleTasks) {
+      const arr = byWorkdir.get(t.workdir);
+      if (arr) arr.push(t); else byWorkdir.set(t.workdir, [t]);
+    }
+    const ordered: string[] = [];
+    for (const p of projects) {
+      if (byWorkdir.has(p.path)) ordered.push(p.path);
+    }
+    const known = new Set(ordered);
+    const extra = Array.from(byWorkdir.keys()).filter((w) => !known.has(w)).sort();
+    return [...ordered, ...extra].map((workdir) => {
+      const laneTasks = byWorkdir.get(workdir)!;
+      const tasksByDisplayColumn = new Map<DisplayColumnId, Task[]>();
+      for (const t of laneTasks) {
+        const dc = toDisplayColumn(t.column);
+        const arr = tasksByDisplayColumn.get(dc);
+        if (arr) arr.push(t); else tasksByDisplayColumn.set(dc, [t]);
+      }
+      // Cards waiting on a human float to the top of their column. Stable
+      // (relative order preserved within both groups) and identity-preserving
+      // (returns the same array when nothing is waiting), so Column's
+      // element-wise memo comparator keeps bailing out across polls.
+      for (const [dc, arr] of tasksByDisplayColumn) {
+        tasksByDisplayColumn.set(dc, sortWaitingFirst(arr));
+      }
+      const project = projects.find((p) => p.path === workdir);
+      return {
+        workdir,
+        label: project?.name || basename(workdir) || workdir,
+        taskCount: laneTasks.length,
+        tasksByDisplayColumn,
+        visibleColumns: filterLaneColumns(
+          visibleDisplayColumns,
+          (id) => (tasksByDisplayColumn.get(id)?.length ?? 0) > 0,
+        ),
+      };
+    });
+  }, [visibleTasks, projects, visibleDisplayColumns]);
+
+  // taskId -> Task over the full board, so a child card can look up its
+  // parent's title regardless of which column the parent is in.
+  const tasksById = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
 
   // Distinct harness ids referenced by any task — feeds the harness filter so
   // ids belonging to removed harnesses still show up as filter options.
@@ -1021,10 +1081,23 @@ function AppInner() {
 
   const onDragEnd = useCallback(async (e: DragEndEvent) => {
     const id = String(e.active.id);
-    const col = e.over?.id as ColumnId | undefined;
-    if (!col) return;
+    // Droppable ids are namespaced per-lane (`${workdir}::${columnId}`, see
+    // SwimLane.tsx) since a swimlane board has one Column per (project,
+    // display column) pair and every id repeats once per lane. Split it back
+    // apart rather than trusting `over.id` as a bare ColumnId.
+    const overId = e.over?.id != null ? String(e.over.id) : undefined;
+    if (!overId) return;
+    const sep = overId.indexOf("::");
+    if (sep < 0) return;
+    const laneWorkdir = overId.slice(0, sep);
+    const col = overId.slice(sep + 2) as ColumnId;
     const t = tasksRef.current.find((x) => x.id === id);
-    if (!t || t.column === col) return;
+    if (!t) return;
+    // A drag must never silently move a task to a different project — there
+    // is no API support for that, and it shouldn't be a side effect of a
+    // column-to-column drag. Reject rather than guess.
+    if (t.workdir !== laneWorkdir) return;
+    if (t.column === col) return;
     setTasks((cur) => cur.map((x) => (x.id === id ? { ...x, column: col } : x)));
     try {
       setError(null);
@@ -1571,38 +1644,43 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />
-          {/* Kanban gets all remaining vertical space and scrolls horizontally
-              on its own — the bottom bar stays anchored regardless of column
-              count. */}
-          {/* Outer positioning context lives OUTSIDE the horizontal
-              scroller: the zero-task overlay below is absolutely positioned
-              against this div, not `.kanban-scroll`, so scrolling the board
-              horizontally can't carry the card off-screen with it (an
-              abs-positioned descendant of a scrolling containing block
-              scrolls along with it — the previous bug). */}
+          {/* The lane LIST scrolls vertically for all remaining space; each
+              lane scrolls horizontally on its own (SwimLane.tsx), so the
+              bottom bar stays anchored regardless of lane or column count.
+              The board no longer scrolls horizontally as one unit — that
+              moved down a level when it became one row per project. */}
+          {/* Outer positioning context lives OUTSIDE the scroller: the
+              zero-task overlay below is absolutely positioned against this
+              div, not the scrolling one, so scrolling the board can't carry
+              the card off-screen with it (an abs-positioned descendant of a
+              scrolling containing block scrolls along with it — the
+              previous bug). */}
           <div className="relative flex-1">
-            <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
+            <div className="absolute inset-0 overflow-y-auto">
               <DndContext sensors={sensors} onDragEnd={onDragEnd}>
-                <div className="flex gap-3 p-4">
-                  {visibleColumns.map((c) => (
-                    <Column
-                      key={c.id}
-                      id={c.id}
-                      label={c.label}
-                      tasks={visibleTasks.filter((t) => t.column === c.id)}
-                      homeDir={homeDir}
-                      onStart={start}
-                      onCancel={cancel}
-                      onDelete={del}
+                <div className="flex flex-col gap-4 p-4">
+                  {lanes.length === 0 && tasks.length > 0 && (
+                    // Tasks exist but every one is filtered out. Distinct
+                    // from the zero-task onboarding overlay below, which
+                    // answers "you have no tasks at all" — conflating the
+                    // two would tell a filtering user to go create a task.
+                    <p className="px-1 text-xs text-muted-foreground">
+                      No tasks match the current filters.
+                    </p>
+                  )}
+                  {lanes.map((lane) => (
+                    <SwimLane
+                      key={lane.workdir}
+                      workdir={lane.workdir}
+                      label={lane.label}
+                      taskCount={lane.taskCount}
+                      visibleColumns={lane.visibleColumns}
+                      tasksByColumn={lane.tasksByDisplayColumn}
+                      tasksById={tasksById}
+                      childCountsByParent={childCountsByParent}
                       onOpen={setSelected}
-                      onDiff={setDiffTask}
-                      onMarkDone={markDone}
-                      onArchive={archive}
-                      onUnarchive={unarchive}
-                      emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
                       selectedTaskId={selected?.id ?? null}
                       onContextMenu={openTaskMenu}
-                      childCountsByParent={childCountsByParent}
                     />
                   ))}
                 </div>

@@ -1,53 +1,60 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Package, Paperclip, Pause, Play, Square, Terminal, Trash2, Workflow } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { abbreviateHome, cn } from "@/lib/utils";
+import { ListTodo, Paperclip } from "lucide-react";
+import { Card } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
+import { cardStateLabel } from "@/lib/card-state";
+import { displayColumnMeta, toDisplayColumn } from "@/lib/display-columns";
+import { AGE_BADGE_MIN_MS, formatAge } from "@/lib/board-status";
+import { useMinuteNow } from "@/lib/minute-tick";
 import { AgentIcon } from "./AgentIcon";
 
 interface Props {
   task: Task;
-  homeDir: string;
-  onStart: (t: Task) => void;
-  onCancel: (t: Task) => void;
-  onDelete: (t: Task) => void;
+  /** taskId -> Task over the full board — used to look up a child's parent
+   *  title (folded into a tooltip, not shown as its own line — see the
+   *  compact-card design note below). Stable reference across renders
+   *  where the underlying task list didn't change (see Column.tsx). */
+  tasksById: Map<string, Task>;
+  /** parentTaskId -> sub-task progress, folded into the state badge for a
+   *  parent card. */
+  childCountsByParent: Map<string, { merged: number; total: number }>;
   onOpen: (t: Task) => void;
-  onDiff: (t: Task) => void;
-  onMarkDone: (t: Task) => void;
-  onArchive: (t: Task) => void;
-  onUnarchive: (t: Task) => void;
-  /** True when this task is the one currently open in the run panel — App.tsx
-   *  passes `task.id === selected?.id`. Suppresses the unread dot while the
-   *  user is actively watching the task (messages streamed while open are
-   *  marked seen on close, not shown as unread in the meantime). */
+  /** True when this task is the one currently open in the run panel.
+   *  Suppresses the unread dot while the user is actively watching it. */
   isOpen?: boolean;
-  /** Right-click (or keyboard menu-key) on the card. `pos` is where App.tsx's
-   *  task context menu should anchor — omitted entirely when the caller
-   *  doesn't wire it up (no menu to open). */
+  /** Right-click (or keyboard menu-key) on the card. This is the card's
+   *  ACTION SURFACE — see the doc comment below. */
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
-  /** parentTaskId -> merged/total sub-task counts over the whole board.
-   *  Only read for a PARENT pipeline task (one with `pipelineStage` set), to
-   *  render its build progress. App.tsx memoizes the map, so a column whose
-   *  cards are otherwise unchanged still bails out of re-rendering. */
-  childCountsByParent?: Map<string, { merged: number; total: number }>;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu, childCountsByParent }: Props) {
+/**
+ * Compact by design: shows exactly subject (title), harness (agent), and
+ * state (one badge), plus a small set of at-a-glance count signals.
+ * Everything else that used to live on the card face — workdir,
+ * branch/baseRef, model/mode, prompt preview, and every action button — is
+ * reachable two other ways: the run panel (click the tile) and the task
+ * context menu (right-click), which `buildTaskContextMenu` already builds
+ * with Run / Stop / Mark done / Archive / View changes / Delete and more.
+ * Dropping the buttons costs no reachability, which is what makes a card
+ * this small viable across a swimlane board's six columns per project.
+ */
+function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen, isOpen, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
+  const parentTask = task.parentTaskId ? tasksById.get(task.parentTaskId) : undefined;
+  const childProgress = task.pipelineStage != null ? childCountsByParent.get(task.id) : undefined;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
     // the user has to take the explicit unarchive action first. A pipeline
-    // task sitting on one of the stage columns is undraggable for a
-    // different reason: a human yanking it elsewhere mid-auto-advance would
-    // desync `pipelineStage` from `column`. Once it lands on
-    // blocked/ready/review/done it's an ordinary draggable card again.
+    // task mid-flight (one of the stage columns) is also undraggable — a
+    // human yanking it to another column mid-auto-advance would desync
+    // pipelineStage from column. Once it reaches blocked/ready/review/done
+    // it's a normal draggable card again.
     disabled: archived || PIPELINE_STAGE_COLUMNS.includes(task.column),
   });
 
@@ -55,61 +62,69 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
     ? { transform: CSS.Translate.toString(transform) }
     : undefined;
 
-  // Button precedence: Answer > Stop > Open > Run.
-  //  - Answer when at least one interaction (AskUserQuestion / ExitPlanMode /
-  //    tool-approval) is pending OR codex flipped the task to
-  //    `blocked` via the approval-prompt heuristic. Opens the run panel; Stop
-  //    moves to a trailing icon slot so the user can still cancel.
-  //  - Stop while the agent process is live (running OR blocked-awaiting-user).
-  //  - Open once any run has reached succeeded/running/orphaned — there's
-  //    something worth re-reading; Run stays reachable from inside the panel.
-  //  - Run otherwise (no openable history yet, or only failed/cancelled).
-  const active = task.column === "running" || task.column === "blocked";
-  const openable = task.hasOpenableRun;
-  // Combine structured interactions with codex's narrative `blocked` signal.
-  // The latter has no answerable payload — the user resolves it from the run
-  // panel — but it represents the same "waiting on you" state to the user.
-  // When the only signal is `blocked` (no structured questions), we label the
-  // call-to-action "Review" instead of "Answer" to avoid promising a Q&A flow
-  // the panel can't deliver.
   const pendingCount = task.pendingInteractionCount;
   const blocked = task.column === "blocked";
-  // Three pipeline states join the amber-ring club, because in every one of
-  // them the human is the only thing that moves the task forward and the
-  // card would otherwise read as a healthy "running":
-  //  - awaitingHandBack: a build child whose work is done but not handed back.
-  //  - gateParked: a parent parked at its stage gate by a conversation turn
-  //    (RC-6 refuses to advance a run whose origin isn't "pipeline-stage").
-  //  - stalledSince: the turn-stall watchdog's soft "may be stuck" mark.
+  // awaitingHandBack joins the amber-ring club: a build child whose work is
+  // done but not handed back is waiting on the human exactly like a pending
+  // question is. gateParked (a parent pipeline task parked at its gate by a
+  // conversation turn) and stalledSince (the turn-stall watchdog's "may be
+  // stuck" mark) join for the same reason: in all three the human is the
+  // only thing that moves the task forward, and all three previously hid
+  // behind a healthy-looking card.
   const awaiting = pendingCount > 0 || blocked || task.awaitingHandBack === true
     || task.gateParked === true || task.stalledSince != null;
-  const awaitingLabel =
-    pendingCount > 1 ? `Answer (${pendingCount})`
-    : pendingCount === 1 ? "Answer"
-    : "Review";
-
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
-  const runningSubagents = task.runningSubagents ?? 0;
-  // Build progress for a PARENT pipeline task. Children carry
-  // `parentTaskId`, so a child never looks itself up here.
-  const childProgress = task.pipelineStage != null ? childCountsByParent?.get(task.id) : undefined;
+
+  // The single "state" string (priority + wording in lib/card-state.ts).
+  // Collapses what used to be up to 4 separate badges (pipeline-stage,
+  // revision suffix, terminal count, running-subagents) into one line —
+  // those secondary counts are still visible in RunPanel (terminal count)
+  // or have their own surface there (running subagents get tabs).
+  const stageLabel = cardStateLabel(task);
+  const stateSuffix = [
+    task.pipelineStage && task.revisionCount > 0 ? `rev ${task.revisionCount}` : null,
+    childProgress ? `${childProgress.merged}/${childProgress.total} sub-tasks` : null,
+  ].filter(Boolean).join(" · ");
+  // A gate-parked card sits on a stage column with nothing running — the
+  // pulsing "actively mid-stage" dot would be a lie there.
+  const isActivelyMidStage = task.pipelineStage != null && PIPELINE_STAGE_COLUMNS.includes(task.column)
+    && !task.gateParked;
+  // Time-in-column rot signal, only where dwell time means "a human hasn't
+  // acted": review and blocked. Hidden for the first hour (sub-hour dwell is
+  // normal flow) and on archived cards. `updatedAt` is bumped by the column
+  // transition, so "since last update" is "since it landed here" unless the
+  // user actively touched the task — in which case resetting is the point.
+  const now = useMinuteNow();
+  const ageMs = now - task.updatedAt;
+  const showAge = !archived && (task.column === "review" || task.column === "blocked") && ageMs >= AGE_BADGE_MIN_MS;
+  // Static state-color dot, shown for every card so a task's place in the
+  // (now-merged) display-column taxonomy reads without opening it. Skipped
+  // only when the pulsing dot below already covers the exact same signal
+  // (an actively-mid-stage pipeline task) — showing both would be a
+  // redundant double-dot for the same "in-progress" state.
+  const stateDotClass = displayColumnMeta(toDisplayColumn(task.column)).dotClass;
+  const sentCount = task.sentFiles?.length ?? 0;
+  const todo = task.todoProgress;
 
   return (
     <Card
       ref={setNodeRef}
       style={style}
       className={cn(
-        "relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
-        type.borderClass,
+        "relative flex cursor-grab select-none flex-col gap-0.5 border-border/60 border-l-4 px-2.5 py-1.5 hover:border-border transition-colors",
+        // A pipeline sub-task gets a distinct border color instead of its
+        // task-type color, so it reads as "part of a build" at a glance —
+        // the "part of <parent>" text is folded into the title's tooltip
+        // instead of its own line, to keep the tile compact.
+        parentTask ? "border-l-primary" : type.borderClass,
         isDragging && "opacity-50",
-        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background",
+        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
         archived && "cursor-default opacity-60",
       )}
-      // `onClick` (open) stays untouched by the addition below — a
-      // right-click never opens the panel, only `onContextMenu` fires for it.
       onClick={() => onOpen(task)}
-      // dnd-kit's `useDraggable` above is unaffected by right-click: its
+      title={parentTask ? `${task.title} — part of "${parentTask.title}"` : task.title}
+      // dnd-kit's `useDraggable` is unaffected by right-click: its
       // `PointerSensor` bails on `event.button !== 0`, so a right-click can
       // never arm a drag — `{...listeners}` and this handler don't fight.
       onContextMenu={(e) => {
@@ -122,16 +137,12 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         const r = e.currentTarget.getBoundingClientRect();
         onContextMenu(task, fromKeyboard ? { x: r.left, y: r.top } : { x: e.clientX, y: e.clientY });
       }}
-      // The card is focusable (dnd-kit's `attributes` below add
-      // `tabIndex=0`), so a right-click would otherwise focus it and WebKit
-      // scrolls a partially-visible card into view inside `.kanban-scroll`;
-      // the board would visibly jump (and focus would land on the card)
-      // under the freshly-opened menu. Only suppress the default for the
-      // right button — left-click focus/drag
-      // behavior (dnd-kit's `PointerSensor`, wired via `{...listeners}`
-      // below as `onPointerDown`, so there's no prop collision here) is
-      // untouched, and `contextmenu` still fires after a default-prevented
-      // `mousedown`.
+      // The card is focusable (dnd-kit's `attributes` add `tabIndex=0`), so
+      // a right-click would otherwise focus it and WebKit scrolls a
+      // partially-visible card into view; the board would visibly jump under
+      // the freshly-opened menu. Only suppress the default for the right
+      // button — left-click focus/drag behavior is untouched, and
+      // `contextmenu` still fires after a default-prevented `mousedown`.
       onMouseDown={(e) => {
         if (e.button === 2) e.preventDefault();
       }}
@@ -142,214 +153,90 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         // Static dot for "has assistant messages you haven't read yet" —
         // deliberately unanimated (the amber awaiting-pulse ring is the only
         // animated attention state). Pinned to the corner so it coexists
-        // with that ring (an outline) without visual conflict, and sits
-        // above the header's row-1 harness badge in the DOM/paint order.
+        // with that ring (an outline) without visual conflict.
         <span
-          // -1.5 offsets keep the dot's background halo clear of the
-          // awaiting state's ring-offset outline instead of notching it.
           className="absolute -top-1.5 -right-1.5 size-2.5 rounded-full bg-info ring-2 ring-background"
           title="New messages"
           role="img"
           aria-label="New messages"
         />
       )}
-      <CardHeader className="pb-2 space-y-1">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-            <TypeIcon
-              className={cn("size-3.5 shrink-0", type.iconClass)}
-              aria-label={type.label}
-            />
-            {task.pipelineStage != null && (
-              <Badge
-                variant="outline"
-                className={cn(
-                  "gap-1 text-[10px] shrink-0",
-                  task.pausedAt != null ? "text-warning" : "text-muted-foreground",
-                )}
-                title={
-                  task.pausedAt != null
-                    ? `Pipeline paused at the "${task.pipelineStage}" stage — auto-advance is off`
-                    : `Pipeline stage: ${task.pipelineStage}`
-                }
-              >
-                {task.pausedAt != null ? <Pause className="size-3" /> : <Workflow className="size-3" />}
-                {task.pipelineStage}
-                {task.revisionCount > 0 && <span className="opacity-70">· rev {task.revisionCount}</span>}
-              </Badge>
+      {/* `items-start`, not `items-center`: the title clamps to TWO lines, so
+          centring would float the type icon and the count badges against the
+          middle of a tall title instead of its first line. */}
+      <div className="flex min-w-0 items-start gap-1.5">
+        <TypeIcon className={cn("mt-px size-3 shrink-0", type.iconClass)} aria-label={type.label} />
+        {/* Two lines, not one. Measured at a 1440px viewport the title box is
+            163px — about 26 characters — and real task titles run 37-57, so a
+            single truncated line hid roughly half of most titles and pushed
+            the user to hover or open the panel just to read what a card IS.
+            The clamp buys that back out of the one axis there is room in:
+            lanes stack vertically and the page scrolls, while a lane with all
+            six columns populated already overflows 1440px horizontally by
+            ~336px, so widening the column instead would make the worse
+            problem worse. Fixed at two lines (not free wrap) so every card
+            stays the same height and the grid still scans. */}
+        <span className="min-w-0 flex-1 line-clamp-2 text-xs font-medium leading-tight">{task.title}</span>
+        {/* Two count signals kept on the face rather than folded into the
+            state line: both answer "did something land here" for a card the
+            user isn't watching, which the state label can't express. Icon +
+            number only — no Badge chrome, which the compact tile has no
+            room for. */}
+        {todo && todo.total > 0 && (
+          <span
+            className={cn(
+              "mt-px flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums",
+              todo.completed === todo.total ? "text-success" : "text-muted-foreground",
             )}
-            {childProgress && (
-              <Badge
-                variant="outline"
-                className={cn(
-                  "gap-1 text-[10px] shrink-0",
-                  childProgress.merged === childProgress.total ? "text-success" : "text-muted-foreground",
-                )}
-                title={`${childProgress.merged} of ${childProgress.total} sub-tasks merged back`}
-              >
-                <Package className="size-3" />
-                {childProgress.merged}/{childProgress.total}
-              </Badge>
-            )}
-            {runningSubagents > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px] shrink-0"
-                title={`${runningSubagents} background task${runningSubagents > 1 ? "s" : ""} running`}
-              >
-                <Bot className="size-3" />
-                {runningSubagents}
-              </Badge>
-            )}
-            {task.openTerminalCount > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px] shrink-0"
-                title={`${task.openTerminalCount} open terminal${task.openTerminalCount > 1 ? "s" : ""}`}
-              >
-                <Terminal className="size-3" />
-                {task.openTerminalCount}
-              </Badge>
-            )}
-            {task.todoProgress && task.todoProgress.total > 0 && (
-              <Badge
-                variant="outline"
-                className={cn(
-                  "gap-1 text-[10px] shrink-0",
-                  task.todoProgress.completed === task.todoProgress.total
-                    ? "text-success"
-                    : "text-muted-foreground",
-                )}
-                title={`${task.todoProgress.completed} of ${task.todoProgress.total} tasks done`}
-              >
-                <ListTodo className="size-3" />
-                {task.todoProgress.completed}/{task.todoProgress.total}
-              </Badge>
-            )}
-            {task.sentFiles && task.sentFiles.length > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px] shrink-0"
-                data-testid="sent-files-badge"
-                title={`${task.sentFiles.length} file${task.sentFiles.length === 1 ? "" : "s"} sent · ${[...task.sentFiles]
-                  .sort((a, b) => b.sentAt - a.sentAt)
-                  .slice(0, 5)
-                  .map((f) => sentFileBasename(f.path))
-                  .join(", ")}`}
-              >
-                <Paperclip className="size-3" />
-                {task.sentFiles.length}
-              </Badge>
-            )}
-          </div>
-          <Badge variant="secondary" className="gap-1 shrink-0">
-            <AgentIcon kind={task.agent} className="size-3" />
-            {task.agent}
-          </Badge>
-        </div>
-        {(task.model || task.mode) && (
-          <span className="self-end text-[10px] font-mono text-muted-foreground">
-            {[task.model, task.mode].filter(Boolean).join(" · ")}
+            title={`${todo.completed} of ${todo.total} tasks done`}
+          >
+            <ListTodo className="size-2.5" aria-hidden />
+            {todo.completed}/{todo.total}
           </span>
         )}
-        <CardTitle className="text-sm break-words">{task.title}</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-2">
-        <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
-        <p
-          className="text-[10px] text-muted-foreground/70 font-mono truncate"
-          title={task.workdir}
-        >
-          {abbreviateHome(task.workdir, homeDir)}
-        </p>
-        {(task.branch || task.baseRef) && (
-          <div className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground">
-            <GitBranch className="size-3 shrink-0" />
-            <span className="truncate">
-              {task.branch ?? "(not yet created)"}
-              {task.baseRef && (
-                <span className="ml-1 opacity-70">· {task.baseRef.slice(0, 7)}</span>
-              )}
-            </span>
-          </div>
+        {sentCount > 0 && (
+          <span
+            className="mt-px flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums text-muted-foreground"
+            data-testid="sent-files-badge"
+            title={`${sentCount} file${sentCount === 1 ? "" : "s"} sent · ${[...task.sentFiles!]
+              .sort((a, b) => b.sentAt - a.sentAt)
+              .slice(0, 5)
+              .map((f) => sentFileBasename(f.path))
+              .join(", ")}`}
+          >
+            <Paperclip className="size-2.5" aria-hidden />
+            {sentCount}
+          </span>
         )}
-        <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
-          {archived ? (
-            <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
-              <FolderOpen className="size-3" /> Open
-            </Button>
-          ) : awaiting ? (
-            <Button
-              size="sm"
-              className="gap-1 bg-amber-500 text-amber-950 hover:bg-amber-500/90 focus-visible:ring-amber-500"
-              onClick={() => onOpen(task)}
-              title={pendingCount > 0 ? "Open run panel to answer" : "Agent is waiting on you — open the run panel"}
-            >
-              <MessageCircleQuestion className="size-3" />
-              {awaitingLabel}
-              <ArrowRight className="size-3" />
-            </Button>
-          ) : active ? (
-            <Button size="sm" variant="destructive" onClick={() => onCancel(task)}>
-              <Square className="size-3" /> Stop
-            </Button>
-          ) : openable ? (
-            <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
-              <FolderOpen className="size-3" /> Open
-            </Button>
-          ) : (
-            <Button size="sm" onClick={() => onStart(task)}>
-              <Play className="size-3" /> Run
-            </Button>
-          )}
-          {!archived && awaiting && active && (
-            <Button size="icon" variant="ghost" onClick={() => onCancel(task)} title="Stop">
-              <Square className="size-3" />
-            </Button>
-          )}
-          {!archived && task.column === "review" && (
-            <Button size="sm" variant="outline" onClick={() => onMarkDone(task)} title="Mark this task as done">
-              <CheckCircle2 className="mr-1 size-3" /> Done
-            </Button>
-          )}
-          {!archived && (task.column === "done" || active) && (
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={() => onArchive(task)}
-              title={active ? "Stop the running agent and archive task" : "Archive task"}
-            >
-              <Archive className="size-3" />
-            </Button>
-          )}
-          {archived && (
-            <Button size="icon" variant="ghost" onClick={() => onUnarchive(task)} title="Unarchive task">
-              <ArchiveRestore className="size-3" />
-            </Button>
-          )}
-          <Button size="icon" variant="ghost" onClick={() => onDiff(task)} title="View changes (git diff)">
-            <GitCompare className="size-3" />
-          </Button>
-          <Button size="icon" variant="ghost" onClick={() => onDelete(task)} title="Delete task">
-            <Trash2 className="size-3" />
-          </Button>
-        </div>
-      </CardContent>
-      {/* The "waiting on you" glow. A separate overlay whose OPACITY pulses,
-          rather than animating `filter: drop-shadow` on the card itself:
-          filter animations re-rasterize the whole card on the CPU every
-          frame (60–120 Hz, for as long as the card is awaiting), whereas an
-          opacity animation is compositor-only. The shadow is static and
-          paints outside the overlay's box, so the overlay is invisible over
-          the card's own content and `pointer-events-none` keeps clicks and
-          drags untouched. */}
-      {awaiting && (
-        <span
-          aria-hidden
-          className="pointer-events-none absolute inset-0 rounded-[inherit] animate-awaiting-pulse motion-reduce:animate-none"
-          style={{ boxShadow: "0 0 14px hsl(var(--warning) / 0.85)" }}
-        />
-      )}
+      </div>
+      <div className="flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
+        <AgentIcon kind={task.agent} className="size-3 shrink-0" />
+        <span className="shrink-0">{task.agent}</span>
+        <span className="opacity-40">·</span>
+        {isActivelyMidStage ? (
+          // The "agent actively working" pulse — deliberately NOT the amber
+          // awaiting-pulse the card's outer ring uses, which means the
+          // opposite state ("waiting on a human").
+          <span className="relative inline-flex size-1.5 shrink-0">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success-solid/60 opacity-75" />
+            <span className="relative inline-flex size-1.5 rounded-full bg-success-solid" />
+          </span>
+        ) : (
+          <span className={cn("size-1.5 shrink-0 rounded-full", stateDotClass)} />
+        )}
+        <span className="truncate">
+          {stageLabel}
+          {stateSuffix && ` · ${stateSuffix}`}
+        </span>
+        {showAge && (
+          <span
+            className="ml-auto shrink-0 rounded bg-muted px-1 text-[9px] tabular-nums"
+            title={`In ${stageLabel.toLowerCase()} for ${formatAge(ageMs)}`}
+          >
+            {formatAge(ageMs)}
+          </span>
+        )}
+      </div>
     </Card>
   );
 }
@@ -357,8 +244,9 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
 // Default shallow-props comparator is correct here (unlike Column, which
 // needs a custom comparator for its array prop): `task` is a single object
 // whose identity App.tsx's `reconcileById` preserves across polls when
-// unchanged, and every other prop is either a primitive (`homeDir`) or a
-// `useCallback`-stabilized handler. dnd-kit's `useDraggable` lives inside
-// the component body, so memoizing the outer function doesn't interfere
-// with drag state — that's driven by dnd-kit's own context, not props.
+// unchanged, `tasksById`/`childCountsByParent` are useMemo'd in App.tsx
+// (reference-stable when unchanged), and `onOpen`/`onContextMenu` are
+// `useCallback`-stabilized. dnd-kit's `useDraggable` lives inside the
+// component body, so memoizing the outer function doesn't interfere with
+// drag state — that's driven by dnd-kit's own context, not props.
 export const TaskCard = memo(TaskCardImpl);
