@@ -323,6 +323,26 @@ export class AgetorClient {
     const qs = harnessId ? `?harness=${encodeURIComponent(harnessId)}` : "";
     return this.req("POST", `/agent-models${qs}`);
   }
+
+  // ── headless folder/file picking ────────────────────────────────────────
+  /** `POST /refs/pick` — in the packaged app (native dialog) or under the
+   *  `AGETOR_FAKE_PICK_REFS_DIR` test seam, resolves directly to `{ refs }`.
+   *  Headless (no native bridge), resolves to `{ candidates }`: a bounded,
+   *  prioritized, deduped list of absolute directory paths the caller (the
+   *  TUI's `DirPickerOverlay`) lets the user browse/filter/manually override
+   *  before calling `selectPickedRef`. */
+  pickRefs(mode: "files" | "folder"): Promise<{ candidates?: string[]; refs?: TaskReference[] }> {
+    return this.req("POST", "/refs/pick", { mode });
+  }
+  /** `POST /refs/pick/select` — resolve a chosen candidate (or a manually
+   *  typed, already-absolute path) into the final `{ refs }` result: a
+   *  single directory reference in `"folder"` mode, or the directory's
+   *  immediate regular (non-hidden) files in `"files"` mode. A 400 (path
+   *  missing / not a directory / inaccessible) surfaces as a thrown
+   *  `ApiError` whose `.message` is the server's `error` string. */
+  selectPickedRef(path: string, mode: "files" | "folder"): Promise<{ refs: TaskReference[] }> {
+    return this.req("POST", "/refs/pick/select", { path, mode });
+  }
 }
 
 /** Body for POST /tasks (mirrors the server's accepted fields). */
