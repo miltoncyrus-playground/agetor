@@ -540,10 +540,10 @@ export const api = {
    *  reliable way to turn a user pick into an absolute path. Returns `[]` on
    *  cancel. `isDirectory` follows `mode`. */
   pickRefs: (mode: "files" | "folder", startingFolder?: string) =>
-    j<{ refs: TaskReference[] }>("/refs/pick", {
+    j<{ refs?: TaskReference[]; candidates?: string[] }>("/refs/pick", {
       method: "POST",
       body: JSON.stringify({ mode, startingFolder }),
-    }).then((r) => r.refs),
+    }).then((r) => r.refs ?? []),
   /** Resolve absolute paths (pulled from a drag/drop's file:// URLs) into
    *  references — the server stats each for directory-ness and drops any
    *  that no longer exist. */
