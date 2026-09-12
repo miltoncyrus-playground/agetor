@@ -88,6 +88,7 @@ import {
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
 import { listProjectFiles } from "./project-files.ts";
+import { headlessPickCandidates, selectPick } from "./refs-pick.ts";
 import {
   addGitHubDiscussionComment,
   addGitHubProjectItem,
@@ -4327,7 +4328,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               return json({ refs: [] }, { headers: corsHeaders(req) }); // gone / unreadable — cancelled pick
             }
           }
-          if (!native) return notAvailableHeadless(req);
+          if (!native) {
+            return json(
+              { candidates: headlessPickCandidates(), refs: [] },
+              { headers: corsHeaders(req) },
+            );
+          }
           const paths = await native.openFileDialog({
             startingFolder,
             canChooseFiles: mode === "files",
@@ -4337,6 +4343,28 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // The native bridge returns a comma-joined string; an empty first
           // element means the user cancelled.
           return json({ refs: refsFromPaths(paths) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Turns a chosen candidate (from /refs/pick's `candidates` list) or a
+      // manually-typed absolute path into the final `{ refs }` result —
+      // folder mode in one step, files mode by listing the directory's
+      // immediate regular files. No `native` dependency (like /refs/resolve
+      // and /files/index): this route only stats/reads a path the caller
+      // already named, so it works identically headless or packaged.
+      "/refs/pick/select": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: unknown;
+            mode?: "files" | "folder";
+          };
+          const rawPath = typeof body.path === "string" ? body.path : "";
+          const mode = body.mode === "folder" ? "folder" : "files";
+          if (!rawPath) {
+            return json({ error: "path is required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = selectPick(rawPath, mode);
+          return json(result, { status: "error" in result ? 400 : 200, headers: corsHeaders(req) });
         }),
       },
 
