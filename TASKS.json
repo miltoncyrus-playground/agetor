@@ -1,30 +1,17 @@
 {
   "subtasks": [
     {
-      "id": "backend-refs-pick",
-      "title": "Headless /refs/pick candidate enumeration + /refs/pick/select endpoint",
-      "prompt": "Implement the server side of headless folder/file picking, per PLAN.md's \"Server: candidate enumeration + selection\", \"src/bun/server.ts changes\", \"Server tests\", and \"Webview: src/mainview/lib/api.ts\" sections.\n\n1. Create src/bun/refs-pick.ts exporting MAX_PICK_CANDIDATES = 50, headlessPickCandidates(): string[], and selectPick(rawPath, mode: \"files\"|\"folder\"): { refs: TaskReference[] } | { error: string }, exactly as specified in PLAN.md (priority order: task workdirs by updatedAt desc, then non-dot git-repo dirs one level under homedir() sorted alphabetically, then homedir() itself; dedup+cap via realpathSync with silent drop on failure; selectPick validates absolute path, existence, directory-ness, and for \"files\" mode lists immediate non-hidden regular files sorted by localeCompare).\n2. Edit src/bun/server.ts: replace the `if (!native) return notAvailableHeadless(req);` branch in the /refs/pick route with the candidates response described in PLAN.md, and add the new POST /refs/pick/select route immediately after /refs/pick, exactly as specified (including its request/response shape and status codes). Do not touch the fake-seam or native-dialog branches of /refs/pick.\n3. Write src/bun/refs-pick.test.ts covering every case listed under PLAN.md's \"New file: src/bun/refs-pick.test.ts\".\n4. Edit src/bun/refs-endpoint.test.ts: replace the now-incorrect \"/refs/pick is unavailable in headless mode...\" test and add the new tests listed under PLAN.md's \"Edits to existing src/bun/refs-endpoint.test.ts\", leaving every other existing test in that file untouched.\n5. Edit src/mainview/lib/api.ts's pickRefs per PLAN.md's \"Webview\" section (defensive-only change, no new UI).\n\nRun `bun run typecheck` and `bun test src/bun/refs-pick.test.ts src/bun/refs-endpoint.test.ts` until green.",
+      "id": "webview-folder-picker",
+      "title": "Webview folder/file picker for headless mode",
+      "prompt": "Implement the full feature described in PLAN.md end to end, in this one slice:\n\n1. `src/mainview/lib/api.ts` — change `pickRefs` to return a discriminated `PickRefsResult` (`{kind:\"refs\",refs}` | `{kind:\"candidates\",candidates}`), discriminating on `r.candidates !== undefined` (not falsy `refs`). Export `PickRefsResult`. Add `selectPickedRef(path, mode)` hitting `POST /refs/pick/select`, letting `j`'s thrown `ApiError` carry the 400 error message.\n\n2. New file `src/mainview/components/kanban/FolderPickerDialog.tsx` — dialog with a `list`/`fileslist` state machine per PLAN.md §2: manual-path input (separate from the filter input) resolving `~`/relative paths like `DirPickerOverlay.resolveManualPath` (copy locally, drop `~` expansion if `node:os` `homedir()` isn't usable client-side — verify by grepping `from \"node:path\"` under src/mainview first), case-insensitive substring filter over candidates (no re-sort/dedupe), candidate-row click → `selectPickedRef`; folder mode closes via `onDone(refs)`, files mode shows the returned refs as a second-level list with Back; a file row click resolves directly via `onDone([fileRefs[i]])` (no network call). Errors surface inline (`rowError`/`manualError`) without closing the dialog. Cancel/Escape → `onDone([])`. Use `Dialog` from `@/components/ui/dialog`; candidate/file rows are real `<button>` elements for keyboard accessibility (AC-12). Add the test ids listed in PLAN.md §2.\n\n3. `src/mainview/components/kanban/ReferencesPicker.tsx` — add `dialog` state, update `pick()` to branch on `result.kind`, conditionally render `{dialog && <FolderPickerDialog .../>}` (mount-per-open, not always-mounted) with `onDone` clearing `dialog` and appending picked refs if any.\n\n4. `e2e/fixtures.ts` — add an optional `options?: { fakePickRefsDir?: boolean }` (default true) to `provisionBackend`, only setting `AGETOR_FAKE_PICK_REFS_DIR` when true; add a new `headlessPickBackend` fixture (own port block after 4900, e.g. 5000/5100) calling it with `{ fakePickRefsDir: false }`. Do not change default behavior for any existing fixture/call site.\n\n5. New file `e2e/folder-picker-dialog.spec.ts` using `headlessPickBackend`, covering: candidate click → chip appears; manual entry (invalid path shows inline error and stays open, then valid path succeeds); files-mode drill-in (plant files under `backend.dataDir`, pick it, click one file row, assert exactly one chip, plus Back returns to the candidate list and Cancel adds nothing).\n\nDo not touch `src/bun/refs-pick.ts`, `src/bun/server.ts`, `src/cli/**`, `NewTaskForm.tsx`, or `RunPanel.tsx`. Run `bun run typecheck` and `bun test` and keep them green; run the new and existing e2e specs.",
       "dependsOn": [],
-      "acceptanceCriteria": ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5", "AC-6", "AC-7", "AC-8", "AC-15", "AC-16"],
+      "acceptanceCriteria": ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5", "AC-6", "AC-7", "AC-8", "AC-9", "AC-10", "AC-11", "AC-12"],
       "files": [
-        "src/bun/refs-pick.ts",
-        "src/bun/server.ts",
-        "src/bun/refs-pick.test.ts",
-        "src/bun/refs-endpoint.test.ts",
-        "src/mainview/lib/api.ts"
-      ]
-    },
-    {
-      "id": "cli-tui-dir-picker",
-      "title": "CLI client methods + interactive TUI DirPickerOverlay + Dashboard wiring",
-      "prompt": "Implement the CLI/TUI side of headless folder/file picking, per PLAN.md's \"CLI: src/cli/api-client.ts\", \"TUI: new src/cli/tui/DirPickerOverlay.tsx\", \"TUI: src/cli/tui/Dashboard.tsx wiring\", and \"TUI test\" sections. Work against the HTTP contract exactly as documented in PLAN.md (POST /refs/pick returns either { refs } for a direct result or { candidates } for headless enumeration; POST /refs/pick/select takes { path, mode } and returns { refs } with 200 or { error } with 400) — do not depend on or read src/bun/refs-pick.ts or src/bun/server.ts; build entirely against the documented contract and mock it in tests.\n\n1. Add pickRefs and selectPickedRef methods to AgetorClient in src/cli/api-client.ts as specified.\n2. Create src/cli/tui/DirPickerOverlay.tsx implementing the full state machine described in PLAN.md (\"kind\" -> \"loading\" -> \"dirlist\"/\"manual\"/\"fileslist\" screens), matching AnswerOverlay.tsx's component style/pattern. Implement every behavior listed: direct-result short-circuit, candidate filtering (case-insensitive substring), keyboard navigation, manual path entry with ~ expansion and relative-path resolution against process.cwd(), inline error-and-retry on invalid manual paths, back-out semantics at each screen, and the files-mode two-level flow.\n3. Edit src/cli/tui/Dashboard.tsx: add \"pick\" to the Mode union, import DirPickerOverlay/appendReferences/TaskReference, add the `r` keybinding, the pick-mode render block, and the Footer hint updates, exactly as specified in PLAN.md's wiring section.\n4. Write src/cli/tui/DirPickerOverlay.test.tsx covering every scenario listed in PLAN.md's TUI test section, using a hand-built fake AgetorClient and the same ink-testing-library harness pattern as AnswerOverlay.test.tsx.\n\nRun `bun run typecheck` and `bun test src/cli/tui/DirPickerOverlay.test.tsx src/cli/tui/Dashboard.test.tsx` until green.",
-      "dependsOn": [],
-      "acceptanceCriteria": ["AC-9", "AC-10", "AC-11", "AC-12", "AC-13", "AC-14"],
-      "files": [
-        "src/cli/api-client.ts",
-        "src/cli/tui/DirPickerOverlay.tsx",
-        "src/cli/tui/Dashboard.tsx",
-        "src/cli/tui/DirPickerOverlay.test.tsx"
+        "src/mainview/lib/api.ts",
+        "src/mainview/components/kanban/FolderPickerDialog.tsx",
+        "src/mainview/components/kanban/ReferencesPicker.tsx",
+        "e2e/fixtures.ts",
+        "e2e/folder-picker-dialog.spec.ts"
       ]
     }
   ]
