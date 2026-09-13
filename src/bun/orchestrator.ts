@@ -181,6 +181,7 @@ import { readRepoProfile, renderProjectCommands, ensureDependenciesInstalled } f
 import { extractHandoff, renderHandoff } from "./stage-handoff.ts";
 import { writeReviewDiff, removeReviewDiff } from "./review-diff.ts";
 import { runPipelinePrecheck, precheckPasses, precheckEnabled, testerSkipEnabled, precheckPassedChecks } from "./pipeline-precheck.ts";
+import { filterClaudeMdForPipeline } from "./claude-md-filter.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -1128,6 +1129,61 @@ export function pipelineLeanContext(task: Task, harnessKind: AgentKind, cwd: str
   };
 }
 
+/** Env kill-switch for O-14 (mirrors leanContextEnabled/autoInstallEnabled's
+ *  convention): `AGETOR_PIPELINE_CLAUDE_MD_FILTER=0` restores the raw,
+ *  unfiltered worktree CLAUDE.md for pipeline/child sessions — today's O-2
+ *  behavior, byte for byte. */
+function claudeMdFilterEnabled(): boolean {
+  return process.env.AGETOR_PIPELINE_CLAUDE_MD_FILTER !== "0";
+}
+
+/**
+ * O-14: narrow the CLAUDE.md O-2 re-injects for a pipeline/child claude-code
+ * turn to the one matching "Agent command shape" harness bullet and drop the
+ * JubarteAI section outright (see docs/plans/pipeline-token-efficiency.md
+ * §7/§9 open item and CLAUDE.md's own "Agent command shape" /
+ * "JubarteAI Agent Identity" sections). Writes the filtered copy to
+ * `<cwd>/.agetor/CLAUDE.filtered.md` — the real `CLAUDE.md` on disk is never
+ * touched. `claudeMdPath` is `pipelineLeanContext`'s own
+ * `appendSystemPromptFile` (already null when the worktree has none, or when
+ * O-2 itself is off/inapplicable) — this function only narrows a path that's
+ * already been decided on, it never turns a null into a path or vice versa
+ * except in the two fail-open cases below. Fails open at every step: any
+ * error here falls back to `claudeMdPath` unchanged, so a pipeline turn is
+ * never blocked by this optimisation and, at worst, sees the same
+ * un-narrowed file O-2 already re-injects today.
+ */
+export function resolvePipelineSystemPromptFile(
+  claudeMdPath: string | null,
+  agentKind: AgentKind,
+  cwd: string,
+): string | null {
+  if (claudeMdPath == null) return null;
+  if (!claudeMdFilterEnabled()) return claudeMdPath;
+  let original: string;
+  try {
+    original = readFileSync(claudeMdPath, "utf8");
+  } catch {
+    return claudeMdPath;
+  }
+  let filtered: string;
+  try {
+    filtered = filterClaudeMdForPipeline(original, { agentKind });
+  } catch {
+    return claudeMdPath;
+  }
+  if (filtered.trim() === "") return null; // degenerate output — same as "no CLAUDE.md" (O-2's existing null path)
+  try {
+    const outDir = join(cwd, ".agetor");
+    mkdirSync(outDir, { recursive: true });
+    const outPath = join(outDir, "CLAUDE.filtered.md");
+    writeFileSync(outPath, filtered);
+    return outPath;
+  } catch {
+    return claudeMdPath;
+  }
+}
+
 /**
  * Effort tiering next to model tiering (O-8). Effort drives thinking tokens
  * AND tool-call count, and both measured pipelines ran every stage and
@@ -1475,6 +1531,10 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   // up.
   onChunk("user", normalizeUserText(promptWithRefs));
 
+  const lean = pipelineLeanContext(task, harness.kind, prepared.cwd);
+  const leanContext = lean
+    ? { ...lean, appendSystemPromptFile: resolvePipelineSystemPromptFile(lean.appendSystemPromptFile ?? null, harness.kind, prepared.cwd) }
+    : lean;
   const { agent, message } = await spawnAgentOrFail({
     taskId,
     runId,
@@ -1493,7 +1553,7 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
         ? { geminiSessionId: sessionId }
         : { fxSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: resolveRunModel(task, harness.kind) ?? DEFAULT_MODEL[harness.kind], effort: resolveRunEffort(task, harness.kind), fast: task.fast, maxMode: task.maxMode, leanContext: pipelineLeanContext(task, harness.kind, prepared.cwd) },
+    opts: { mode: task.mode, model: resolveRunModel(task, harness.kind) ?? DEFAULT_MODEL[harness.kind], effort: resolveRunEffort(task, harness.kind), fast: task.fast, maxMode: task.maxMode, leanContext },
   });
   if (!agent) return { error: `failed to start agent: ${message}` };
   registerActiveRun(runId, taskId, task, agent);
