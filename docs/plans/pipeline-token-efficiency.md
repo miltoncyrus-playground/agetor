@@ -245,3 +245,18 @@ Paid evals (claude-opus-5, effort high, 1 run each): all 5 — `decompose-files`
 §6 has the full before/after from re-running both baseline tickets live against `/home/mcyrus/Portfolio`. The branch was fast-forwarded into `main` as one ref move (`8af6c3a..3f297ce`, 2026-09-12) rather than pulled in per commit — it was already a clean ancestor-preserving fast-forward with no divergence from `main`, so there was nothing to rebase or squash.
 
 Still open: (1) O-8's 3-runs-each validation across `low`/`medium`/`high` (§7 open question 4); (2) whether to update the worktree root or CLAUDE.md-suppression approach (O-2) if a repo's own CLAUDE.md ever needs the operator-level one too; (3) the cross-task shared-memory tier from `pipeline-shared-memory.md` §4, once O-4/O-11's within-pipeline redundancy fix has been running long enough to judge its marginal value.
+
+## 9. Follow-up (2026-09-13): cutting redundant checks and unbounded child debugging
+
+A later live pipeline run against this repo burned 38.8M tokens and traced back to two confirmed root causes on top of the O-1…O-11 baseline above: the Tester stage was handed a full re-run of checks the precheck had already confirmed green (Finding 1), and there was no fast/scoped-check alternative to a full-project check for a build child to lean on while debugging, so a child would iterate against the full, slow command repeatedly (Finding 2), which compounds with §2.3's "quadratic in message count" factor — each redundant full-project re-run is itself a many-message round trip, and paying that cost once per child multiplies it across however many children a decomposition produces. (Finding 3 ties these together: neither gap is visible in the "as built" table above because both concern the same commands running twice — once at precheck, once again at Tester or at each child's own debugging loop — rather than a new stage or a new call.) O-12 and O-13 below close those two gaps; both are additive to the O-1…O-11 mechanisms and change no previously shipped behavior.
+
+| Item | Where | Verified by | Kill switch |
+| --- | --- | --- | --- |
+| O-12 Tester precheck → project-commands handoff | `repo-profile.ts` `renderProjectCommands` skip-set param; `pipeline-precheck.ts` `precheckPassedChecks`; `pipelinePromptExtras` in `orchestrator.ts` | `repo-profile.test.ts`, `pipeline-precheck.test.ts`, token test file | none, falls back to unfiltered rendering on any error |
+| O-13 scoped/fast check preference + child debugging bound | `repo-profile.ts` `*Scoped` fields and the `<check>:changed` convention; `package.json` `test:changed` + `scripts/test-changed.ts`; `pipeline-prompts.ts` `childBuildPrompt` | `repo-profile.test.ts`, `pipeline-prompts.test.ts` | none, falls back to the full command when no scoped script exists |
+
+**AC-8 decision, verbatim per PLAN.md §2e**: this repository intentionally has no `typecheck:changed` script. `tsc --noEmit` type-checks the whole program as one unit; per-file scoping would under-report cross-file errors (a change in one file can break type-checking in a file that itself didn't change), and true project-reference scoping is disproportionate to this ticket. `--incremental` is noted as a deferred follow-up, not included here.
+
+**Re-run instructions**: run `bun run eval:pipeline:tokens` against a fresh pipeline run whose Tester stage actually spawns — i.e. give it a ticket with an unreferenced AC so the Tester isn't skipped — and confirm the resulting transcript no longer re-runs a check the precheck already confirmed green.
+
+**Still open**: the trimmed pipeline-specific CLAUDE.md non-goal from this follow-up remains open; see the §7 open-questions list above rather than a duplicate note here.
