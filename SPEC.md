@@ -1,68 +1,48 @@
 ## Summary
-When agetor runs headlessly (no native desktop shell available — e.g. the CLI daemon or the terminal UI), a user currently cannot pick a folder or set of files to attach as a task reference: the pick request dead-ends with an "unavailable" response. This feature replaces that dead end with a working, keyboard-driven picking flow: the system offers a relevant, bounded list of candidate directories, and the user can browse, filter, and either select from that list or type a path manually. Selecting a directory yields either a folder reference or a listing of that directory's immediate files, depending on the type of pick requested. The existing desktop (native dialog) picking experience and any existing test-only picking shortcut are unaffected.
+The automated build pipeline currently wastes a large amount of token and time budget in two related ways: a Tester step is told (in prose) that certain checks already passed, yet the same turn still hands it the raw commands to re-run those checks, so it often repeats them anyway; and neither the pipeline nor the underlying project offers a fast, diff-scoped alternative to the full-project checks, so even a small change pays the full cost of a full-suite run, sometimes multiple times within a single session. Separately, a build step with no natural stopping point can spiral into open-ended, unbounded debugging (starting duplicate long-running processes, writing and re-running throwaway verification scripts, extensive trial-and-error cycles) without ever being nudged to consolidate and report status. This work tightens the handoff between automated pre-checks and the Tester step, introduces an opt-in fast-check path that a project can expose for scoped verification, and adds guidance so a build step self-limits its debugging effort and reports partial progress rather than iterating indefinitely.
 
 ## User stories
-- As a user running agetor headlessly (CLI/TUI), when I try to pick a folder for a task, I want to see a list of directories I'm likely to want (places I've already worked in, plus git repositories under my home directory) instead of an error.
-- As a user browsing that candidate list, I want to narrow it by typing part of a path, and to move through it with the keyboard.
-- As a user who doesn't see the directory I want in the list, I want to type the exact path myself instead of being stuck with only the suggested candidates.
-- As a user picking "files" rather than a whole folder, I want to first choose a directory and then choose which of its immediate files to attach, with the ability to back out to the directory list if I change my mind.
-- As a user picking a whole "folder", I want a single selection step that immediately confirms my choice without a second-level listing.
-- As a user, if I cancel out of the picker at the top level, I want the pick to be treated as "nothing selected" rather than an error.
-- As a developer/administrator of a desktop (non-headless) installation, I want this feature to have zero effect on the existing native file/folder picker behavior.
+- As a pipeline operator, I want the Tester step to not re-run a check that was already confirmed to pass, so that pipeline runs don't waste time and tokens on redundant work.
+- As a pipeline operator, I want the pipeline to prefer a fast, change-scoped check over a full-project check when one is available, so that small changes are verified quickly without sacrificing correctness on projects that don't offer a fast path.
+- As a maintainer of a project the pipeline targets, I want to be able to define fast/scoped verification commands that the pipeline will automatically prefer, without being required to define them.
+- As a pipeline operator, I want a build step that gets stuck in a long debugging loop to be nudged toward consolidating and reporting its status, so that a single step cannot silently consume an unbounded share of the pipeline's budget.
+- As a pipeline operator, I want a build step to be discouraged from starting duplicate or parallel long-running verification processes it doesn't need, in favor of the verification tooling already available to it.
 
 ## Acceptance criteria
-AC-1: When picking in headless mode without the test-only picking shortcut active, requesting a pick returns a non-error, bounded list of candidate directories instead of an "unavailable" response.
-AC-2: The candidate list includes every distinct directory the user has already used as a task's working directory, and among those, more recently used directories are ordered ahead of less recently used ones.
-AC-3: The candidate list includes git-repository directories found one level under the user's home directory, excluding hidden (dot-prefixed) directories.
-AC-4: The candidate list includes the user's home directory itself as a fallback entry.
-AC-5: The candidate list never contains duplicate entries, even when two different-looking paths refer to the same real location on disk.
-AC-6: The candidate list never contains more than 50 entries in total.
-AC-7: Selecting a candidate (or a manually typed path) in "folder" pick mode produces a final result representing that single path as a directory reference, with no further steps required.
-AC-8: Selecting a candidate (or a manually typed path) in "files" pick mode produces a final result listing the immediate regular files contained directly within that directory (not files in subdirectories), each represented as a non-directory reference.
-AC-9: In "files" pick mode, after a directory has been chosen and its files are being browsed, the user can back out to the directory-candidate list without losing the ability to choose a different directory.
-AC-10: In "files" pick mode, backing out of the directory-candidate list entirely (without ever selecting a directory) results in an empty selection, not an error.
-AC-11: In "folder" pick mode, backing out of the directory-candidate list results in an empty selection, not an error.
-AC-12: A user can narrow the visible candidates by typing text that is matched against candidate paths as a substring, and the visible list updates to reflect only matching candidates.
-AC-13: A user can navigate the candidate list using the keyboard (moving the highlighted selection up and down) and confirm the currently highlighted candidate.
-AC-14: A user can bypass the candidate list entirely by entering a path manually, and that manually entered path is resolved the same way a selected candidate would be (per AC-7/AC-8 depending on pick mode).
-AC-15: When a pick request returns a direct final result (as in the existing native-dialog or test-shortcut paths) rather than a candidate list, the caller receives that result unchanged, with no interactive selection step introduced.
-AC-16: The existing native (desktop) picking path and the existing test-only picking shortcut behave exactly as they did before this feature, for both "folder" and "files" pick modes.
+AC-1: When a pre-check step has already confirmed that a given verification check passes, the instructions given to the Tester step for that same turn omit the runnable form of that already-passed check rather than merely stating in prose that it already passed.
+AC-2: When a pre-check step has already confirmed that a given verification check passes, the Tester step's instructions still include the runnable form of any other verification check that was not already confirmed to pass.
+AC-3: When no verification checks have been confirmed to pass ahead of time, the Tester step's instructions are unchanged from current behavior.
+AC-4: When a project exposes a fast, change-scoped variant of a verification check under a recognized naming convention, the pipeline's rendered instructions prefer that scoped variant over the full/unscoped version of the same check.
+AC-5: When a project does not expose a fast, change-scoped variant of a verification check, the pipeline's rendered instructions fall back to the same full/unscoped command it uses today, unchanged.
+AC-6: The behavior in AC-4 and AC-5 applies independently per verification check — a project may offer a scoped variant for one check and not another, and each is handled according to whether its own scoped variant exists.
+AC-7: This repository itself exposes a fast, change-scoped test check that the pipeline can discover and prefer under the recognized naming convention.
+AC-8: A decision about whether this repository's type-checking step also gets a change-scoped variant, or intentionally remains a full-project check, is documented along with its rationale.
+AC-9: Instructions given to a build step explicitly direct it to verify its work using the verification tooling already available to it (existing checks and test suites) rather than starting an additional, separate long-running process of its own for verification purposes.
+AC-10: Instructions given to a build step state that if it genuinely cannot verify its work without a running instance of the application, it should report this as a limitation in its final output rather than starting a duplicate process on its own.
+AC-11: Instructions given to a build step include guidance that once the step has been running for a substantial amount of activity, it should consolidate progress and either commit its work or clearly report what remains unresolved, rather than continuing to iterate indefinitely.
+AC-12: None of the existing pipeline optimizations this work builds on (lean context restriction, decomposition sizing, install-once behavior, effort tiering, stage handoff, session closing on settlement, prompt/result size bounds, per-run token accounting, and the existing logic that decides whether the Tester step can be skipped entirely) change behavior as a result of this work.
+AC-13: If the detection of a fast/scoped check fails to find one, or if deriving which checks to omit for the Tester step encounters an error, the pipeline falls back to rendering exactly what it would have rendered before this work existed — no run is blocked or degraded by these changes.
+AC-14: The project's documentation of pipeline token-efficiency work is updated with a new, appended entry describing what shipped in this effort, without altering previously recorded measurements or findings.
 
 ## Non-goals
-- Browsing into subdirectories beyond the single level of files shown for a chosen directory (no recursive/nested file browser).
-- Any change to the desktop native picking dialog behavior.
-- Any change to the existing test-only picking shortcut/fixture behavior.
-- Persisting or remembering the user's picker selections beyond the single pick in progress.
-- Any change to how references, once picked, are subsequently used elsewhere in a task.
+- Producing a trimmed or pipeline-specific variant of the project's own agent-instructions document for when the pipeline targets this repository — this is explicitly left as an open item for future work.
+- Changing the logic that decides whether the Tester step can be skipped entirely when all acceptance criteria are already covered by tests — that logic is confirmed correct and is out of scope.
+- Adding deterministic (sandboxed or enforced) prevention of a build step starting additional processes — the response to that risk is limited to instructional guidance, not technical enforcement.
+- Redesigning or replacing any of the previously shipped pipeline token-efficiency optimizations.
 
 ## Edge cases considered
-- The user's home directory contains no git repositories one level down: the candidate list still includes the home directory itself as a fallback, so the list is never empty.
-- No tasks have ever been created (no known working directories): candidate generation falls back to home-directory-derived entries only.
-- Two known working directories resolve to the same real path (e.g. via a symlink): they must be deduplicated into a single candidate.
-- The number of eligible candidates (task working directories plus home-derived git repos) exceeds the cap: only the highest-priority 50 are returned, prioritizing known task working directories (most recently used first) over home-derived entries.
-- A manually entered path does not exist, is not a directory, or is otherwise inaccessible: the selection must not silently succeed with a broken reference.
-- "Files" mode on a directory containing only subdirectories and no regular files: the result is an empty file listing rather than an error.
-- "Files" mode on a directory containing hidden files: behavior with respect to hidden regular files must be consistent and well-defined (not selectively broken).
-- The user cancels at the very first prompt of the picker (before any typing or navigation): this must resolve to an empty selection rather than hanging or erroring.
-- Filtering text that matches zero candidates: the list becomes empty but the manual-entry option remains available.
+- A turn where every verification check has already been confirmed to pass but the Tester step still cannot be skipped entirely (e.g., because not every acceptance criterion is covered by an existing test) — the runnable commands for the passed checks must still be omitted even though the Tester step runs.
+- A turn where some checks passed ahead of time and others were not run or did not pass — only the confirmed-passing checks are omitted; everything else is presented normally.
+- A project whose fast/scoped check naming convention only covers some verification checks (e.g., tests but not type-checking) — each check is evaluated independently for whether a scoped variant exists.
+- A project with no fast/scoped checks at all — output must be byte-identical to current behavior.
+- A failure or error anywhere in the new detection or omission logic — the system must degrade gracefully to prior behavior rather than blocking or corrupting a pipeline run.
+- A build step whose task is small and finishes well within a normal amount of activity — the consolidation guidance must not create unnecessary pressure or false urgency for a step that is proceeding normally.
+- A build step that legitimately needs to observe a running instance of the application to verify its change — it must have a clear, sanctioned way to report that limitation instead of being left to improvise.
 
-## Clarifications
+## Assumptions
+No material ambiguities were found under the standard taxonomy (functional scope, data shape, UX flow, non-functional requirements, integration behaviour, edge/failure handling, terminology) that require a human decision before planning can proceed. The remaining open points below are implementation-level judgment calls that the originating ticket already and explicitly delegates to the Plan/Build stages ("your own judgment," "make a call and document the reasoning either way," "exact naming your own judgment"); this SPEC intentionally leaves them unresolved at the requirements level rather than pre-deciding them, and each is already covered by an AC that requires the choice and its rationale to be documented where it is made:
 
-**Q1: In "files" pick mode, should hidden (dot-prefixed) regular files be included in the immediate-file listing?**
-A: Exclude hidden files — dot-prefixed regular files are filtered out of the listing, mirroring the dotdir exclusion already used for git-repo candidate enumeration (AC-3).
-
-*Folded into AC-8: Selecting a candidate (or a manually typed path) in "files" pick mode produces a final result listing the immediate regular files contained directly within that directory (not files in subdirectories, and not hidden/dot-prefixed files), each represented as a non-directory reference.*
-
-*Folded into the edge case: "Files" mode on a directory containing hidden files: hidden (dot-prefixed) regular files are excluded from the listing, consistent with the dotdir exclusion applied elsewhere in candidate generation.*
-
-**Q2: When a manually typed path is invalid (doesn't exist, isn't a directory, or is inaccessible), what should the picker do?**
-A: Reject and let the user retry — the picker shows an inline error at the manual-entry prompt and remains open, so the user can type a corrected path or go back to the candidate list, rather than aborting the whole pick.
-
-*Folded into AC-14: A user can bypass the candidate list entirely by entering a path manually, and that manually entered path is resolved the same way a selected candidate would be (per AC-7/AC-8 depending on pick mode). If the manually entered path does not exist, is not a directory, or is otherwise inaccessible, the picker rejects it with an inline error and keeps the manual-entry prompt open for a retry, rather than ending the pick.*
-
-*Folded into the edge case: A manually entered path does not exist, is not a directory, or is otherwise inaccessible: the selection must not silently succeed with a broken reference — instead the picker surfaces an inline error and lets the user retry the manual entry (or back out to the candidate list).*
-
-**Q3: Should substring filtering of the candidate list be case-sensitive or case-insensitive?**
-A: Case-insensitive — typing "src" matches a candidate path containing "Src" or "SRC" as well.
-
-*Folded into AC-12: A user can narrow the visible candidates by typing text that is matched against candidate paths as a case-insensitive substring, and the visible list updates to reflect only matching candidates.*
+- **Recognized naming convention for scoped/fast checks (AC-4–AC-7).** The SPEC specifies the behavior (prefer a scoped variant when present, fall back when absent, evaluated independently per check) but not the exact script-name pattern. Resolved by lowest-risk conventional interpretation: this is an implementation detail to be chosen and documented at Plan/Build time, not fixed here.
+- **Whether this repository's type-checking step gets a scoped variant or intentionally stays full-project (AC-8).** The SPEC requires the decision and its rationale to be documented; it does not mandate one outcome over the other. Left to the Plan/Build stage's judgment, as the ticket explicitly directs.
+- **The base/comparison ref used by this repository's own change-scoped test check (AC-7).** The SPEC requires that a scoped test check exist and be discoverable; it does not mandate which git ref changed files are compared against. Resolved by lowest-risk conventional interpretation: left to Build-time implementation choice, to be documented alongside the script.
+- **The exact threshold for "a substantial amount of activity" that triggers the build-step consolidation nudge (AC-11).** The SPEC requires that such a checkpoint exist and that it not create false urgency for normally-proceeding work (see Edge cases), but not a specific numeric threshold. Left to the Plan/Build stage's judgment, as the ticket explicitly directs.

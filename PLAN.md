@@ -1,482 +1,412 @@
-# PLAN: headless `/refs/pick` candidate enumeration + interactive TUI picker
+# Plan — cut redundant full-suite checks and unbounded child debugging
 
-## Approach summary
+Extends `docs/plans/pipeline-token-efficiency.md` (O-1…O-11, already shipped). This plan
+adds two new numbered entries there — **O-12** (Tester precheck → `## Project commands`
+handoff) and **O-13** (scoped/fast check preference + child-build debugging bound) — and
+touches exactly three production files plus `package.json`/a new script plus the doc:
 
-`POST /refs/pick` currently has three branches (fake-seam / native / headless-501).
-Only the headless-501 branch changes. It starts returning a bounded, prioritized,
-deduped list of candidate directories instead of 501. A new sibling route,
-`POST /refs/pick/select`, turns a chosen candidate (or a manually-typed path) into
-the final `{ refs }` result — folder mode in one step, files mode by listing the
-directory's immediate regular files. This mirrors the existing `/refs/pick` +
-`/refs/resolve` split: enumeration is stateless, selection is stateless, the
-interactive loop lives entirely in the caller.
+- `src/bun/repo-profile.ts` — scoped-command detection, `renderProjectCommands` skip-set param
+- `src/bun/pipeline-precheck.ts` — small pure helper to derive the skip set
+- `src/bun/orchestrator.ts` — `pipelinePromptExtras` reordering to wire the skip set through
+- `src/bun/pipeline-prompts.ts` — `childBuildPrompt` debugging-discipline paragraph
+- `package.json` + new `scripts/test-changed.ts` — this repo's own scoped test check (AC-7)
+- `docs/plans/pipeline-token-efficiency.md` — appended O-12/O-13 entries (AC-14)
 
-The only caller that gets a real interactive UI is the CLI TUI (`src/cli/tui/`) —
-that's the one headless, human-facing surface in this codebase (see "Why no
-webview UI" below). A new `DirPickerOverlay` component (same layer/pattern as
-`AnswerOverlay`) drives the two HTTP endpoints with keyboard navigation, and a new
-Dashboard keybinding (`r`, "attach reference") activates it.
+No changes to `precheckPasses`, `testerSkipEnabled`, `precheckEnabled`, or any of O-1…O-11's
+mechanisms (AC-12). Every new code path is fail-open per AC-13: an exception or "nothing
+detected" falls through to exactly today's rendering.
 
-Server-side enumeration/selection logic lives in a new small module,
-`src/bun/refs-pick.ts`, so it has direct, fast unit tests independent of spinning
-up the HTTP server (the HTTP-level tests in `refs-endpoint.test.ts` cover the
-route contract itself, per the ticket).
+## 1. Finding 1 — omit an already-green check's runnable command from `## Project commands`
 
-## Why no webview UI
+### 1a. `src/bun/repo-profile.ts`
 
-`src/mainview/lib/api.ts`'s `pickRefs` is only ever called by the packaged desktop
-app, which always supplies `native` to `startApiServer` (see `src/bun/index.ts`).
-Structurally, the webview can never observe the `{ candidates }` shape in
-production — only a headless daemon (CLI-spawned, `native` undefined) can produce
-it, and the webview isn't a client of that path. Per SPEC.md's user stories,
-which explicitly scope this feature to "a user running agetor headlessly
-(CLI/TUI)", the interactive picker belongs in the TUI only. The webview's
-`api.ts` still gets a small defensive update (see below) so it fails safe instead
-of crashing if it were ever pointed at a headless core, but implements no picker
-UI — that would be scope creep with no real caller.
-
-## Server: candidate enumeration + selection
-
-### New file: `src/bun/refs-pick.ts`
-
-Two pure(ish) functions, unit-testable without an HTTP server:
+Add an exported check-name type and thread an optional skip set through
+`renderProjectCommands`:
 
 ```ts
-export const MAX_PICK_CANDIDATES = 50;
-
-export function headlessPickCandidates(): string[]
-export function selectPick(
-  rawPath: string,
-  mode: "files" | "folder",
-): { refs: TaskReference[] } | { error: string }
+export type CheckName = "typecheck" | "lint" | "test" | "build";
 ```
 
-**`headlessPickCandidates()`** — priority order, exactly matching the ticket's
-"Candidate generation rules" (AC-2/3/4):
-
-1. Every task's `workdir` from `tasks.list()` (imported from `./db.ts`, already a
-   server.ts dependency), sorted by `updatedAt` descending before insertion — most
-   recently used first (AC-2). Do **not** filter archived tasks; AC-2 says "every
-   distinct directory the user has already used", with no archived exclusion.
-2. Direct subdirectories of `homedir()` (`node:os`) that are git repos: filter
-   `Dirent.isDirectory() && !name.startsWith(".")`, then
-   `existsSync(join(dir, ".git"))`. Sort alphabetically (`localeCompare`) for
-   deterministic output — the ticket doesn't specify an order among these, and a
-   stable order matters for testability. Wrap the `readdirSync(homedir())` call in
-   try/catch — an unreadable `$HOME` degrades to "no git-repo candidates", not an
-   error (AC-1 must still return 200).
-3. `homedir()` itself, appended last, unconditionally attempted (AC-4).
-
-Dedup + cap, applied via one `add(rawPath)` helper used by all three tiers:
-- Resolve with `realpathSync`; on failure (path gone / permission denied), the
-  candidate is **silently dropped** — this both implements AC-5's "same real
-  location" dedup (compare/store the realpath, not the raw string — two
-  different-looking inputs that share a realpath collapse to one entry) and
-  guards against ever offering a workdir that no longer exists on disk.
-- Skip (no-op) once `out.length >= MAX_PICK_CANDIDATES` (AC-6). Because tiers are
-  processed in priority order and the cap check is a cheap early-return at the
-  top of `add`, the 50 slots are naturally filled by workdirs first, then
-  home-derived repos, then home itself — matching the "exceeds the cap"
-  edge case's prioritization.
-- **Design note for the Critic**: AC-4 ("candidate list includes home... as a
-  fallback") and the cap/priority edge case are in tension in the pathological
-  case where task workdirs alone already number ≥50 distinct real paths — home
-  would then be dropped by the cap, not appended. I'm resolving this by treating
-  the cap + priority-order edge case as controlling (home is a *fallback*,
-  most meaningful when tiers 1–2 are sparse or empty, which is the only scenario
-  the edge cases actually describe). Flagging this explicitly rather than
-  silently picking a side.
-
-**`selectPick(rawPath, mode)`**:
-- Reject non-absolute paths: `{ error: "enter an absolute path" }`. (The TUI is
-  responsible for expanding `~` and resolving relative manual entries to
-  absolute *before* calling this — see the TUI section. Candidates from
-  `headlessPickCandidates()` are already absolute realpaths.)
-- `statSync(rawPath)`; on throw → `{ error: "path not found" }`. If not a
-  directory → `{ error: "not a directory" }`. This is what backs AC-14/Q2's
-  "reject and let the user retry" behavior — the caller distinguishes error vs.
-  success by the shape of the return value (mirrored 1:1 onto HTTP 400 vs 200).
-- `mode === "folder"` → `{ refs: [{ path: rawPath, isDirectory: true }] }` (AC-7).
-  Deliberately does **not** realpath the result — matches the existing
-  `refsFromPaths` behavior elsewhere in server.ts (the given path is trusted
-  once it's confirmed to exist).
-- `mode === "files"` → `readdirSync(rawPath, { withFileTypes: true })`, filter
-  `isFile() && !name.startsWith(".")` (hidden-file exclusion per the ticket's
-  Q1/AC-8 clarification), sort by `localeCompare` (matches the existing fake-seam
-  ordering convention in server.ts so behavior reads as consistent even though
-  it's a different code path), map to `{ path: join(rawPath, name), isDirectory:
-  false }`. Zero matching files → `{ refs: [] }`, not an error (edge case:
-  "directory containing only subdirectories").
-
-### `src/bun/server.ts` changes
-
-1. Add `import { headlessPickCandidates, selectPick } from "./refs-pick.ts";`
-2. In the `/refs/pick` route, replace the line
-   `if (!native) return notAvailableHeadless(req);`
-   with:
-   ```ts
-   if (!native) {
-     return json(
-       { candidates: headlessPickCandidates(), refs: [] },
-       { headers: corsHeaders(req) },
-     );
-   }
-   ```
-   Everything above it (fake-seam branch) and below it (native dialog branch) is
-   untouched — this is the entire AC-16 guarantee: those two branches structurally
-   cannot be reached differently than before, because the new code only replaces
-   what used to be dead-end 501. `startingFolder` is intentionally unused by this
-   new branch — candidate generation is global, not scoped to a starting folder
-   (matches the ticket's candidate-generation rules, which never reference a
-   starting folder).
-3. Add a new route immediately after `/refs/pick`, alongside `/refs/resolve`:
-   ```ts
-   "/refs/pick/select": {
-     POST: authed(async (req) => {
-       const body = (await req.json().catch(() => ({}))) as {
-         path?: unknown;
-         mode?: "files" | "folder";
-       };
-       const rawPath = typeof body.path === "string" ? body.path : "";
-       const mode = body.mode === "folder" ? "folder" : "files";
-       if (!rawPath) {
-         return json({ error: "path is required" }, { status: 400, headers: corsHeaders(req) });
-       }
-       const result = selectPick(rawPath, mode);
-       return json(result, { status: "error" in result ? 400 : 200, headers: corsHeaders(req) });
-     }),
-   },
-   ```
-   No `native` dependency (deliberately, like `/refs/resolve` and `/files/index`)
-   — this route only ever stats/reads a path the caller already named, so it
-   works identically whether headless or packaged.
-
-No migrations. No DB schema changes (`tasks.list()` already exists and is read
-elsewhere on the hot poll path — this adds one more read-only call site, on a
-route nobody polls).
-
-## Server tests
-
-### New file: `src/bun/refs-pick.test.ts`
-
-Direct unit tests against the two exported functions (no HTTP server needed —
-fast, and lets every edge case in SPEC.md get its own assertion without the
-combinatorial blow-up of doing it all through fetch):
-
-- `headlessPickCandidates()` includes a task's `workdir` (insert a task via
-  `tasks.insert(...)`, same fixture shape as `db-openable.test.ts`'s `makeTask`,
-  pointed at a real `mkdtempSync` dir) — AC-2.
-- Two tasks with different `updatedAt` → the more recent one's workdir sorts
-  first — AC-2.
-- Two tasks whose `workdir`s are a real dir and a symlink to it (or two paths
-  that `realpathSync` to the same location) → exactly one candidate — AC-5.
-- `process.env.HOME` pointed at a scratch dir containing a git-repo subdir (a
-  `.git` marker dir/file), a non-git subdir, and a dot-prefixed git-repo subdir
-  → only the non-dot git repo appears — AC-3.
-- `process.env.HOME` pointed at a scratch dir with **no** git repos and no task
-  workdirs (no tasks inserted) → candidates is exactly `[realpath(HOME)]`, never
-  empty — AC-4 + the "no git repos" edge case.
-- Insert 60 tasks with 60 distinct real tmp-dir workdirs → result length is
-  exactly 50, and every entry is one of the (realpath'd) task workdirs, in
-  most-recently-updated-first order — AC-6 + the "exceeds the cap" edge case.
-- A task `workdir` pointing at a path that doesn't exist on disk → it does not
-  appear in candidates (dead workdir silently dropped, not surfaced as broken).
-- `process.env.HOME` set/deleted per-test inside try/finally, following the
-  precedent in `src/bun/login-path.test.ts`.
-
-- `selectPick(dir, "folder")` on a real directory → `{ refs: [{ path: dir,
-  isDirectory: true }] }` — AC-7.
-- `selectPick(dir, "files")` on a directory containing a visible file, a hidden
-  (dot-prefixed) file, and a subdirectory → refs contains only the visible file,
-  as `{ path, isDirectory: false }` — AC-8 + the hidden-files edge case.
-- `selectPick(dir, "files")` on a directory containing only subdirectories →
-  `{ refs: [] }`, not an error — the "only subdirectories" edge case.
-- `selectPick("relative/path", "folder")` → `{ error: ... }` (non-absolute
-  rejected).
-- `selectPick("/definitely/does/not/exist", "folder")` → `{ error: ... }` — the
-  "manually entered path does not exist" edge case.
-- `selectPick(<path to a regular file, not a dir>, "folder")` → `{ error: ... }`
-  ("not a directory").
-
-### Edits to existing `src/bun/refs-endpoint.test.ts`
-
-- Import `tasks` alongside the existing `startApiServer`/`API_TOKEN` in
-  `beforeAll` (via the same `await import("./db.ts")` already present at the top
-  of the file — just capture the returned `tasks` binding).
-- **Replace** the test `"/refs/pick is unavailable in headless mode when the
-  fake-pick seam is unset"` (current lines 92–100) — this is the exact dead end
-  the ticket removes, so its assertion is now wrong by design, not a regression.
-  New test: `"/refs/pick returns candidates in headless mode when the fake-pick
-  seam is unset"` — insert a task via `tasks.insert(...)` with `workdir` set to a
-  real tmp dir (reuse the file's existing `SCRATCH`/`DIR`), call `pick("files")`,
-  assert `res.status === 200`, body has no `refs` key (or `refs: []`, matching
-  the route's literal response shape) and `candidates` is an array containing
-  that task's workdir. This is the ticket's explicitly-requested unit test #1.
-- Add: `"/refs/pick/select folder mode returns a directory reference"` — POST
-  `/refs/pick/select` with `{ path: DIR, mode: "folder" }`, assert `{ refs: [{
-  path: DIR, isDirectory: true }] }`. Ticket's unit test #2.
-- Add: `"/refs/pick/select files mode lists immediate regular files"` — plant a
-  couple of files (+ a subdirectory, + a dot-file) directly under `DIR`, POST
-  `/refs/pick/select` with `{ path: DIR, mode: "files" }`, assert the visible
-  files come back as `isDirectory: false` refs, sorted, excluding the dot-file
-  and the subdirectory. Ticket's unit test #3.
-- Add: `"/refs/pick/select rejects an invalid manual path with 400"` — POST with
-  a nonexistent path, assert `res.status === 400` and body has an `error` string.
-- Leave every other existing test in this file (native-panel comma-split
-  fragments, `/refs/resolve` behavior, the two `AGETOR_FAKE_PICK_REFS_DIR` tests)
-  completely unmodified — they exercise branches this ticket doesn't touch
-  (AC-16).
-
-## Webview: `src/mainview/lib/api.ts`
-
-Defensive-only change, no new UI (see "Why no webview UI" above). Update
-`pickRefs`'s expected response type and fallback:
-
 ```ts
-pickRefs: (mode: "files" | "folder", startingFolder?: string) =>
-  j<{ refs?: TaskReference[]; candidates?: string[] }>("/refs/pick", {
-    method: "POST",
-    body: JSON.stringify({ mode, startingFolder }),
-  }).then((r) => r.refs ?? []),
+export function renderProjectCommands(
+  profile: RepoProfile,
+  opts: { installed: boolean; skipChecks?: ReadonlySet<CheckName> },
+): string
 ```
-When `refs` is present (native dialog or fake seam), behavior is byte-identical
-to today (AC-15). If a `candidates` shape were ever received, this resolves to
-`[]` instead of throwing on `undefined.length` — `ReferencesPicker.tsx`'s
-existing `if (picked.length) append(picked)` then simply no-ops, which is exactly
-"nothing selected", never a crash.
 
-## CLI: `src/cli/api-client.ts`
+In the loop that builds `known` / pushes `${label}: ${cmd}` lines, when `opts.skipChecks?.has(label)`
+is true, drop that line entirely (no replacement text — this is the "dropped from the block
+entirely" behavior the ticket asks for, distinct from the `install` line's replacement-prose
+pattern, because `renderPrecheck`'s own "## Pre-run checks" block — see §3 below — already
+narrates the pass/fail status; duplicating that narration here is exactly the redundant
+friction Finding 1 identifies). `known.length === 0` after filtering must still correctly
+report `""` only when there is *also* no install line to show — i.e. the existing "no known
+commands at all → empty string" early-return should be evaluated on the *unfiltered* `known`
+list (a profile with commands that are all skipped this turn should still render an empty
+`## Project commands` block only if `profile.install` is also null and nothing else remains;
+otherwise it should render just `install: …` with no check lines). Concretely: keep the
+existing `known.length === 0 && profile.install === null` early return as-is (based on the
+full/unscoped commands the profile detected — a profile with real commands is never treated
+as "no known commands" just because this turn happens to skip all of them), and instead apply
+`skipChecks` only when deciding whether to push each individual `${label}: ${cmd}` line.
 
-Add two thin methods on `AgetorClient`, next to the other one-off route wrappers:
+No other caller passes `skipChecks` (`opts.skipChecks` defaults to absent → identical output
+to today, satisfying AC-3/AC-5's "unchanged" requirement structurally, not just as an
+assertion).
+
+### 1b. `src/bun/pipeline-precheck.ts`
+
+Add a small pure helper next to `precheckPasses`:
 
 ```ts
-pickRefs(mode: "files" | "folder"): Promise<{ candidates?: string[]; refs?: TaskReference[] }> {
-  return this.req("POST", "/refs/pick", { mode });
-}
-selectPickedRef(path: string, mode: "files" | "folder"): Promise<{ refs: TaskReference[] }> {
-  return this.req("POST", "/refs/pick/select", { path, mode });
+/** Which of a precheck's commands passed — the skip-set `renderProjectCommands` uses to
+ *  drop an already-confirmed-green check's runnable line for this Tester turn (Finding 1 /
+ *  O-12). Import `CheckName` from repo-profile.ts so the return type lines up with
+ *  `renderProjectCommands`'s param without relying on structural bivariance. */
+export function precheckPassedChecks(summary: PrecheckSummary): Set<CheckName> {
+  return new Set(summary.results.filter((r) => r.ok).map((r) => r.name));
 }
 ```
-`req`'s existing non-2xx handling already throws `ApiError` with `.message` set
-from the body's `error` field on a 400 from `/refs/pick/select` — `DirPickerOverlay`
-catches that and shows it inline (AC-14/Q2), no new error-plumbing needed.
 
-## TUI: new `src/cli/tui/DirPickerOverlay.tsx`
+(`import type { CheckName } from "./repo-profile.ts";` at the top — pipeline-precheck.ts
+already imports `RepoProfile` from there, so this doesn't add a new dependency edge.)
 
-Same shape/pattern as `AnswerOverlay.tsx`: a single component with an internal
-screen state machine, mounted only while active, owning `useInput` entirely
-while mounted.
+### 1c. `src/bun/orchestrator.ts` — `pipelinePromptExtras`
+
+Reorder so the O-5 precheck read happens *before* the O-4 project-commands block (today it's
+after), and feed its result into `renderProjectCommands`:
 
 ```ts
-export function DirPickerOverlay({
-  client,
-  onDone,
-}: {
-  client: AgetorClient;
-  onDone: (refs: TaskReference[]) => void;
-}): JSX.Element
+async function pipelinePromptExtras(task, cwd, log): Promise<StageExtras> {
+  const extras: StageExtras = {};
+  const isChild = task.parentTaskId != null;
+  const stage = task.pipelineStage;
+
+  // O-5/O-12: read the precheck FIRST so the testing stage's own
+  // ## Project commands block (below) can omit an already-green check's
+  // runnable line instead of just narrating it — Finding 1. Read failure
+  // degrades to "no precheck" here, which also disables the omission; it
+  // never blocks the run.
+  let precheckSummary: PrecheckSummary | null = null;
+  if (stage === "testing") {
+    try {
+      precheckSummary = pipelineState.getPrecheck(task.id);
+      extras.precheck = precheckSummary;
+    } catch (err) {
+      console.error(`[agetor] precheck read failed for task ${task.id}:`, err);
+    }
+  }
+
+  if (isChild || (stage != null && COMMAND_RUNNING_STAGES.has(stage))) {
+    try {
+      const profile = readRepoProfile(cwd);
+      let installed = existsSync(join(cwd, "node_modules"));
+      if (profile.install && autoInstallEnabled()) { /* unchanged */ }
+      const skipChecks = precheckSummary ? precheckPassedChecks(precheckSummary) : undefined;
+      extras.projectCommands = renderProjectCommands(profile, { installed, skipChecks }) || null;
+    } catch (err) {
+      console.error(`[agetor] repo profile failed for task ${task.id}:`, err);
+    }
+  }
+
+  // O-11 handoff, O-6 review diff: unchanged, in place.
+  // (the old standalone "O-5" block at the bottom is deleted — folded into the top of this
+  // function above.)
+  return extras;
+}
 ```
 
-One callback, not two (`onDone` only) — every exit path (top-level cancel,
-back-out at the directory list, a genuine empty files-listing) collapses to
-"call `onDone` with a `TaskReference[]`, possibly `[]`". This directly matches
-the user story "if I cancel out of the picker at the top level, I want the pick
-to be treated as nothing selected rather than an error" and every other
-back-out/cancel AC (AC-10, AC-11) — they're all "empty selection", not a distinct
-error/cancel channel. This is a deliberate simplification vs. `AnswerOverlay`'s
-`onDone`/`onCancel` pair (which exists there because a *pending interaction*
-that's merely dismissed must stay pending server-side — there's no equivalent
-server state here to preserve).
+Add `precheckPassedChecks` to the existing `import { runPipelinePrecheck, precheckPasses,
+precheckEnabled, testerSkipEnabled } from "./pipeline-precheck.ts"`.
 
-Internal state (`screen: "kind" | "loading" | "dirlist" | "manual" |
-"fileslist"`), transitions:
+`precheckSummary` is `null` for every non-testing stage and for a testing turn with no stored
+precheck (fresh pass, AC-3) — `skipChecks` stays `undefined` in both cases, so
+`renderProjectCommands` behaves exactly as before. This satisfies AC-1 (green check's command
+omitted), AC-2 (a failed or never-run check's command still shown — it's simply absent from
+`skipChecks`), and AC-3 (no precheck at all → unchanged).
 
-1. **`"kind"`** (initial screen — this *is* "the very first prompt" from the
-   cancel-before-typing-or-navigating edge case): two rows, "Folder" / "Files".
-   ↑/↓ move a 0/1 cursor, Enter picks it and moves to `"loading"` (fires
-   `client.pickRefs(kind)`), Esc calls `onDone([])`.
-2. **`"loading"`**: on resolve — if the response has `refs` (native/fake-seam
-   direct-result path, AC-15) call `onDone(refs)` immediately, no further screen
-   is ever shown; otherwise take `candidates` (default `[]` if absent) and move
-   to `"dirlist"`. On reject (network/`ApiError`), move to `"dirlist"` anyway
-   with an empty candidate list and a `loadError` hint shown above the list —
-   fails open to "type a path manually" rather than stranding the user.
-3. **`"dirlist"`**: outer state `candidates: string[]`, `filterText: string`,
-   `cursor: number` — all three persist across trips into `"manual"` /
-   `"fileslist"` and back, which is what implements AC-9 ("without losing the
-   ability to choose a different directory").
-   - Visible rows = `candidates.filter(c => c.toLowerCase().includes(filterText.toLowerCase()))`
-     (AC-12, case-insensitive substring — Q3), **plus** a trailing fixed
-     `"› Enter a path manually…"` row, always rendered even when the filtered
-     list is empty (the "filtering matches zero candidates" edge case: the list
-     empties, manual entry stays available).
-   - Printable, non-ctrl/meta input appends to `filterText` and resets `cursor`
-     to 0 (mirrors `Composer.tsx`'s existing query-reset behavior); Backspace
-     trims it.
-   - ↑/↓ move `cursor`, clamped to `[0, rows.length - 1]` (AC-13).
-   - Enter on the manual row → `screen = "manual"`, reset `manualText`/`manualError`.
-   - Enter on a candidate row → `client.selectPickedRef(rows[cursor], kind)`:
-     - success + `kind === "folder"` → `onDone(refs)` (AC-7, single-level).
-     - success + `kind === "files"` → store `fileRefs = refs`, `screen =
-       "fileslist"` (AC-8/AC-9, two-level).
-     - failure (`ApiError`, e.g. the candidate vanished between listing and
-       selection) → set an inline `dirError` hint, stay on `"dirlist"`.
-   - Esc → `onDone([])` (AC-10 for files mode, AC-11 for folder mode — one code
-     path covers both since it doesn't depend on `kind`).
-4. **`"manual"`**: a single hand-rolled text field, same style as
-   `AnswerOverlay`'s `custom` field / `Composer`'s own input (append printable
-   chars, Backspace trims, no external deps).
-   - Enter with non-empty trimmed text: resolve the typed text to an absolute
-     path client-side first — expand a leading `~` to `homedir()` (Node's
-     `os.homedir()`, available in the CLI process) and `path.resolve()` anything
-     relative (against `process.cwd()`, same convention already used by
-     `src/cli/refs.ts`'s `resolveRefs` for `--ref`). Then
-     `client.selectPickedRef(resolved, kind)`:
-     - success → same branching as the dirlist success case above (folder →
-       `onDone`, files → `"fileslist"`).
-     - failure → set `manualError` to `(e as Error).message`, **stay on
-       `"manual"`** so the user can correct and resubmit in place (AC-14/Q2:
-       "rejects it with an inline error and keeps the manual-entry prompt open
-       for a retry").
-   - Esc → back to `"dirlist"` (Q2: "or back out to the candidate list") — this
-     is a screen change only; `candidates`/`filterText`/`cursor` are untouched.
-5. **`"fileslist"`**: renders `fileRefs` (the immediate-files result from
-   selecting a directory in files mode) as a static list — this level has no
-   further per-file selection, since AC-8 defines the result as *the whole
-   listing*, not a further pick; "the same navigation" language in the source
-   ticket is satisfied by reusing the same visual list style, not by adding
-   selection semantics that no AC actually calls for. An empty `fileRefs` renders
-   a "no files here" line (the "only subdirectories" edge case) rather than
-   nothing.
-   - Enter → `onDone(fileRefs)` (confirms the listing as the final result).
-   - Esc → `screen = "dirlist"` (AC-9 — directory list state, per above, was
-     never touched).
+## 2. Finding 2 — prefer a diff-scoped check over the full one when the project exposes one
 
-## TUI: `src/cli/tui/Dashboard.tsx` wiring
+### 2a. `RepoProfile` shape (`src/bun/repo-profile.ts`)
 
-There is currently no call site for a folder/file picker anywhere in the CLI/TUI
-(the only existing reference-attach mechanism is the non-interactive `agetor add
---ref <path>` / `agetor send --ref <path>`, in `src/cli/refs.ts` +
-`src/cli/commands/lifecycle.ts`). This ticket's own source doc assumed an
-existing `api.pickRefs` call site to retrofit; since none exists in the TUI, a
-new activation point is added — this is in scope ("the system offers... a
-keyboard-driven picking flow", per SPEC.md's summary), not scope creep, but it's
-a genuinely new integration decision the Critic should sanity-check.
+Add four new nullable fields, one per check, holding the *scoped* command when detected:
 
-1. `Mode` union gains `"pick"`.
-2. Import `DirPickerOverlay` and `appendReferences` (from
-   `../../shared/refs.ts`) and `TaskReference` (type-only, from
-   `../../shared/types.ts`).
-3. New keybinding in the existing nav-mode `useInput` block (alongside `m`/`g`/`c`/`s`/`x`):
-   ```ts
-   if (input === "r" && selected) {
-     setTargetId(selected.id);
-     return setMode("pick");
-   }
-   ```
-   No gating (unlike `g`, which requires a pending interaction) — attaching a
-   reference doesn't depend on run state; if the task has no run yet,
-   `sendMessage` (below) already surfaces "no run yet — press s to start", the
-   same as it does for any other message today.
-4. New render block, next to the existing `"answer"` block:
-   ```tsx
-   {mode === "pick" && target ? (
-     <Box borderStyle="round" borderColor="cyan" paddingX={1} overflow="hidden">
-       <DirPickerOverlay
-         client={client}
-         onDone={(refs: TaskReference[]) => {
-           setMode("nav");
-           if (!refs.length) {
-             setStatus("no reference selected");
-             return;
-           }
-           const label = `→ attached ${refs.length} reference${refs.length > 1 ? "s" : ""}`;
-           sendMessage(target, appendReferences("", refs), label);
-         }}
-       />
-     </Box>
-   ) : null}
-   ```
-   Reuses the existing `sendMessage` helper unchanged — a refs-only message
-   (empty text + `appendReferences`) is already a supported shape; it's the same
-   thing `agetor send --ref <path>` (no message text) produces today. This is
-   also the entire reason SPEC.md's non-goal ("no change to how references,
-   once picked, are subsequently used elsewhere in a task") holds: the picker
-   only ever hands its result to plumbing (`appendReferences` → `sendInput`)
-   that already exists and is untouched.
-5. `Footer`'s `hint` ternary gains a `"pick"` branch (`"↑/↓ move · type to
-   filter · enter select · esc back"`), and the default (`"nav"`) hint string
-   gains `· r ref` at the end. Existing `Dashboard.test.tsx` assertions
-   (`toContain("m msg")`, etc.) are substring checks and are unaffected.
+```ts
+export interface RepoProfile {
+  packageManager: "npm" | "pnpm" | "yarn" | "bun" | null;
+  install: string | null;
+  typecheck: string | null;
+  lint: string | null;
+  test: string | null;
+  build: string | null;
+  /** Fast, change-scoped variant of each check above, when the project exposes one under
+   *  the `<check>:changed` script-name convention (O-13) — e.g. `test:changed` alongside
+   *  `test`. Independent per check (AC-6): a project may have `test:changed` and no
+   *  `lint:changed`. Only ever set when the FULL command for that same check also exists —
+   *  a scoped variant is a fast alternative for an existing check, not a way to invent one.
+   *  `renderProjectCommands` prefers this over the full command when rendering; nothing
+   *  else (in particular `runPipelinePrecheck`, the deterministic Tester-skip gate) reads
+   *  these fields — the pipeline's own correctness gate always uses the full command, so a
+   *  diff-scoped check can never weaken what "green" means for skipping the Tester. */
+  typecheckScoped: string | null;
+  lintScoped: string | null;
+  testScoped: string | null;
+  buildScoped: string | null;
+  workspaces: boolean;
+  lockfile: string | null;
+}
+```
 
-## TUI test: new `src/cli/tui/DirPickerOverlay.test.tsx`
+Update `EMPTY_PROFILE` with the four new `null`s.
 
-Same harness as `AnswerOverlay.test.tsx` (`ink-testing-library`'s `render` +
-`stdin.write` with the file's existing `ENTER`/`ESC`/`UP`/`DOWN` byte-sequence
-constants — replicate that small constants block), with a hand-built fake
-`AgetorClient` exposing just `pickRefs`/`selectPickedRef`. This is the ticket's
-requested e2e/component test, expanded into the several scenarios the ACs
-actually require:
+### 2b. Detection (`detectRepoProfileFromFiles`)
 
-- Candidates path, folder mode: fake `pickRefs` resolves `{ candidates: ["/a",
-  "/b"] }`; render, Enter (kind=Folder default cursor), DOWN, ENTER on `/b` →
-  fake `selectPickedRef` captures `("/b", "folder")` and resolves `{ refs: [{
-  path: "/b", isDirectory: true }] }`; assert `onDone` was called with that
-  array. This is the ticket's literal "↑ ↓ Enter … resulting task carries the
-  selected path as a reference" scenario (verified at the overlay's own
-  `onDone` boundary, not by actually spinning up a task — the Dashboard-level
-  wiring that turns `onDone`'s result into a sent message is simple enough
-  (`appendReferences` + `sendMessage`, both already independently
-  exercised/existing) that it doesn't need its own component test; keeping
-  the append/`sendMessage` boundary point out of this test's mocking surface
-  matches the file's existing pattern of unit-testing `AnswerOverlay` at the
-  `client.answer*` boundary).
-- Files mode two-level flow: candidates `["/dir"]`; DOWN into Files kind, Enter
-  on `/dir` → `selectPickedRef("/dir", "files")` resolves a multi-file `refs`
-  array; assert the second-level list renders those file names; Esc → assert
-  the directory list reappears (dirlist row for `/dir` still visible); Enter
-  again on `/dir`, then Enter at the file list → `onDone` called with the same
-  `refs` array (AC-8/AC-9).
-- Filter narrows the list: candidates `["/alpha", "/beta"]`; type `"be"` →
-  assert only `/beta` (+ the manual row) is rendered (AC-12).
-- Manual entry, invalid path retried: choose the manual row, type a bogus path,
-  Enter → fake `selectPickedRef` rejects with an `ApiError`-shaped error; assert
-  an inline error string renders and the text field is still present/editable;
-  edit and Enter again with a path the fake resolves successfully → `onDone`
-  fires (AC-14).
-- Esc at the very first (`"kind"`) screen → `onDone([])` (top-level-cancel edge
-  case).
-- Esc at the `"dirlist"` screen (no selection made) → `onDone([])` for both
-  kinds (AC-10, AC-11).
-- Direct-result short-circuit: fake `pickRefs` resolves `{ refs: [{ path: "/x",
-  isDirectory: true }] }` (no `candidates`) → assert `onDone` fires immediately
-  with that array and no candidate-list screen is ever rendered (AC-15).
+Add a `hasScoped(label)` check (`hasScript(\`${label}:changed\`)`) alongside the existing
+`hasScript`, and populate the four new fields, each gated on the corresponding full command
+existing:
 
-## Non-scope reaffirmed (do not implement)
+```ts
+typecheck: typecheckKey ? runScriptCommand(manager, typecheckKey) : null,
+typecheckScoped: typecheckKey && hasScript("typecheck:changed") ? runScriptCommand(manager, "typecheck:changed") : null,
+lint: hasScript("lint") ? runScriptCommand(manager, "lint") : null,
+lintScoped: hasScript("lint") && hasScript("lint:changed") ? runScriptCommand(manager, "lint:changed") : null,
+test: hasScript("test") ? runScriptCommand(manager, "test") : null,
+testScoped: hasScript("test") && hasScript("test:changed") ? runScriptCommand(manager, "test:changed") : null,
+build: hasScript("build") ? runScriptCommand(manager, "build") : null,
+buildScoped: hasScript("build") && hasScript("build:changed") ? runScriptCommand(manager, "build:changed") : null,
+```
 
-- No new one-shot `agetor pick`/`agetor refs pick` CLI subcommand — only the
-  interactive TUI overlay. `agetor add --ref` / `agetor send --ref` remain the
-  non-interactive path, unchanged.
-- No changes to `Composer.tsx`'s `@`-mention autocomplete — a completely
-  separate feature (inline mention resolution vs. whole-file/folder attachment).
-- No persistence of picker selections beyond the single pick (no new DB
-  columns, no draft/backlog integration).
-- No change to `AGETOR_FAKE_PICK_REFS_DIR` or the native `openFileDialog`
-  branch — verified by construction (new code is added only inside what used to
-  be the `notAvailableHeadless` branch) and by leaving every pre-existing test
-  for those branches untouched.
+Document the convention inline: the scoped script is always looked up under the **canonical
+label** (`typecheck:changed`, not e.g. `tsc:changed`), regardless of which alias
+(`TYPECHECK_SCRIPT_KEYS`) satisfied the full command — so a project whose typecheck runs via
+a `tsc` script still exposes its fast path as `typecheck:changed`. This is the "recognized
+naming convention" AC-4 through AC-7 refer to; document it in this same comment since it's
+the concrete answer to the SPEC's open judgment call.
 
-## Definition of done (for the Builder to self-check)
+### 2c. `renderProjectCommands` prefers the scoped command
 
-- `bun run typecheck` is green.
-- `bun test src/bun/refs-pick.test.ts src/bun/refs-endpoint.test.ts
-  src/cli/tui/DirPickerOverlay.test.tsx` all pass, plus the full suite
-  (`bun test`) to confirm no regressions in `Dashboard.test.tsx` or elsewhere.
-- `POST /refs/pick` in headless mode (no `native`, no
-  `AGETOR_FAKE_PICK_REFS_DIR`) returns `{ candidates, refs: [] }` with status
-  200, never 501.
-- `POST /refs/pick/select` resolves a candidate or manual path to `{ refs }`
-  (200) or `{ error }` (400).
-- `r` in the Dashboard opens `DirPickerOverlay`; a completed pick sends a
-  references-only message to the selected task via the existing `sendMessage` /
-  `appendReferences` plumbing.
+Change the `commands` tuple list to carry both variants and pick per line:
+
+```ts
+const commands: Array<[CheckName, string | null, string | null]> = [
+  ["typecheck", profile.typecheck, profile.typecheckScoped],
+  ["lint", profile.lint, profile.lintScoped],
+  ["test", profile.test, profile.testScoped],
+  ["build", profile.build, profile.buildScoped],
+];
+const known = commands.filter((c): c is [CheckName, string, string | null] => c[1] !== null);
+...
+for (const [label, cmd, scopedCmd] of known) {
+  if (opts.skipChecks?.has(label)) continue;
+  lines.push(`${label}: ${scopedCmd ?? cmd}`);
+}
+```
+
+`known`'s existence check (whether a check is "known" at all) stays keyed on the *full*
+command per §1a's note — a scoped-only script with no full script is never surfaced (a
+scoped variant is defined relative to an existing check, not a way to introduce a new one).
+The rendered line shows only one command (whichever is preferred), so the ~400-byte budget
+noted in the module doc comment doesn't grow — this is a substitution, not an addition. This
+independently applies to every `COMMAND_RUNNING_STAGES` stage (building, code-review,
+testing) and to build children (`isChild` branch in `pipelinePromptExtras`), since they all
+go through the same `renderProjectCommands` call — Finding 2's own example (the 136-message
+child) is itself a `renderProjectCommands` consumer via the `isChild` branch, so fixing the
+one function fixes all of them.
+
+### 2d. This repo's own scoped test check (AC-7)
+
+Add to `package.json`'s `scripts`:
+
+```json
+"test:changed": "bun scripts/test-changed.ts"
+```
+
+New file `scripts/test-changed.ts` (Bun script, no new dependency):
+
+1. Determine a base ref: `process.env.AGETOR_TEST_CHANGED_BASE`, else `git merge-base HEAD
+   main` (fall back to `origin/main` if plain `main` doesn't resolve), else `HEAD~1` if
+   neither resolves (a shallow clone / detached first commit).
+2. Collect changed paths: `git diff --name-only <base>...HEAD` plus `git diff --name-only
+   HEAD` (uncommitted working-tree changes too — a build child's Tester precheck already
+   requires a commit before this stage runs, but running this script by hand mid-edit should
+   still be useful).
+3. From the changed paths, compute the test files to run:
+   - any changed path that already matches this repo's test-file convention
+     (`*.test.ts(x)` — see `TEST_PATH_PATTERNS` in `pipeline-precheck.ts` for the existing
+     convention list this repo already relies on) is included directly;
+   - any other changed `*.ts`/`*.tsx` file is checked for a sibling `<basename>.test.ts` (or
+     `.test.tsx`) in the same directory, included if it exists.
+4. Dedupe the resulting file list. If it's empty, print a one-line note ("no test files
+   affected by this diff") and exit 0 — a deliberately unconcerning outcome, since AC-6/the
+   unreferenced-AC check in `pipeline-precheck.ts` is the mechanism that catches a diff with
+   no test coverage at all; this script's job is only to be a faster stand-in for `bun test`
+   when there *are* affected tests, never an authority on "nothing needs testing."
+5. Otherwise run `bun test <files...>` (`Bun.spawn`, inherit stdio, propagate its exit code
+   via `process.exit`).
+
+This script is a convenience the pipeline's `renderProjectCommands` prefers per §2c; it is
+**never** what `runPipelinePrecheck` (the deterministic Tester-skip gate) runs — that
+continues to call `profile.test` (the full `bun test`), unchanged, so the skip-Tester
+decision's correctness bar doesn't shrink (AC-12, and the constraint against changing
+`precheckPasses`/`testerSkipEnabled`).
+
+### 2e. Typecheck: stays full-project, documented (AC-8)
+
+Decision: **no `typecheck:changed` script for this repo.** Rationale to record verbatim in
+the docs update (§4 below):
+
+- `tsc --noEmit` in this repo's non-project-references config type-checks the whole program
+  as one unit — a changed file's type can affect callers anywhere in the tree, so a
+  file-scoped subset of `tsc` invocations would under-report errors the diff actually
+  introduces (the same risk the ticket itself calls out).
+- Getting genuine per-file/per-package scoping would mean splitting the codebase into
+  TypeScript project references (`tsc -b`), which is a real architectural change with its own
+  maintenance cost (separate `tsconfig.json` per boundary, `references` graph upkeep) —
+  disproportionate to this ticket's scope.
+- A lower-risk partial win — turning on `--incremental` (a cached `.tsbuildinfo`, still a
+  full-project check, just faster on repeat invocations within the same worktree) — is
+  deliberately **not** included in this change either, to keep this ticket's blast radius to
+  what Finding 2 asks for; note it in the doc as a considered-but-deferred follow-up.
+
+No code change for this decision beyond the documentation entry — `profile.typecheckScoped`
+simply stays `null` for this repo since no `typecheck:changed` script exists, which is
+exactly the fallback path AC-5 requires.
+
+## 3. Finding 3 — bound a build child's debugging effort (prompt-only, no enforcement)
+
+`src/bun/pipeline-prompts.ts`, `childBuildPrompt`:
+
+Add one constant near the other sizing knobs (`DECOMPOSE_SINGLE_SUBTASK_MAX_FILES` etc.):
+
+```ts
+/** Rough tool-call count past which a build child should stop iterating and consolidate
+ *  (Finding 3 / O-13): commit what's working and report what's unresolved instead of
+ *  open-ended debugging. Picked well above what a normally-scoped single/few-file slice
+ *  needs for a couple of edit-and-verify cycles, and far below the 95-Bash-call runaway
+ *  session that motivated this — a guideline, not a hard trigger, so a slice that's
+ *  genuinely proceeding normally is never made to feel urgency it doesn't need (SPEC edge
+ *  case). Prose-only: there is no counter enforcing this (no sandboxing changes, per SPEC's
+ *  non-goals) — it only shapes what the prompt says.  */
+export const CHILD_DEBUG_CONSOLIDATE_TOOL_CALLS = 40;
+```
+
+Insert a new paragraph into `childBuildPrompt`'s `body`, between `${subtask.prompt}` and the
+existing "When you're done, commit…" paragraph:
+
+```ts
+const verificationBlock =
+  `\n\nVerify your work with what's already available (this repo's own typecheck/lint/test ` +
+  `commands, and any relevant e2e specs) instead of starting a second, separate long-running ` +
+  `process of your own (e.g. another dev server). If you truly cannot verify without a ` +
+  `running instance of the app, say so as a limitation in your final message instead of ` +
+  `improvising one.\n\n` +
+  `If you're well past what a change this size should normally take (rough guide: more than ` +
+  `about ${CHILD_DEBUG_CONSOLIDATE_TOOL_CALLS} tool calls, or repeated failed attempts at the ` +
+  `same fix), stop: commit what's working and state plainly in your final message what ` +
+  `remains unresolved, rather than iterating indefinitely.`;
+```
+
+and splice it in: `...${acBlock}${filesBlock}\n\n${subtask.prompt}${verificationBlock}\n\n` +
+`When you're done, commit...`. This satisfies AC-9 (verify with existing tooling, not a
+duplicate process), AC-10 (report the limitation instead of improvising one), and AC-11 (a
+soft consolidation checkpoint). Measured addition is ≈650 bytes; combined with the existing
+fixed-overhead budget test's ~1092-byte baseline this stays comfortably under that test's
+existing 2048-byte ceiling (verify after wording is finalized — do not raise the 2048 ceiling
+to make room; keep the added text tight instead, since the ceiling exists to keep the
+fast-argv-launch path available per the function's own doc comment).
+
+This block is added to `childBuildPrompt` only, not `buildingPrompt` (the non-decomposed
+single-Builder-stage path) — the ticket scopes Finding 3's evidence and fix specifically to
+the build-child path, and `buildingPrompt` is out of scope for this change.
+
+## 4. `docs/plans/pipeline-token-efficiency.md` (AC-14)
+
+Append a new `## 9. Follow-up (2026-09-13): cutting redundant checks and unbounded child
+debugging` section after the existing `## 8. As built` section (do not edit §1–§8's existing
+numbers/findings). Content:
+
+- One paragraph recapping the two confirmed root causes from the live 38.8M-token run
+  (linking back to this ticket's Finding 1/2/3, and to §2.3's "quadratic in message count"
+  factor this addendum specifically targets).
+- A table in the same style as §8's, with two new rows:
+
+  | Item | Where | Verified by | Kill switch |
+  | --- | --- | --- | --- |
+  | O-12 Tester precheck → project-commands handoff | `repo-profile.ts` `renderProjectCommands` skip-set param; `pipeline-precheck.ts` `precheckPassedChecks`; `pipelinePromptExtras` in `orchestrator.ts` | `repo-profile.test.ts`, `pipeline-precheck.test.ts`, token test file | none (falls back to unfiltered rendering on any error) |
+  | O-13 scoped/fast check preference + child debugging bound | `repo-profile.ts` (`*Scoped` fields, `<check>:changed` convention); `package.json` `test:changed` + `scripts/test-changed.ts`; `pipeline-prompts.ts` `childBuildPrompt` | `repo-profile.test.ts`, `pipeline-prompts.test.ts` | none (falls back to the full command when no scoped script exists) |
+
+- The AC-8 typecheck decision and rationale from §2e above, stated plainly (so it's
+  discoverable from the doc, not just this now-deleted PLAN.md/SPEC.md).
+- Re-run instructions: `bun run eval:pipeline:tokens` against a fresh pipeline run whose
+  Tester stage actually spawns (i.e. a run with an unreferenced AC, so the Tester isn't
+  skipped outright) and confirm its transcript no longer re-runs a check the precheck already
+  reported green.
+- Note the ticket's explicit non-goal (a trimmed pipeline-specific CLAUDE.md variant for when
+  the pipeline targets this repo itself) as still open, cross-referencing the existing §7
+  open-questions list rather than duplicating it.
+
+Do not alter any previously recorded measurement, table, or "As built" entry — this is an
+append-only addition per AC-14 and the ticket's explicit instruction.
+
+## 5. Tests
+
+- **`src/bun/repo-profile.test.ts`**
+  - Update the handful of exact `RepoProfile` object literals (`toEqual`) to include the four
+    new `*Scoped: null` fields (the "npm with package-lock" test, the "no package.json" test,
+    the "invalid JSON" test's `empty` literal).
+  - New: a fixture with `scripts: { test: "vitest run", "test:changed": "vitest related" }`
+    (etc. for typecheck) asserts `profile.testScoped === "npm run test:changed"` (or the
+    manager-appropriate form) and that `renderProjectCommands` renders `test: npm run
+    test:changed` (scoped preferred).
+  - New: a fixture with only `test:changed` and no `test` script asserts `testScoped` stays
+    `null` (full command must exist first).
+  - New: a fixture with `test:changed` but not `lint:changed` asserts `test` is scoped and
+    `lint` (if present) still renders its full command (AC-6, independence).
+  - New: `renderProjectCommands` with a `skipChecks` set containing one known check name
+    asserts that check's line is entirely absent and the others are unaffected; called with
+    no `skipChecks` at all asserts byte-identical output to before this change (reuse the
+    existing "full profile … under 400 bytes" fixture verbatim).
+  - New: `renderProjectCommands` with `skipChecks` covering *every* known check but
+    `profile.install` non-null still renders the block (just the install line) — the "no
+    known commands" early return must stay keyed on the unfiltered command set, not the
+    post-skip one.
+
+- **`src/bun/pipeline-precheck.test.ts`**
+  - New: `precheckPassedChecks` returns the `ok:true` result names only, from a summary with
+    a mix of passing/failing results; empty summary → empty set.
+
+- **`src/bun/orchestrator-pipeline-token.test.ts`**
+  - New: seed `pipeline_stage_state.precheck` (or drive it the same way the existing "a
+    failing command spawns the Tester…" test does — via a real `runTesterGate` pass with one
+    command green and one red/unreferenced) and assert the resulting Tester prompt's `##
+    Project commands` block contains the failed/unreferenced check's runnable line but *not*
+    the green one's (AC-1/AC-2). Pair it with a same-shape assertion that when nothing has
+    been precomputed (fresh testing-stage entry, no precheck stored) the block is unchanged
+    from today (AC-3) — this can extend the existing "no package.json → the Tester is spawned
+    exactly as before" test or sit alongside it with a package.json present.
+  - Do not weaken or remove any of the existing 5 tester-gate tests (lines ~209–292 as they
+    stand today) — they continue to pass unmodified since `skipChecks` is only populated when
+    a precheck summary is actually stored for that turn, and those tests' assertions on `##
+    Pre-run checks` (a different block, from `renderPrecheck`) are untouched by this change.
+
+- **`src/bun/pipeline-prompts.test.ts`**
+  - New: `childBuildPrompt` output contains the new fixed-string guidance (assert on stable
+    substrings like `"do not improvise one"`, `"say so as a limitation"`, `"stop: commit
+    what's working"` — match whatever exact wording lands in §3, the point is a fixed-string
+    presence check per the ticket's own guidance for this AC, matching how O-9's existing
+    bound instructions are tested).
+  - Update the existing "fixed overhead stays well inside the claude argv budget" test only if
+    the byte math requires it — per §3 above, the wording is sized to keep this test's
+    existing `toBeLessThan(2048)` assertion passing unmodified; do not raise the ceiling to
+    accommodate the new text.
+
+## 6. Definition of done checklist (for Build/Test stages)
+
+- `bun run typecheck` and `bun test` green, including every new/updated test above.
+- A fresh `bun run eval:pipeline:tokens` run (per §4) shows the Tester no longer re-running a
+  precheck-confirmed-green check.
+- `docs/plans/pipeline-token-efficiency.md` has the new appended section; nothing above it
+  changed.
+- Every new mechanism verified fail-open: a thrown error inside the new `skipChecks`
+  derivation, or a profile with no `:changed` scripts anywhere, renders prompts byte-identical
+  to pre-change behavior (AC-13).
