@@ -393,6 +393,13 @@ export const DECOMPOSE_SOFT_MAX_SUBTASKS = 8;
  *  inside childBuildPrompt (argv-delivered when small enough) and is re-read
  *  on every child turn, so bloat here is paid many times over. */
 export const CHILD_SUBTASK_PROMPT_MAX_BYTES = 2048;
+/** Rough tool-call count past which a build child should stop iterating and
+ *  consolidate: commit what's working and report what's unresolved instead
+ *  of open-ended debugging. A guideline folded into `childBuildPrompt`'s
+ *  prose, not an enforced counter — there is no sandboxing or hard cutoff,
+ *  so a slice that's genuinely proceeding normally is never made to feel
+ *  urgency it doesn't need. */
+export const CHILD_DEBUG_CONSOLIDATE_TOOL_CALLS = 40;
 
 /**
  * Advisory checks over an already-parsed {@link BuildPlan}. Pure; returns
@@ -733,6 +740,16 @@ export function childBuildPrompt(
       `describe the exact needed change in your final message instead, so the integration ` +
       `slice can apply it.`
     : "";
+  const verificationBlock =
+    `\n\nVerify your work with what's already available (this repo's own typecheck/lint/test ` +
+    `commands, and any relevant e2e specs) instead of starting a second, separate long-running ` +
+    `process of your own (e.g. another dev server). If you truly cannot verify without a ` +
+    `running instance of the app, say so as a limitation in your final message instead of ` +
+    `improvising one.\n\n` +
+    `If you're well past what a change this size should normally take (rough guide: more than ` +
+    `about ${CHILD_DEBUG_CONSOLIDATE_TOOL_CALLS} tool calls, or repeated failed attempts at the ` +
+    `same fix), stop: commit what's working and state plainly in your final message what ` +
+    `remains unresolved, rather than iterating indefinitely.`;
   const body =
     `You are one of several agents implementing independent slices of a larger plan in ` +
     `parallel, each in your own git worktree branched off the same commit. Your slice: ` +
@@ -740,7 +757,7 @@ export function childBuildPrompt(
     `${PIPELINE_PLAN_FILE} at the repository root has the full plan for context — read it ` +
     `if you need to understand how your slice fits in, but implement ONLY what's described ` +
     `below; the other slices are being built separately and will be merged in alongside ` +
-    `yours.${acBlock}${filesBlock}\n\n${subtask.prompt}\n\n` +
+    `yours.${acBlock}${filesBlock}\n\n${subtask.prompt}${verificationBlock}\n\n` +
     `When you're done, commit your changes locally with a clear commit message (prefix the ` +
     `subject with "${ccType}:", e.g. "${ccType}: ..."). This step is required — your work ` +
     `is only picked up by the rest of the pipeline once it's committed. Do NOT push, do not ` +

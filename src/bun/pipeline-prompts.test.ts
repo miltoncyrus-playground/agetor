@@ -11,6 +11,7 @@ import {
   DECOMPOSE_SINGLE_SUBTASK_MAX_FILES,
   DECOMPOSE_SOFT_MAX_SUBTASKS,
   CHILD_SUBTASK_PROMPT_MAX_BYTES,
+  CHILD_DEBUG_CONSOLIDATE_TOOL_CALLS,
   PIPELINE_PLAN_FILE,
   PIPELINE_TASKS_FILE,
   PIPELINE_SPEC_FILE,
@@ -330,6 +331,24 @@ test("childBuildPrompt: references owned ACs by id and points at SPEC.md for the
   expect(p).toContain("AC-1");
   expect(p).toContain("AC-2");
   expect(p).toContain(PIPELINE_SPEC_FILE);
+});
+
+test("childBuildPrompt: tells the child to verify with existing tooling and report limitations instead of improvising a running instance", () => {
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
+    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [], acceptanceCriteria: [], files: [] },
+  );
+  expect(p).toContain("typecheck/lint/test");
+  expect(p).toContain("say so as a limitation");
+});
+
+test("childBuildPrompt: tells the child to consolidate and stop past a rough tool-call guideline", () => {
+  const p = childBuildPrompt(
+    task({ pipelineStage: "building", branch: "feature/dark-mode", prompt: "Add dark mode" }),
+    { id: "toggle", title: "Add the toggle", prompt: "Add a toggle component to settings.", dependsOn: [], acceptanceCriteria: [], files: [] },
+  );
+  expect(p).toContain(`about ${CHILD_DEBUG_CONSOLIDATE_TOOL_CALLS} tool calls`);
+  expect(p).toContain("stop: commit what's working");
 });
 
 test("childBuildPrompt: fixed overhead stays well inside the claude argv budget", () => {
