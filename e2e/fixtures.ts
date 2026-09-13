@@ -255,7 +255,9 @@ async function provisionBackend(
   githubStubPort: number,
   logLabel: string,
   use: (backend: E2EBackend) => Promise<void>,
+  options?: { fakePickRefsDir?: boolean },
 ): Promise<void> {
+  const fakePickRefsDir = options?.fakePickRefsDir ?? true;
   const apiBase = `http://127.0.0.1:${apiPort}`;
 
   await assertPortFree(apiBase, apiPort);
@@ -331,8 +333,10 @@ async function provisionBackend(
       // until something calls startGitHubStub(backend.githubStubPort, ...).
       AGETOR_GITHUB_API_BASE: `http://127.0.0.1:${githubStubPort}`,
       // Test seam for `/refs/pick` (src/bun/server.ts) — see fakePickDir
-      // above. Never set in production launches.
-      AGETOR_FAKE_PICK_REFS_DIR: fakePickDir,
+      // above. Never set in production launches. Omitted when
+      // `fakePickRefsDir` is false, so the real headless `candidates`
+      // branch in server.ts fires instead (see `headlessPickBackend`).
+      ...(fakePickRefsDir ? { AGETOR_FAKE_PICK_REFS_DIR: fakePickDir } : {}),
       // So `githubToken()` resolves this literal token from env and never
       // shells out to `gh auth token` on the dev machine (which could hang,
       // fail, or leak a real token into a test run).
@@ -457,7 +461,17 @@ const FRESH_BASE_API_PORT = 4700;
 const GITHUB_STUB_BASE_PORT = 4800;
 const FRESH_GITHUB_STUB_BASE_PORT = 4900;
 
-export const test = base.extend<{ freshBackend: E2EBackend }, { backend: E2EBackend }>({
+// Disjoint from every range above (4600-4531... up through 4900+) —
+// `headlessPickBackend` is test-scoped like `freshBackend`, but spawned
+// with `fakePickRefsDir: false` so `/refs/pick` exercises the real headless
+// `candidates` branch instead of the fixture-dir shortcut.
+const HEADLESS_PICK_BASE_API_PORT = 5000;
+const HEADLESS_PICK_GITHUB_STUB_BASE_PORT = 5100;
+
+export const test = base.extend<
+  { freshBackend: E2EBackend; headlessPickBackend: E2EBackend },
+  { backend: E2EBackend }
+>({
   backend: [
     async ({}, use, workerInfo) => {
       // `parallelIndex` is the stable 0..(workers-1) slot this worker
@@ -498,5 +512,25 @@ export const test = base.extend<{ freshBackend: E2EBackend }, { backend: E2EBack
     const apiToken = `e2e-fresh-w${testInfo.parallelIndex}-${randomUUID()}`;
     const githubStubPort = FRESH_GITHUB_STUB_BASE_PORT + testInfo.parallelIndex;
     await provisionBackend(apiPort, apiToken, githubStubPort, `test "${testInfo.title}"`, use);
+  },
+
+  // Test-scoped, structurally identical to `freshBackend` above, but spawned
+  // WITHOUT `AGETOR_FAKE_PICK_REFS_DIR` — so `/refs/pick` takes the real
+  // headless "no native, no fixture" path and returns `{ candidates }`
+  // instead of `{ refs }`. Backs e2e/folder-picker-dialog.spec.ts, which
+  // exercises the webview's `FolderPickerDialog` (the candidates branch is
+  // otherwise unreachable in every other spec's fixture-backed backend).
+  headlessPickBackend: async ({}, use, testInfo) => {
+    const apiPort = HEADLESS_PICK_BASE_API_PORT + testInfo.parallelIndex;
+    const apiToken = `e2e-pick-w${testInfo.parallelIndex}-${randomUUID()}`;
+    const githubStubPort = HEADLESS_PICK_GITHUB_STUB_BASE_PORT + testInfo.parallelIndex;
+    await provisionBackend(
+      apiPort,
+      apiToken,
+      githubStubPort,
+      `test "${testInfo.title}" (headlessPick)`,
+      use,
+      { fakePickRefsDir: false },
+    );
   },
 });

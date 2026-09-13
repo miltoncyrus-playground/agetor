@@ -430,6 +430,13 @@ export interface HarnessInput {
   env: Record<string, string>;
 }
 
+/** Discriminated result of `pickRefs`: either the (possibly empty) refs a
+ *  native/fixture pick already resolved, or a flat candidate directory list
+ *  for the headless picker dialog to render. */
+export type PickRefsResult =
+  | { kind: "refs"; refs: TaskReference[] }
+  | { kind: "candidates"; candidates: string[] };
+
 export const api = {
   defaults: () => j<AppDefaults>("/defaults"),
   info: () => j<{ version: string }>("/info"),
@@ -538,12 +545,27 @@ export const api = {
   /** Open a native file/folder picker and return the chosen references.
    *  WKWebView never exposes `File.path`, so this native panel is the only
    *  reliable way to turn a user pick into an absolute path. Returns `[]` on
-   *  cancel. `isDirectory` follows `mode`. */
-  pickRefs: (mode: "files" | "folder", startingFolder?: string) =>
+   *  cancel. `isDirectory` follows `mode`. In headless mode (no native bridge,
+   *  no fixture dir) the server instead returns a flat candidate directory
+   *  list for the caller to render as a picker. */
+  pickRefs: (mode: "files" | "folder", startingFolder?: string): Promise<PickRefsResult> =>
     j<{ refs?: TaskReference[]; candidates?: string[] }>("/refs/pick", {
       method: "POST",
       body: JSON.stringify({ mode, startingFolder }),
-    }).then((r) => r.refs ?? []),
+    }).then((r) =>
+      r.candidates !== undefined
+        ? { kind: "candidates", candidates: r.candidates }
+        : { kind: "refs", refs: r.refs ?? [] },
+    ),
+  /** Resolve one candidate/manual path into refs for the headless picker.
+   *  `mode: "folder"` yields a single directory ref; `mode: "files"` lists
+   *  every immediate regular file in that directory. Throws `ApiError` (400)
+   *  with a user-facing message on an invalid path. */
+  selectPickedRef: (path: string, mode: "files" | "folder") =>
+    j<{ refs: TaskReference[] }>("/refs/pick/select", {
+      method: "POST",
+      body: JSON.stringify({ path, mode }),
+    }),
   /** Resolve absolute paths (pulled from a drag/drop's file:// URLs) into
    *  references — the server stats each for directory-ness and drops any
    *  that no longer exist. */
