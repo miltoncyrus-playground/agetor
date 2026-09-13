@@ -40,7 +40,6 @@ test("every native-host route returns 501 when running headless", async () => {
     ["/open-external", { method: "POST", headers: auth(), body: JSON.stringify({ url: "https://example.com" }) }],
     ["/open-path", { method: "POST", headers: auth(), body: JSON.stringify({ path: "/tmp" }) }],
     ["/projects/pick", { method: "POST", headers: auth(), body: "{}" }],
-    ["/refs/pick", { method: "POST", headers: auth(), body: "{}" }],
     ["/updates/status", { method: "GET", headers: auth() }],
     ["/updates/check", { method: "POST", headers: auth() }],
     ["/updates/apply", { method: "POST", headers: auth() }],
@@ -50,6 +49,14 @@ test("every native-host route returns 501 when running headless", async () => {
     const res = await fetch(u(p), init);
     expect({ route: p, status: res.status }).toEqual({ route: p, status: 501 });
   }
+});
+
+test("/refs/pick returns a non-error candidate list when running headless", async () => {
+  const res = await fetch(u("/refs/pick"), { method: "POST", headers: auth(), body: "{}" });
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { candidates?: string[]; refs?: unknown[] };
+  expect(Array.isArray(body.candidates)).toBe(true);
+  expect(body.refs).toEqual([]);
 });
 
 test("native routes still enforce the token (401 without it)", async () => {
