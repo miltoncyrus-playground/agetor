@@ -7,6 +7,7 @@ import { iconForRef, refBasename } from "@/lib/file-icons";
 import { captureDroppedOrPastedItems } from "@/lib/capture-refs";
 import type { CaptureResult } from "@/lib/capture-refs";
 import { api } from "@/lib/api";
+import { FolderPickerDialog } from "./FolderPickerDialog";
 import type { TaskReference } from "../../../shared/types.ts";
 
 export { captureDroppedOrPastedItems, type CapturedItem, type CaptureResult } from "@/lib/capture-refs";
@@ -76,6 +77,10 @@ export function ReferencesPicker({
   const [dragging, setDragging] = useState(false);
   const [picking, setPicking] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  const [dialog, setDialog] = useState<
+    | null
+    | { mode: "files" | "folder"; candidates: string[] }
+  >(null);
   // Local open state for the expandable variant. We auto-open the section
   // the first time refs flip from empty → non-empty so adding the first
   // file reveals the list — but never force it open afterwards, so the
@@ -100,8 +105,12 @@ export function ReferencesPicker({
     setHint(null);
     setPicking(true);
     try {
-      const picked = await api.pickRefs(mode, startingFolder);
-      if (picked.length) append(picked);
+      const result = await api.pickRefs(mode, startingFolder);
+      if (result.kind === "refs") {
+        if (result.refs.length) append(result.refs);
+      } else {
+        setDialog({ mode, candidates: result.candidates });
+      }
     } catch (e) {
       setHint(`Couldn't open the picker: ${(e as Error).message}`);
     } finally {
@@ -200,6 +209,18 @@ export function ReferencesPicker({
     </div>
   );
 
+  const folderPickerDialog = dialog && (
+    <FolderPickerDialog
+      open
+      mode={dialog.mode}
+      candidates={dialog.candidates}
+      onDone={(picked) => {
+        setDialog(null);
+        if (picked.length) append(picked);
+      }}
+    />
+  );
+
   if (variant === "inline") {
     // When empty, render a single compact row (no placeholder strip) — the
     // send box already has the textarea below to spell out the intent.
@@ -227,6 +248,7 @@ export function ReferencesPicker({
         )}
         {hint && <p className="mt-1 text-[10px] text-muted-foreground">{hint}</p>}
         {dropOverlay}
+        {folderPickerDialog}
       </div>
     );
   }
@@ -267,6 +289,7 @@ export function ReferencesPicker({
         {hint && <p className="text-[10px] text-muted-foreground">{hint}</p>}
       </div>
       {dropOverlay}
+      {folderPickerDialog}
     </details>
   );
 }
