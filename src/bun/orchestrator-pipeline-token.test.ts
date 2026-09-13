@@ -242,6 +242,12 @@ test("tester gate: a failing command spawns the Tester with the failure output f
   expect(testerPrompt).toContain("- test: FAILED (exit 2)");
   expect(testerPrompt).toContain("assertion-boom");
   expect(testerPrompt).toContain("Start from the failures");
+  // Finding 1 / O-12: the already-green typecheck's runnable command is
+  // omitted from ## Project commands, but the still-failing test's line
+  // stays (AC-1/AC-2) — narrated failure output above, not a duplicate ask.
+  expect(testerPrompt).toContain("## Project commands");
+  expect(testerPrompt).toContain("test: npm run test");
+  expect(testerPrompt).not.toContain("typecheck: npm run typecheck");
   expect(statusLines(reviewRunId).some((l) => l.includes("precheck: test failed"))).toBe(true);
   // The Tester's settle clears the stored precheck either way.
   runs.appendEvent(tasks.get(taskId)!.runId!, "assistant", "fixed\nPIPELINE_VERDICT: pass");
@@ -279,6 +285,22 @@ test("tester gate: AGETOR_PIPELINE_TESTER_SKIP=0 keeps the precheck but always s
   } finally {
     if (prior === undefined) delete process.env.AGETOR_PIPELINE_TESTER_SKIP; else process.env.AGETOR_PIPELINE_TESTER_SKIP = prior;
   }
+});
+
+test("tester gate: a testing-stage turn with no precheck stored renders ## Project commands unchanged (AC-3)", async () => {
+  const workdir = makeWorkdir();
+  writePackageJson(workdir, { typecheck: "echo tc-ok", test: "echo ok" });
+  // Entered directly, not via a code-review approve — no precheck was ever
+  // stored for this task, so `pipelinePromptExtras` reads `null` and
+  // `skipChecks` stays `undefined`.
+  const taskId = insertPipelineTask(workdir, { pipelineStage: "testing", planApproved: true });
+  const runId = await start(taskId);
+  const prompt = firstUserPrompt(runId);
+  expect(pipelineState.getPrecheck(taskId)).toBeNull();
+  expect(prompt).toContain("## Project commands");
+  expect(prompt).toContain("typecheck: npm run typecheck");
+  expect(prompt).toContain("test: npm run test");
+  expect(prompt).not.toContain("## Pre-run checks");
 });
 
 test("tester gate: no package.json → the Tester is spawned exactly as before (no precheck block)", async () => {

@@ -17,6 +17,9 @@ import path from "node:path";
  * Only the JS/TS ecosystem is detected. Anything else yields an all-null
  * profile and `renderProjectCommands` returns "" so no block is injected.
  */
+/** The four verification checks agetor knows how to render/skip. */
+export type CheckName = "typecheck" | "lint" | "test" | "build";
+
 export interface RepoProfile {
   packageManager: "npm" | "pnpm" | "yarn" | "bun" | null;
   install: string | null;
@@ -24,6 +27,19 @@ export interface RepoProfile {
   lint: string | null;
   test: string | null;
   build: string | null;
+  /** Fast, change-scoped variant of each check above, when the project exposes one under
+   *  the `<check>:changed` script-name convention (O-13) — e.g. `test:changed` alongside
+   *  `test`. Independent per check (AC-6): a project may have `test:changed` and no
+   *  `lint:changed`. Only ever set when the FULL command for that same check also exists —
+   *  a scoped variant is a fast alternative for an existing check, not a way to invent one.
+   *  `renderProjectCommands` prefers this over the full command when rendering; nothing
+   *  else (in particular `runPipelinePrecheck`, the deterministic Tester-skip gate) reads
+   *  these fields — the pipeline's own correctness gate always uses the full command, so a
+   *  diff-scoped check can never weaken what "green" means for skipping the Tester. */
+  typecheckScoped: string | null;
+  lintScoped: string | null;
+  testScoped: string | null;
+  buildScoped: string | null;
   workspaces: boolean;
   lockfile: string | null;
 }
@@ -59,6 +75,10 @@ const EMPTY_PROFILE: RepoProfile = {
   lint: null,
   test: null,
   build: null,
+  typecheckScoped: null,
+  lintScoped: null,
+  testScoped: null,
+  buildScoped: null,
   workspaces: false,
   lockfile: null,
 };
@@ -118,13 +138,24 @@ export function detectRepoProfileFromFiles(files: { packageJson: string | null; 
   const hasScript = (key: string): boolean => typeof scripts[key] === "string" && (scripts[key] as string).trim() !== "";
   const typecheckKey = TYPECHECK_SCRIPT_KEYS.find(hasScript) ?? null;
 
+  // Fast/scoped variant convention (O-13): always looked up under the
+  // CANONICAL check label (`typecheck:changed`), never the alias that
+  // satisfied the full command (`tsc:changed` is not recognised even when
+  // `tsc` is the script that answered the typecheck) — a project whose
+  // typecheck runs via a `tsc` script still exposes its fast path as
+  // `typecheck:changed`. A scoped script is only meaningful relative to an
+  // existing full check, so each is gated on the full command existing too.
   return {
     packageManager: manager,
     install: installCommand(manager, lockfile),
     typecheck: typecheckKey ? runScriptCommand(manager, typecheckKey) : null,
+    typecheckScoped: typecheckKey && hasScript("typecheck:changed") ? runScriptCommand(manager, "typecheck:changed") : null,
     lint: hasScript("lint") ? runScriptCommand(manager, "lint") : null,
+    lintScoped: hasScript("lint") && hasScript("lint:changed") ? runScriptCommand(manager, "lint:changed") : null,
     test: hasScript("test") ? runScriptCommand(manager, "test") : null,
+    testScoped: hasScript("test") && hasScript("test:changed") ? runScriptCommand(manager, "test:changed") : null,
     build: hasScript("build") ? runScriptCommand(manager, "build") : null,
+    buildScoped: hasScript("build") && hasScript("build:changed") ? runScriptCommand(manager, "build:changed") : null,
     workspaces: pkg.workspaces !== undefined && pkg.workspaces !== null,
     lockfile,
   };
@@ -173,14 +204,20 @@ export function lockfileHash(cwd: string): string | null {
  * nothing. Kept well under 400 bytes for a full profile: every byte here is
  * repeated into every stage prompt of every pipeline.
  */
-export function renderProjectCommands(profile: RepoProfile, opts: { installed: boolean }): string {
-  const commands: Array<[string, string | null]> = [
-    ["typecheck", profile.typecheck],
-    ["lint", profile.lint],
-    ["test", profile.test],
-    ["build", profile.build],
+export function renderProjectCommands(
+  profile: RepoProfile,
+  opts: { installed: boolean; skipChecks?: ReadonlySet<CheckName> },
+): string {
+  const commands: Array<[CheckName, string | null, string | null]> = [
+    ["typecheck", profile.typecheck, profile.typecheckScoped],
+    ["lint", profile.lint, profile.lintScoped],
+    ["test", profile.test, profile.testScoped],
+    ["build", profile.build, profile.buildScoped],
   ];
-  const known = commands.filter((c): c is [string, string] => c[1] !== null);
+  // "No known commands at all" is evaluated on the unfiltered (full) command
+  // set — a profile with real commands is never treated as empty just
+  // because this turn happens to skip all of them via `skipChecks`.
+  const known = commands.filter((c): c is [CheckName, string, string | null] => c[1] !== null);
   if (known.length === 0 && profile.install === null) return "";
 
   const lines: string[] = ["## Project commands"];
@@ -189,7 +226,10 @@ export function renderProjectCommands(profile: RepoProfile, opts: { installed: b
   } else if (profile.install) {
     lines.push(`install: ${profile.install}`);
   }
-  for (const [label, cmd] of known) lines.push(`${label}: ${cmd}`);
+  for (const [label, cmd, scopedCmd] of known) {
+    if (opts.skipChecks?.has(label)) continue;
+    lines.push(`${label}: ${scopedCmd ?? cmd}`);
+  }
   if (profile.workspaces) lines.push("workspaces: yes (monorepo; run commands from the root)");
   return lines.join("\n");
 }

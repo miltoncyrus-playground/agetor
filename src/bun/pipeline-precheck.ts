@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
-import { runCheck, type RepoProfile } from "./repo-profile.ts";
+import { runCheck, type RepoProfile, type CheckName } from "./repo-profile.ts";
 import type { PrecheckSummary, PrecheckResult } from "./pipeline-state.ts";
 
 /**
@@ -74,6 +74,13 @@ export function readTestFiles(cwd: string): string[] {
  *  there is nothing deterministic to stand on, so the Tester runs. */
 export function precheckPasses(summary: PrecheckSummary): boolean {
   return summary.results.length > 0 && summary.results.every((r) => r.ok) && summary.unreferencedAcs.length === 0;
+}
+
+/** Which of a precheck's commands passed — the skip-set `renderProjectCommands` uses to
+ *  drop an already-confirmed-green check's runnable line for this Tester turn (Finding 1 /
+ *  O-12). */
+export function precheckPassedChecks(summary: PrecheckSummary): Set<CheckName> {
+  return new Set(summary.results.filter((r) => r.ok).map((r) => r.name));
 }
 
 /** Env kill-switch: `AGETOR_PIPELINE_TESTER_SKIP=0` keeps the precheck

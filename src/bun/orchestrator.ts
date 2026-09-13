@@ -176,11 +176,11 @@ import {
 import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { expandAtReferencesDetailed } from "./project-files.ts";
-import { pipelineState } from "./pipeline-state.ts";
+import { pipelineState, type PrecheckSummary } from "./pipeline-state.ts";
 import { readRepoProfile, renderProjectCommands, ensureDependenciesInstalled } from "./repo-profile.ts";
 import { extractHandoff, renderHandoff } from "./stage-handoff.ts";
 import { writeReviewDiff, removeReviewDiff } from "./review-diff.ts";
-import { runPipelinePrecheck, precheckPasses, precheckEnabled, testerSkipEnabled } from "./pipeline-precheck.ts";
+import { runPipelinePrecheck, precheckPasses, precheckEnabled, testerSkipEnabled, precheckPassedChecks } from "./pipeline-precheck.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -1176,6 +1176,21 @@ async function pipelinePromptExtras(
   const isChild = task.parentTaskId != null;
   const stage = task.pipelineStage;
 
+  // O-5/O-12: read the precheck FIRST so the testing stage's own
+  // ## Project commands block (below) can omit an already-green check's
+  // runnable line instead of just narrating it — Finding 1. Read failure
+  // degrades to "no precheck" here, which also disables the omission; it
+  // never blocks the run.
+  let precheckSummary: PrecheckSummary | null = null;
+  if (stage === "testing") {
+    try {
+      precheckSummary = pipelineState.getPrecheck(task.id);
+      extras.precheck = precheckSummary;
+    } catch (err) {
+      console.error(`[agetor] precheck read failed for task ${task.id}:`, err);
+    }
+  }
+
   // O-4: repo profile + one-time install. Children each get their own
   // worktree, so each installs once (lockfile-hash marker makes re-runs a
   // no-op) — the same install the agent used to run itself, minus the
@@ -1190,7 +1205,8 @@ async function pipelinePromptExtras(
         if (r.ran) log(r.ok ? "dependencies installed" : `dependency install failed — leaving it to the agent: ${r.detail.slice(-400)}`);
         installed = installed || r.ok;
       }
-      extras.projectCommands = renderProjectCommands(profile, { installed }) || null;
+      const skipChecks = precheckSummary ? precheckPassedChecks(precheckSummary) : undefined;
+      extras.projectCommands = renderProjectCommands(profile, { installed, skipChecks }) || null;
     } catch (err) {
       console.error(`[agetor] repo profile failed for task ${task.id}:`, err);
     }
@@ -1225,14 +1241,6 @@ async function pipelinePromptExtras(
     }
   }
 
-  // O-5: hand the Tester agetor's own check results (set by runTesterGate).
-  if (stage === "testing") {
-    try {
-      extras.precheck = pipelineState.getPrecheck(task.id);
-    } catch (err) {
-      console.error(`[agetor] precheck read failed for task ${task.id}:`, err);
-    }
-  }
   return extras;
 }
 
