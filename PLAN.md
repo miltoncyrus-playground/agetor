@@ -1,193 +1,203 @@
-# PLAN — Webview folder/file picker for headless mode
+# Plan — O-14: trimmed CLAUDE.md for pipeline/child sessions
 
-## Confirmed contract (read before coding)
+## 0. Confirmed mechanism (read before writing code)
 
-`src/bun/refs-pick.ts` + the two routes in `src/bun/server.ts` (already merged, untouched by this task):
+O-2 (`src/bun/orchestrator.ts`, `pipelineLeanContext`) already:
+- returns `null` (full-context spawn, unchanged) unless `harnessKind === "claude-code"` AND (`task.pipelineStage != null || task.parentTaskId != null`) AND `leanContextEnabled()`.
+- when active, resolves `appendSystemPromptFile` to `join(cwd, "CLAUDE.md")` if that file exists at the prepared worktree root, else `null`.
+- `agents.ts` (`buildCommand`, ~line 551-561) only ever does `args.push("--append-system-prompt-file", opts.leanContext.appendSystemPromptFile)` plus set the two `CLAUDE_CODE_DISABLE_*` env vars — it has no opinion on the file's contents, so **agents.ts needs no changes at all** for this task.
+- `pipelineLeanContext` is called inline in `startTask` (orchestrator.ts, ~line 1496) and its existing tests (`orchestrator-pipeline.test.ts` lines ~1179-1233) assert the exact literal path `path.join(withMd, "CLAUDE.md")` is returned when the fixture worktree has a `CLAUDE.md`. **`pipelineLeanContext` itself must not change** — those tests must keep passing unmodified. The filtering step is therefore a separate, new function applied to `pipelineLeanContext`'s output at the `startTask` call site, not a change inside `pipelineLeanContext`.
 
-- `POST /refs/pick { mode, startingFolder }`:
-  - Native-dialog path or `AGETOR_FAKE_PICK_REFS_DIR` set → `{ refs: TaskReference[] }` (refs may be `[]` on cancel).
-  - Headless, no fixture → `{ candidates: string[], refs: [] }`. `candidates` is a flat list of absolute directory paths (`headlessPickCandidates()`, capped at `MAX_PICK_CANDIDATES = 50`), already ordered/deduped server-side (AC-2) — the client must not re-sort or re-dedupe it, only filter it live by substring (AC-6).
-- `POST /refs/pick/select { path, mode }` (no `native` dependency — works headless):
-  - `mode: "folder"` → `{ refs: [{ path, isDirectory: true }] }` for a valid directory, else `{ error: string }` (400) with one of `"enter an absolute path"`, `"path not found"`, `"not a directory"`.
-  - `mode: "files"` → `{ refs: [...] }` listing **every** immediate regular file in that directory (each `{ path, isDirectory: false }`, dotfiles excluded, name-sorted), or the same `{ error }` shapes on an invalid path.
-  - Key implication: in files mode, the second-level "listing" the browser needs to show is exactly the `refs` array this endpoint already returns — no separate listing call. The single-file-click-confirms behavior (Q1) is a **client-side** narrowing of that already-fetched array to one element; it does not require a new request.
+## 1. New pure module: `src/bun/claude-md-filter.ts`
 
-This confirms the CLI's `AgentClient.pickRefs`/`selectPickedRef` (`src/cli/api-client.ts:328-345`) and `DirPickerOverlay.tsx`'s `startPick`/`selectDir`/`submitManual` are the exact reference flow to mirror in the webview, with one deliberate divergence: `DirPickerOverlay`'s `fileslist` screen bulk-confirms all files on Enter; the webview's second-level list must instead resolve on a single row click (per SPEC.md's Q1/A and AC-4).
+Exports:
 
-## 1. `src/mainview/lib/api.ts` — stop collapsing `candidates` into `[]`
-
-Current (line ~542-546):
 ```ts
-pickRefs: (mode, startingFolder) =>
-  j<{ refs?: TaskReference[]; candidates?: string[] }>("/refs/pick", {...})
-    .then((r) => r.refs ?? []),
+export function filterClaudeMdForPipeline(text: string, opts: { agentKind: string }): string
 ```
 
-Change `pickRefs`'s return type to a discriminated result so callers can't accidentally treat "show me a candidate list" as "nothing selected":
+Also export the two heading sentinels as constants (mirrors `HANDOFF_HEADING` in `stage-handoff.ts`) so the module and its tests agree on exact strings, and so nothing else needs to hardcode them:
 
 ```ts
-export type PickRefsResult =
-  | { kind: "refs"; refs: TaskReference[] }
-  | { kind: "candidates"; candidates: string[] };
-
-pickRefs: (mode: "files" | "folder", startingFolder?: string): Promise<PickRefsResult> =>
-  j<{ refs?: TaskReference[]; candidates?: string[] }>("/refs/pick", {
-    method: "POST",
-    body: JSON.stringify({ mode, startingFolder }),
-  }).then((r) =>
-    r.candidates !== undefined
-      ? { kind: "candidates", candidates: r.candidates }
-      : { kind: "refs", refs: r.refs ?? [] },
-  ),
+export const AGENT_COMMAND_SHAPE_HEADING = "### Agent command shape";
+export const JUBARTEAI_HEADING = "## JubarteAI Agent Identity";
 ```
 
-Branching on `r.candidates !== undefined` (not `r.refs`) matters: the native/fixture path always sends `{ refs: [...] }` with no `candidates` key at all (confirmed above), and the headless path always sends `candidates` alongside a `refs: []` filler — so checking for `candidates` presence is the one unambiguous discriminator; checking falsy-`refs` would also misfire on a native cancel (`{ refs: [] }`, no `candidates`), which must stay in the `"refs"` branch.
+No filesystem or process access anywhere in this file — plain string in, string out.
 
-Add `selectPickedRef`, mirroring `AgentClient.selectPickedRef`:
+### 1a. Generic heading-section bounds helper
+
+A private helper `findHeadingSection(text, headingText)` that:
+- splits `text` into lines, tracking each line's starting char offset (so we can slice back into the original string without re-joining lines and risking an off-by-one on trailing newlines).
+- finds the **first** line whose trimmed content equals `headingText` exactly. Its heading level = the count of leading `#` chars (regex `/^(#{1,6})\s/`). Not found → return `null`.
+- scans forward from the line after the heading for the first line that is *itself* a heading (matches the same `#{1,6}\s` pattern) whose level is `<=` the found heading's level. That line's start offset is the section end; if none found, the section runs to end-of-string.
+- returns `{ headingStart, headingLineEnd, sectionEnd }` — `headingLineEnd` is the offset immediately after the heading line's own newline (start of the section body), so callers can keep the heading line untouched and only operate on the body.
+
+This one helper serves both cuts below — "next heading of the same-or-higher level" is exactly "level `<=` the section heading's own level," which is what makes it correctly stop `### Agent command shape` at the next `###`-or-higher heading (in the live file today, `### Claude session lifecycle`) and stop `## JubarteAI Agent Identity` at end-of-file (or a future `##`-or-higher heading, per the ticket's explicit "don't assume it's always last").
+
+### 1b. Cut 1 — Agent command shape bullets
+
+Private `cutAgentCommandShapeSection(text, agentKind)`:
+1. `findHeadingSection(text, AGENT_COMMAND_SHAPE_HEADING)` → `null` means the heading isn't there (renamed/missing) → return `text` unchanged (fail-open: this cut simply doesn't happen).
+2. Take `body = text.slice(headingLineEnd, sectionEnd)`.
+3. Match every bullet start in `body` with a global regex anchored to line start, e.g. `/^- \*\*`([\w.-]+)`\*\* →/gm` (confirmed live pattern in `CLAUDE.md` today: `- **\`claude-code\`** → driven through …`, one per line for `claude-code`, `codex`, `cursor`, `gemini`, `fx`, in that order — but the parser must not assume order or count, only the pattern). Collect `{ kind, index }` for every match via `matchAll`.
+4. Zero matches found → return `text` unchanged (can't confidently locate any bullet; fail toward keeping everything).
+5. Find the match whose captured `kind === agentKind`. Not found (unrecognized/future kind) → return `text` unchanged, per the ticket's explicit requirement.
+6. Bullet boundaries: bullet `i`'s span is `[matches[i].index, matches[i+1]?.index ?? body.length)` — i.e. from its own bullet-start line up to the next bullet-start line (or end of body if last). This is what makes each bullet's full multi-line content (it runs many lines with embedded prose) travel with it regardless of length, without hardcoding a line count.
+7. New body = `body.slice(0, matches[0].index)` (prose before the first bullet — currently just the intro paragraph, kept verbatim) + the one matching bullet's span. All four non-matching bullets are dropped; nothing after the last bullet inside the section is disturbed because the kept span for a non-last-bullet match already ends where the next bullet starts, and for the *last* bullet the span already runs to `body.length`, which is the trailing "Defaults preserve hands-off…" / "curated lists…" / "Override per-agent…" prose belongs to the *body*, not to any bullet span — so trailing prose after the bullets is currently swallowed into whichever bullet happens to be last in the file. **This is the one structural detail to get right**: bullets are matched in **file order**, not in `AgentKind` union order, so "the next bullet start, or `body.length` if this is the last match in the file" naturally attaches trailing section prose to whichever kind's bullet is physically last (today `fx`). To keep that trailing prose (`Defaults preserve hands-off behavior…`, `The curated lists…`, `Override per-agent…`) intact regardless of which kind is requested, compute the **true end of the kept bullet** as `matches[i+1]?.index ?? <index of the actual bullets-block end>`, where the bullets-block end is the index of whichever match is last in the array (`matches[matches.length - 1].index` marks the start of the *last* bullet, not the end of the block) — so: capture `bulletsEnd = matches[matches.length - 1].index` walked forward to the end of that last bullet's own text by finding the next non-bullet paragraph, OR — simpler and robust — treat "end of the last bullet, hence end of the bullets block" as: keep scanning past `matches[matches.length-1].index` for the next blank-line-followed-by-non-bullet-paragraph. **Simplify per the ticket's own instruction** instead of inventing a paragraph-boundary heuristic: the ticket says "take its end as the start of the next such bullet, **or the end of the section if it's the last one**" — i.e. per the ticket's own literal spec, the *last* bullet's kept span legitimately runs to `sectionEnd`, trailing prose included, when that kind is selected, and a *non-last* bullet's span stops at the next bullet start (so trailing prose is dropped when the kept bullet isn't the physically-last one in the file). This is what the ticket explicitly asks for — do not add extra logic to preserve trailing prose beyond what's specified; implement exactly: `spanEnd = matches[i+1]?.index ?? body.length`. (Net effect on the real file: selecting `fx` — today's last bullet — keeps the trailing "Defaults preserve/curated lists/Override" prose; selecting any other kind drops it along with the other four bullets. This is a known, accepted consequence of the ticket's own bullet-boundary rule, not a bug to work around.)
+8. Reassemble: `text.slice(0, headingStart) + heading-line + newBody + text.slice(sectionEnd)`.
+
+(Builder: write this straightforwardly — the paragraph above is intentionally explicit about the one subtlety (last-bullet-vs-non-last-bullet span end) so there's no ambiguity, not a request to add anything beyond the literal ticket rule.)
+
+### 1c. Cut 2 — JubarteAI section
+
+Private `cutJubarteSection(text)`:
+1. `findHeadingSection(text, JUBARTEAI_HEADING)` → `null` → return `text` unchanged (fail-open).
+2. Otherwise return `text.slice(0, headingStart) + text.slice(sectionEnd)` — the heading itself is removed too (ticket: "heading through end-of-file").
+
+### 1d. Top-level composition
 
 ```ts
-selectPickedRef: (path: string, mode: "files" | "folder") =>
-  j<{ refs: TaskReference[] }>("/refs/pick/select", {
-    method: "POST",
-    body: JSON.stringify({ path, mode }),
-  }),
-```
-
-`j` already throws `ApiError` (message = body's `error` string) on the 400 responses `selectPick` returns — `FolderPickerDialog` catches that and shows `e.message` inline (AC-8), no extra parsing needed.
-
-Export `PickRefsResult` alongside the existing exported types near the top of the file (or inline next to the `api` object — match whatever the file's existing convention is for one-off response shapes, e.g. how `GitHubIssueThreadResult` etc. are imported from `shared/types.ts` vs declared locally; since this type has no server-side twin in `shared/types.ts`, declare it locally in `api.ts` and import it from `ReferencesPicker.tsx`/`FolderPickerDialog.tsx`).
-
-## 2. New file — `src/mainview/components/kanban/FolderPickerDialog.tsx`
-
-Props:
-```ts
-interface Props {
-  open: boolean;
-  mode: "files" | "folder";
-  candidates: string[];
-  onDone: (refs: TaskReference[]) => void; // called with [] on cancel at any level — caller closes on any call
+export function filterClaudeMdForPipeline(text: string, opts: { agentKind: string }): string {
+  let out = text;
+  out = cutAgentCommandShapeSection(out, opts.agentKind);
+  out = cutJubarteSection(out);
+  return out;
 }
 ```
 
-State machine, mirroring `DirPickerOverlay` minus its `"kind"`/`"loading"` screens (mode and the initial candidate fetch are owned by `ReferencesPicker`, not this dialog):
+The two cuts are independent (disjoint sections of the file, applied to the running result in sequence) and each internally fails open to a no-op, satisfying the "independently toggleable at the granularity of each cut" requirement from the Scope section. Neither cut can throw: all string operations, no external calls; wrap the whole body of each `cut*` helper in `try { … } catch { return text; }` as a final belt-and-brace (a regex or slice bug must degrade to "no cut," never to a thrown error that blocks the pipeline turn, per the ticket).
 
-- `screen: "list" | "fileslist"` (starts at `"list"`; no `"manual"` sub-screen — the manual-entry input is always visible at the top of the `"list"` screen per the spec's UI description, not a separate step, unlike the TUI's cursor-driven `"manual"` screen which exists only because ink has no simultaneous multi-widget focus).
-- `filterText: string` — narrows `candidates` via `candidates.filter(c => c.toLowerCase().includes(filterText.toLowerCase()))` (AC-6), recomputed with `useMemo`.
-- `manualPath: string`, `manualError: string | null`.
-- `fileRefs: TaskReference[]` — populated by a `mode: "files"` select call, rendered as the second-level list.
-- `busy: boolean` — true only during the `/refs/pick/select` round-trip (mirrors `picking`'s Q2 semantics but scoped to this dialog).
-- `rowError: string | null` — inline error surfaced next to a candidate-row click failure (same `{error}` shapes as manual entry can hit, e.g. a stale candidate that's since been deleted).
+## 2. Wiring into O-2 (orchestrator.ts)
 
-Behavior:
-- **Row click** (`selectPath(rawPath)`): set `busy`, call `api.selectPickedRef(rawPath, mode)`. On success: `mode === "folder"` → `onDone(result.refs)` (closes). `mode === "files"` → `setFileRefs(result.refs); setScreen("fileslist")` (AC-4/AC-5 — does not close). On failure: set `busy = false` and surface `e.message` (`rowError` for a candidate-row failure, `manualError` for the manual-entry submit) inline; dialog stays open (AC-8, AC-9's "no error state visible… rather it stays open and correctable" reading, matches DirPickerOverlay's `dirError`/`manualError` split).
-- **Manual submit** (Enter in the input, or a small "Use this path" button next to it): resolve `~`/`~/` and relative paths the same way `resolveManualPath` does in `DirPickerOverlay.tsx` (copy that ~15-line helper verbatim into this file or a tiny shared spot — see "shared helper" note below), then call `selectPath(resolved)`. Route failures to `manualError`, not `rowError`, so a stale candidate error and a manual-path error never bleed into each other's slot.
-- **Second-level file row click**: no network call — `onDone([fileRefs[i]])` directly (this is the client-side narrowing described in the contract section; `fileRefs` already holds one `TaskReference` per immediate file).
-- **Back button** on the `"fileslist"` screen: `setScreen("list")` (does not clear `filterText` or `manualPath` — matches "return to the list… and can then choose a different directory" in AC-5 without losing the user's filter).
-- **Cancel** (Escape via `Dialog`'s own handling, or an explicit "Cancel" button in the header): `onDone([])` from whichever screen is active (AC-9). Wire this through the `Dialog`'s `onClose` prop directly — `<Dialog open={open} onClose={() => onDone([])}>` — so Escape-at-any-level and the close button share one code path.
-- **Reopen with clean state** (edge case: "rapidly cancels and reopens… no stale error"): since `ReferencesPicker` unmounts `FolderPickerDialog` when not open (conditionally rendered, not just hidden — see §3), a fresh mount naturally resets all local `useState` to initial values; no explicit reset effect needed. Confirm this by actually conditionally rendering (`{dialogOpen && <FolderPickerDialog .../>}`), not `<FolderPickerDialog open={dialogOpen} .../>` with an always-mounted component.
+Add, near `pipelineLeanContext` (same section of `orchestrator.ts`):
 
-Rendering:
-- Use `Dialog` from `@/components/ui/dialog` exactly as `ResolveConflictsDialog`/other kanban dialogs do — pass `labelledBy`/`describedBy` ids on a title `<h2>`/description `<p>` rendered inside, and `initialFocusRef` pointed at the filter/manual-path input so typing works immediately on open.
-- Header: "Pick a folder" / "Pick a directory to list files from" (mirrors `DirPickerOverlay`'s title text, parameterized on `mode`), a Cancel/close (`X`) button.
-- Manual-path input: a single `<input>` (or reuse `@/components/ui/input`'s `Input`) with a placeholder like `/absolute/path` and `IDENTIFIER_INPUT_PROPS`-style spellcheck-off attributes if that convention exists (check `Input`'s usage in `search-select.tsx` for the pattern) — typing into it **also drives `filterText`** is NOT correct per spec (filter and manual-entry are two distinct affordances per the ticket: "a text input up top for typing an arbitrary path" is separate from candidate filtering, and DirPickerOverlay itself keeps `filterText` and `manualText` as two different pieces of state reached via two different screens). Render them as two visually distinct controls: a filter input directly above the candidate list (placeholder "Filter…"), and the manual-entry input+submit as its own row (placeholder "Or type an absolute path…", with a "Use path" button or Enter-to-submit). `manualError` renders directly under the manual input; it does not touch the candidate list itself.
-- Candidate rows: `<button type="button">` per row (real buttons, not `<div onClick>`, so Tab-focus + native Enter/Space activation gives AC-12 for free with zero extra key handling) showing a folder icon (`Folder` from `lucide-react`, matching `FolderPlus`'s import style already in `ReferencesPicker.tsx`) + the path text (`truncate` + `title={c}` for overflow, matching the chip pattern already used for `refs-chip`). List container is a `<div role="listbox">` / each row `role="option"` for consistency with the a11y pattern CLAUDE.md documents elsewhere (`AtFileAutocomplete`), though a simple native-button Tab chain already satisfies AC-12's literal requirement ("move between candidate rows and confirm a highlighted one without a pointing device") since Tab + Enter/Space works without any custom key handling — do not over-build a roving-tabindex arrow-key scheme unless reusing an existing helper costs nothing; native tab order is sufficient and simpler to keep correct.
-- Empty filtered list: render "No matches — try a different filter or type a path above." (edge case: filtered-to-empty stays usable via manual entry).
-- Zero candidates from the server: same empty-state copy renders (edge case in SPEC.md — "the picker still opens and allows the user to type a manual path").
-- `"fileslist"` screen: header "Files in `<dir>`" + a `← Back` button (`onClick={() => setScreen("list")}`) + the `fileRefs` list rendered the same way (button rows, `iconForRef({ path, isDirectory: false })` icon from `@/lib/file-icons` for consistency with how refs are iconified elsewhere) + empty-state "No files in this directory." (edge case) + a `rowError`-equivalent slot only if a stat race causes a click to fail — not expected per the confirmed contract (the refs are already resolved paths from the same `readdirSync` call), so no error state is needed here; omit it.
-- No nested popover is introduced (no `SearchSelect`/`ExtensionPicker`/autocomplete inside this dialog), so no `data-popover-open` marker is needed — `Dialog`'s own Escape handling is sufficient as-is.
-
-Test ids (new, all scoped to this dialog so they can't collide with the two `refs-pick-*` mount points):
-- `folder-picker-dialog` (root, or reuse `Dialog`'s own `role="dialog"` query if the e2e convention prefers role-based selectors — check an existing dialog spec for the house style before picking).
-- `folder-picker-filter` (filter input), `folder-picker-manual-input` / `folder-picker-manual-submit`, `folder-picker-manual-error`.
-- `folder-picker-candidate` (repeated — use `.nth()`/`.filter({ hasText })` in specs, or add `data-path={c}` for exact targeting — prefer `data-path` since candidate text itself may need substring assertions separately).
-- `folder-picker-back`, `folder-picker-cancel`, `folder-picker-file` (repeated, `data-path={r.path}`).
-
-Shared helper note: `resolveManualPath` (tilde/relative resolution) exists today only in `src/cli/tui/DirPickerOverlay.tsx`, which is Node/CLI code (`node:os`, `node:path`) — those same built-ins are available in the Bun-bundled webview too (Vite polyfills or Bun's own `node:path`/`node:os` work fine in this codebase's other webview files that already import `path` from `"node:path"` — verify by grepping `from "node:path"` under `src/mainview` before assuming; if the webview bundle can't resolve `node:os`'s `homedir()` in-browser, drop the `~` expansion for the webview version and only keep `path.resolve()` against a hardcoded fallback, since there is no reliable client-side "home directory" without a server round trip — document this as a minor, deliberate divergence from the TUI if `homedir()` isn't available client-side). Do not create a new `src/shared/` module for a 10-line helper used by exactly one new file; a local copy in `FolderPickerDialog.tsx` is fine and keeps this task's diff contained to the webview as scoped.
-
-## 3. `src/mainview/components/kanban/ReferencesPicker.tsx` — wire the dialog in
-
-Add local state:
 ```ts
-const [dialog, setDialog] = useState<
-  | null
-  | { mode: "files" | "folder"; candidates: string[] }
->(null);
-```
+import { filterClaudeMdForPipeline } from "./claude-md-filter.ts";
 
-Change `pick` (line ~98-110):
-```ts
-const pick = async (mode: "files" | "folder") => {
-  if (picking) return;
-  setHint(null);
-  setPicking(true);
+/** Env kill-switch for O-14 (mirrors leanContextEnabled/autoInstallEnabled's
+ *  convention): `AGETOR_PIPELINE_CLAUDE_MD_FILTER=0` restores the raw,
+ *  unfiltered worktree CLAUDE.md for pipeline/child sessions — today's O-2
+ *  behavior, byte for byte. */
+function claudeMdFilterEnabled(): boolean {
+  return process.env.AGETOR_PIPELINE_CLAUDE_MD_FILTER !== "0";
+}
+
+/**
+ * O-14: narrow the CLAUDE.md O-2 re-injects for a pipeline/child claude-code
+ * turn to the one matching "Agent command shape" harness bullet and drop the
+ * JubarteAI section outright (see docs/plans/pipeline-token-efficiency.md
+ * §7/§9 open item and CLAUDE.md's own "Agent command shape" /
+ * "JubarteAI Agent Identity" sections). Writes the filtered copy to
+ * `<cwd>/.agetor/CLAUDE.filtered.md` — the real `CLAUDE.md` on disk is never
+ * touched. `claudeMdPath` is `pipelineLeanContext`'s own
+ * `appendSystemPromptFile` (already null when the worktree has none, or when
+ * O-2 itself is off/inapplicable) — this function only narrows a path that's
+ * already been decided on, it never turns a null into a path or vice versa
+ * except in the two fail-open cases below. Fails open at every step: any
+ * error here falls back to `claudeMdPath` unchanged, so a pipeline turn is
+ * never blocked by this optimisation and, at worst, sees the same
+ * un-narrowed file O-2 already re-injects today.
+ */
+export function resolvePipelineSystemPromptFile(
+  claudeMdPath: string | null,
+  agentKind: AgentKind,
+  cwd: string,
+): string | null {
+  if (claudeMdPath == null) return null;
+  if (!claudeMdFilterEnabled()) return claudeMdPath;
+  let original: string;
   try {
-    const result = await api.pickRefs(mode, startingFolder);
-    if (result.kind === "refs") {
-      if (result.refs.length) append(result.refs);
-    } else {
-      setDialog({ mode, candidates: result.candidates });
-    }
-  } catch (e) {
-    setHint(`Couldn't open the picker: ${(e as Error).message}`);
-  } finally {
-    setPicking(false);
+    original = readFileSync(claudeMdPath, "utf8");
+  } catch {
+    return claudeMdPath;
   }
-};
+  let filtered: string;
+  try {
+    filtered = filterClaudeMdForPipeline(original, { agentKind });
+  } catch {
+    return claudeMdPath;
+  }
+  if (filtered.trim() === "") return null; // degenerate output — same as "no CLAUDE.md" (O-2's existing null path)
+  try {
+    const outDir = join(cwd, ".agetor");
+    mkdirSync(outDir, { recursive: true });
+    const outPath = join(outDir, "CLAUDE.filtered.md");
+    writeFileSync(outPath, filtered);
+    return outPath;
+  } catch {
+    return claudeMdPath;
+  }
+}
 ```
 
-Per Q2's clarification, `setPicking(false)` in `finally` already fires as soon as the initial `/refs/pick` call resolves — including when it resolves to the `"candidates"` case — so the trigger button returns to normal the instant the dialog opens, exactly as specified. No change needed to make that true; it falls out of moving the dialog-open decision into the existing `try` block instead of adding a second async step before `finally`.
+All of `readFileSync`/`writeFileSync`/`mkdirSync`/`join` are already imported at the top of `orchestrator.ts` — no new imports beyond `filterClaudeMdForPipeline`.
 
-Render, right after the existing `dropOverlay` conditional (both variants return early, so add it to each return's JSX, or factor a shared trailing fragment — check whether `inline`/expandable returns can both append one extra sibling cheaply):
-```tsx
-{dialog && (
-  <FolderPickerDialog
-    open
-    mode={dialog.mode}
-    candidates={dialog.candidates}
-    onDone={(picked) => {
-      setDialog(null);
-      if (picked.length) append(picked);
-    }}
-  />
-)}
+At the `startTask` call site (~line 1496), change:
+
+```ts
+opts: { mode: task.mode, model: …, effort: …, fast: task.fast, maxMode: task.maxMode, leanContext: pipelineLeanContext(task, harness.kind, prepared.cwd) },
 ```
-Conditionally rendering on `dialog &&` (rather than always rendering with `open={dialog !== null}`) is what gives the dialog a clean mount per open, per the "reopen with no stale state" requirement in §2.
 
-No change to `picking`/`hint` state shape, no change to `buttons`/`chips`/drag-drop code, no change to either `variant` branch's outer structure beyond adding this one sibling — satisfies the ticket's "no change to loading/error surface for the desktop path" constraint.
+to compute the lean context once, then narrow its `appendSystemPromptFile` in place before use:
 
-## 4. No changes needed at call sites
+```ts
+const lean = pipelineLeanContext(task, harness.kind, prepared.cwd);
+const leanContext = lean
+  ? { ...lean, appendSystemPromptFile: resolvePipelineSystemPromptFile(lean.appendSystemPromptFile ?? null, harness.kind, prepared.cwd) }
+  : lean;
+```
 
-`NewTaskForm` and `RunPanel` both render `<ReferencesPicker variant=... />` already; since the dialog is fully internal to `ReferencesPicker`, neither needs to change. Confirms scope item 4 from the ticket — verify by grepping both files for `<ReferencesPicker` to confirm no props need to flow through (e.g. neither currently passes anything the dialog would need beyond what `ReferencesPicker` already has: `startingFolder`, `mode` is per-button not per-component).
+and pass `leanContext` in `opts` instead of the inline call. Because `pipelineLeanContext` still returns `null` for every non-pipeline task (and for codex/gemini/cursor/fx, and when `AGETOR_PIPELINE_LEAN_CONTEXT=0`), `resolvePipelineSystemPromptFile` is simply never invoked for those cases — ordinary tasks keep getting **no** `--append-system-prompt-file` at all (today's real, non-lean spawn path elsewhere in the same function, untouched), exactly preserving "ordinary tasks are completely unaffected."
 
-## 5. e2e tests — `e2e/` (new specs + fixture support)
+This keeps `pipelineLeanContext`'s own signature, behavior, and existing tests (`orchestrator-pipeline.test.ts` ~1179-1233) untouched — it still returns the raw worktree `CLAUDE.md` path in its `appendSystemPromptFile` field, and the narrowing to a filtered copy happens one step later, only at the actual spawn call site.
 
-**Fixture gap**: every existing `E2EBackend` (`backend` and `freshBackend` in `e2e/fixtures.ts`) unconditionally sets `AGETOR_FAKE_PICK_REFS_DIR`, which makes `/refs/pick` always return `{ refs }` — never `{ candidates }`. The new specs need a backend where that env var is **not** set so the real headless `candidates` branch in `server.ts` fires.
+## 3. Tests
 
-Add a minimal, additive change to `e2e/fixtures.ts` (allowed — it's test harness code, not the `src/bun/server.ts`/`refs-pick.ts` logic the ticket says not to touch):
-- Give `provisionBackend` an optional 6th parameter, e.g. `options?: { fakePickRefsDir?: boolean }` (default `true`, preserving every existing call site's behavior byte-for-byte), and only include `AGETOR_FAKE_PICK_REFS_DIR` in the spawned child's `env` when that option is `true`.
-- Add a new test-scoped fixture, e.g. `headlessPickBackend`, structurally identical to `freshBackend` (own port range — pick the next disjoint block after `FRESH_GITHUB_STUB_BASE_PORT = 4900`, e.g. `HEADLESS_PICK_BASE_API_PORT = 5000` / `HEADLESS_PICK_GITHUB_STUB_BASE_PORT = 5100`) but calling `provisionBackend(..., { fakePickRefsDir: false })`. Test-scoped (not worker-scoped) is appropriate here since only a couple of specs need it and it keeps the "no native, no fixture" backend's task list empty/predictable (no risk of another spec's leftover tasks polluting `headlessPickCandidates()`'s task-workdir candidates, since it's a fresh `dataDir`/SQLite file per test like `freshBackend`).
-- `headlessPickCandidates()` always includes `$HOME` itself as a final fallback (`add(home)` in `refs-pick.ts`), so this backend's candidate list is guaranteed non-empty even with zero tasks and no matching `~`-level git repos — the "assert at least one candidate row" requirement in the ticket's test plan is satisfied without needing to seed any task or directory structure.
+### 3a. `src/bun/claude-md-filter.test.ts` (new)
 
-New spec file `e2e/folder-picker-dialog.spec.ts` using `headlessPickBackend`, three cases (`test.describe` per the ticket's three-spec breakdown):
-1. **Candidate click**: open a task form (or whichever surface is fastest to reach `refs-pick-folder`/`refs-pick-files` — check an existing `refs-pick-*` spec, e.g. in `issue-task.spec.ts`, for the minimal page setup used today), click `refs-pick-folder`, assert the dialog opens with ≥1 candidate row (`folder-picker-candidate` count ≥ 1), click the first row, assert it closes and a `refs-chip` appears with `title` equal to that row's `data-path`.
-2. **Manual entry**: open the folder picker, type a known-good absolute path (e.g. `backend.dataDir` itself, which definitely exists) into `folder-picker-manual-input`, submit, assert the same `refs-chip` contract. Also assert the invalid-path branch inline (AC-8): submit a non-existent path first, assert `folder-picker-manual-error` renders and the dialog stays open, then correct it and assert success — covers "user submits… repeatedly after correcting it" from SPEC.md's edge cases in the same spec rather than a fourth file.
-3. **Files-mode drill-in**: click `refs-pick-files`, click a candidate directory known to contain files (e.g. plant a couple of files under `backend.dataDir` via `writeFile` before the test, then pick `backend.dataDir` as the candidate/manual path so the files-mode listing is deterministic rather than depending on real `$HOME` contents), assert the `"fileslist"` screen renders those files (`folder-picker-file` rows), click one, assert a `refs-chip` for that single file appears (and, per AC-4, that ONLY one chip appears — not one per file in the directory). Also assert the back-button path (AC-5): drill in, click `folder-picker-back`, assert the candidate list reappears, then cancel and assert no chip was added (AC-9).
+Build one fixture string containing, at minimum:
+- a `## Stack and architecture` heading
+- a `### Agent command shape` heading followed by an intro paragraph, then five bullets in some order (not necessarily claude-code/codex/cursor/gemini/fx file order — pick a different order than the real file to prove the parser doesn't assume the real file's ordering) each shaped `- **\`<kind>\`** →` followed by a line or two of filler prose, then a trailing paragraph after the bullets (to exercise "last bullet's span runs to section end")
+- a `### Claude session lifecycle` heading (or any distinct `###`/`##` heading) marking the end of the Agent command shape section
+- some other markdown in between
+- a `## JubarteAI Agent Identity` heading with a few paragraphs running to end of file
 
-**Regression guard**: no changes to the existing `plantPicks`-based specs (`issue-task.spec.ts` and any other `AGETOR_FAKE_PICK_REFS_DIR`-flow spec) — they keep using `backend`/`freshBackend` unmodified, which still set the fixture env var by default (`fakePickRefsDir` defaults to `true`). Run the full existing suite to confirm zero behavior change there.
+Cases:
+1. For each of the five `AgentKind` values: `filterClaudeMdForPipeline(fixture, { agentKind: kind })` keeps exactly that kind's bullet text, removes the other four bullets' text, and always removes the whole JubarteAI section (heading + body) — assert via `.toContain`/`.not.toContain` on distinctive strings per bullet plus the JubarteAI heading string.
+2. A fixture where `### Agent command shape` is renamed (e.g. `### Agent invocation shape`) or missing entirely: assert the Agent-command-shape content passes through untouched (all five bullets still present) while the JubarteAI section is still removed.
+3. The mirror case: a fixture where `## JubarteAI Agent Identity` is renamed/missing: assert the JubarteAI content passes through untouched while the Agent-command-shape narrowing still happens correctly.
+4. A fixture with neither section present at all: assert `filterClaudeMdForPipeline(text, { agentKind: "claude-code" })` is byte-identical (`===`) to the input.
+5. An unrecognized `agentKind` (e.g. `"made-up-kind"`) against the full fixture: assert the Agent-command-shape section is untouched (all five bullets still present) while the JubarteAI section is still removed (the two cuts are independent — an unrecognized kind only defeats cut 1).
 
-## 6. Verification
+### 3b. Orchestrator-level test (extend `src/bun/orchestrator-pipeline.test.ts`)
 
-- `bun run typecheck` — must stay green; the new `PickRefsResult` type and `FolderPickerDialog` props need to typecheck cleanly against `ReferencesPicker.tsx`'s existing usage.
-- `bun test` — no `src/bun/*` files change, so the existing unit test suite (including `refs-pick.test.ts` and any `headless-routes` test covering `/refs/pick`) should be unaffected; run it to confirm.
-- New Playwright specs (`e2e/folder-picker-dialog.spec.ts`) pass; existing `AGETOR_FAKE_PICK_REFS_DIR`-driven specs pass unmodified.
-- Manual smoke (optional but cheap): `scripts/dev-headless.sh` + a browser, click the folder picker on a task with no `AGETOR_FAKE_PICK_REFS_DIR` set, confirm the dialog behavior end-to-end matches the ACs.
+Add a new `describe`/test block near the existing "lean-context selection (O-1/O-2)" tests (~line 1177) covering `resolvePipelineSystemPromptFile` directly (import it alongside `pipelineLeanContext`):
+- given a worktree with a real `CLAUDE.md` containing the five bullets + JubarteAI section (reuse the module-level fixture or a trimmed version), `resolvePipelineSystemPromptFile(claudeMdPath, "claude-code", cwd)` returns a path **different from** `claudeMdPath`, that path exists on disk under `<cwd>/.agetor/`, and its content contains the `claude-code` bullet but not the other four kinds' bullets nor the JubarteAI heading.
+- `resolvePipelineSystemPromptFile(null, "claude-code", cwd)` returns `null` (no CLAUDE.md to filter).
+- with `AGETOR_PIPELINE_CLAUDE_MD_FILTER=0`, `resolvePipelineSystemPromptFile(claudeMdPath, "claude-code", cwd)` returns `claudeMdPath` unchanged (restores today's O-2 path byte for byte).
 
-## Files touched
+Then a `startTask`-level assertion that a **pipeline** task's spawn (mock/spy on `spawnAgent`/`buildCommand`, following whatever pattern the existing O-1/O-2 spawn tests in this file or `agents.test.ts` already use to inspect the built argv) receives `--append-system-prompt-file <the filtered .agetor path>`, not the raw worktree `CLAUDE.md` path, while a matching **non-pipeline** task's spawn is unaffected (no `--append-system-prompt-file` flag at all, or the raw file if some other unrelated path already adds it — confirm by reading how `startTask` invokes non-pipeline claude-code spawns today before asserting). Do not touch or weaken the existing `pipelineLeanContext` unit tests at lines ~1179-1233 — they must keep passing exactly as written, proving `pipelineLeanContext` itself is unchanged.
 
-- `src/mainview/lib/api.ts` — `pickRefs` return type change, new `selectPickedRef`, new exported `PickRefsResult` type.
-- `src/mainview/components/kanban/FolderPickerDialog.tsx` — new file.
-- `src/mainview/components/kanban/ReferencesPicker.tsx` — `pick()` branch + dialog state + render.
-- `e2e/fixtures.ts` — additive `provisionBackend` options param + new `headlessPickBackend` fixture.
-- `e2e/folder-picker-dialog.spec.ts` — new file.
+## 4. Manual live-probe step (Definition of done, not a `bun test`)
 
-Not touched: `src/bun/refs-pick.ts`, `src/bun/server.ts`, `src/cli/**`, `NewTaskForm.tsx`, `RunPanel.tsx`.
+After the above lands, run one real pipeline stage turn (claude-code) the same way O-1/O-2's original `prompt_snapshot` JSONL check was done (docs/plans/pipeline-token-efficiency.md §8) and confirm the `--append-system-prompt-file` target under `<worktree>/.agetor/CLAUDE.filtered.md` contains exactly one harness bullet (the task's own agent kind) and no `## JubarteAI Agent Identity` heading. This is a manual verification step for whoever executes the plan, not new automated test code beyond §3.
+
+## 5. Docs: `docs/plans/pipeline-token-efficiency.md`
+
+Append (do not edit any existing row, sentence, or measured number):
+- A new row to the existing `| Item | Where | Verified by | Kill switch |` table under "## 9. Follow-up (2026-09-13): cutting redundant checks and unbounded child debugging":
+
+  `| O-14 Trimmed CLAUDE.md for pipeline/child sessions | \`claude-md-filter.ts\`; wired into \`orchestrator.ts\`'s O-2 call site (\`resolvePipelineSystemPromptFile\`) | \`claude-md-filter.test.ts\`, orchestrator-level spawn test | \`AGETOR_PIPELINE_CLAUDE_MD_FILTER=0\` restores O-2's unfiltered file byte for byte |`
+
+- A new paragraph immediately after the table (after the existing "Re-run instructions" / "Still open" lines, appended below them, leaving those sentences as written) recording what shipped and the measured saving, e.g.:
+
+  "**O-14 shipped (2026-09-13)**: this repo's own `CLAUDE.md` (146,326 bytes measured on this date) narrows to ~89,500 bytes (~39% smaller) when appended to a pipeline/child claude-code session's system prompt — the "Agent command shape" section (53,273 bytes, five per-harness bullets) drops to the one bullet matching the task's own agent kind (15,900 to 26,211 bytes depending on which kind), and the trailing "JubarteAI Agent Identity" section (19,461 bytes) is dropped entirely. Kill switch: `AGETOR_PIPELINE_CLAUDE_MD_FILTER=0` restores today's unfiltered file for every pipeline/child session. This closes the "trimmed pipeline-specific CLAUDE.md" item left open in §9's closing note above."
+
+## 6. Files touched (summary)
+
+- New: `src/bun/claude-md-filter.ts`, `src/bun/claude-md-filter.test.ts`
+- Edited: `src/bun/orchestrator.ts` (new `claudeMdFilterEnabled`, `resolvePipelineSystemPromptFile`, one new import, one call-site change in `startTask`)
+- Edited: `src/bun/orchestrator-pipeline.test.ts` (new tests only, additive)
+- Edited: `docs/plans/pipeline-token-efficiency.md` (append-only, per §5 above)
+- Not touched: `src/bun/agents.ts` (already generic over whatever path it's given), `CLAUDE.md` itself, any O-1 through O-13 mechanism.
