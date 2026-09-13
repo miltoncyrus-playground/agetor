@@ -1232,6 +1232,115 @@ test("pipelineLeanContext: plain tasks, codex/gemini, and AGETOR_PIPELINE_LEAN_C
   }
 });
 
+// ─── trimmed CLAUDE.md for pipeline/child sessions (O-14) ────────────────────
+
+const O14_FIXTURE = `# repo rules
+
+### Agent command shape
+
+Intro paragraph.
+
+- **\`claude-code\`** → claude-code guidance line.
+- **\`codex\`** → codex guidance line.
+- **\`cursor\`** → cursor guidance line.
+- **\`gemini\`** → gemini guidance line.
+- **\`fx\`** → fx guidance line.
+
+### Claude session lifecycle
+
+Lifecycle prose that must survive.
+
+## JubarteAI Agent Identity
+
+This repository participates in the JubarteAI agent fleet.
+
+### Never
+
+Some never-do list, running to end of file.
+`;
+
+test("resolvePipelineSystemPromptFile: writes a filtered copy under <cwd>/.agetor containing only the requested kind's bullet, no JubarteAI heading", async () => {
+  const { resolvePipelineSystemPromptFile } = await import("./orchestrator.ts");
+  const cwd = await makeWorkdir(false);
+  const claudeMdPath = path.join(cwd, "CLAUDE.md");
+  writeFileSync(claudeMdPath, O14_FIXTURE);
+
+  const out = resolvePipelineSystemPromptFile(claudeMdPath, "claude-code", cwd);
+  expect(out).not.toBeNull();
+  expect(out).not.toBe(claudeMdPath);
+  expect(out!.startsWith(path.join(cwd, ".agetor"))).toBe(true);
+
+  const { existsSync, readFileSync } = await import("node:fs");
+  expect(existsSync(out!)).toBe(true);
+  const content = readFileSync(out!, "utf8");
+  expect(content).toContain("claude-code guidance line");
+  expect(content).not.toContain("codex guidance line");
+  expect(content).not.toContain("cursor guidance line");
+  expect(content).not.toContain("gemini guidance line");
+  expect(content).not.toContain("fx guidance line");
+  expect(content).not.toContain("## JubarteAI Agent Identity");
+  expect(content).toContain("Lifecycle prose that must survive.");
+});
+
+test("resolvePipelineSystemPromptFile: null claudeMdPath passes through as null", async () => {
+  const { resolvePipelineSystemPromptFile } = await import("./orchestrator.ts");
+  expect(resolvePipelineSystemPromptFile(null, "claude-code", "/tmp")).toBeNull();
+});
+
+test("resolvePipelineSystemPromptFile: AGETOR_PIPELINE_CLAUDE_MD_FILTER=0 restores the raw path unfiltered", async () => {
+  const { resolvePipelineSystemPromptFile } = await import("./orchestrator.ts");
+  const cwd = await makeWorkdir(false);
+  const claudeMdPath = path.join(cwd, "CLAUDE.md");
+  writeFileSync(claudeMdPath, O14_FIXTURE);
+
+  const prior = process.env.AGETOR_PIPELINE_CLAUDE_MD_FILTER;
+  try {
+    process.env.AGETOR_PIPELINE_CLAUDE_MD_FILTER = "0";
+    expect(resolvePipelineSystemPromptFile(claudeMdPath, "claude-code", cwd)).toBe(claudeMdPath);
+  } finally {
+    if (prior === undefined) delete process.env.AGETOR_PIPELINE_CLAUDE_MD_FILTER; else process.env.AGETOR_PIPELINE_CLAUDE_MD_FILTER = prior;
+  }
+});
+
+test("pipeline: startTask on a pipeline claude-code task writes a filtered CLAUDE.md for spawn; a non-pipeline task does not", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { existsSync, readFileSync } = await import("node:fs");
+
+  // Pipeline task: pipelineStage set via createTask(pipeline: true) + SPEC/PLAN
+  // so `specify` succeeds and the task actually reaches a stage that spawns
+  // a claude-code turn; pipelineLeanContext only kicks in once pipelineStage
+  // is non-null, which is true from creation.
+  const pipelineWorkdir = await makeWorkdir(true);
+  writeFileSync(path.join(pipelineWorkdir, "CLAUDE.md"), O14_FIXTURE);
+  const createdPipeline = await createTask({
+    title: "o14-pipeline", prompt: "add dark mode", agent: "claude-code",
+    workdir: pipelineWorkdir, isolation: "none", taskType: "task", pipeline: true,
+  });
+  if ("error" in createdPipeline) throw new Error(createdPipeline.error);
+  await startAndGetRunId(startTask, createdPipeline.task.id);
+
+  const pipelineFilteredPath = path.join(pipelineWorkdir, ".agetor", "CLAUDE.filtered.md");
+  expect(existsSync(pipelineFilteredPath)).toBe(true);
+  const pipelineFiltered = readFileSync(pipelineFilteredPath, "utf8");
+  expect(pipelineFiltered).toContain("claude-code guidance line");
+  expect(pipelineFiltered).not.toContain("codex guidance line");
+  expect(pipelineFiltered).not.toContain("## JubarteAI Agent Identity");
+
+  // Non-pipeline task: pipelineLeanContext returns null (no pipelineStage, no
+  // parentTaskId), so resolvePipelineSystemPromptFile is never invoked and no
+  // filtered file is written — ordinary tasks are unaffected.
+  const plainWorkdir = await makeWorkdir(false);
+  writeFileSync(path.join(plainWorkdir, "CLAUDE.md"), O14_FIXTURE);
+  const createdPlain = await createTask({
+    title: "o14-plain", prompt: "add dark mode", agent: "claude-code",
+    workdir: plainWorkdir, isolation: "none", taskType: "task",
+  });
+  if ("error" in createdPlain) throw new Error(createdPlain.error);
+  await startAndGetRunId(startTask, createdPlain.task.id);
+
+  expect(existsSync(path.join(plainWorkdir, ".agetor", "CLAUDE.filtered.md"))).toBe(false);
+});
+
 // ─── stage session closed at settle (O-7) ────────────────────────────────────
 
 test("pipeline: a settled stage's session is closed on advance and on done, recorded as a status event on the settled run", async () => {
