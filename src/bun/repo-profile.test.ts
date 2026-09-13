@@ -12,6 +12,7 @@ import {
   runCheck,
   LOCKFILE_HASH_MARKER,
   type RepoProfile,
+  type CheckName,
 } from "./repo-profile.ts";
 
 const FULL_PKG = JSON.stringify({
@@ -40,6 +41,10 @@ test("npm with package-lock: ci install, `npm run` syntax", () => {
     lint: "npm run lint",
     test: "npm run test",
     build: "npm run build",
+    typecheckScoped: null,
+    lintScoped: null,
+    testScoped: null,
+    buildScoped: null,
     workspaces: false,
     lockfile: "package-lock.json",
   });
@@ -143,6 +148,7 @@ test("no package.json → all nulls, even with a stray lockfile", () => {
   const p = detectRepoProfileFromFiles({ packageJson: null, lockfiles: ["yarn.lock"] });
   expect(p).toEqual({
     packageManager: null, install: null, typecheck: null, lint: null, test: null, build: null,
+    typecheckScoped: null, lintScoped: null, testScoped: null, buildScoped: null,
     workspaces: false, lockfile: null,
   });
 });
@@ -150,6 +156,7 @@ test("no package.json → all nulls, even with a stray lockfile", () => {
 test("invalid JSON / non-object root → all nulls", () => {
   const empty: RepoProfile = {
     packageManager: null, install: null, typecheck: null, lint: null, test: null, build: null,
+    typecheckScoped: null, lintScoped: null, testScoped: null, buildScoped: null,
     workspaces: false, lockfile: null,
   };
   expect(detectRepoProfileFromFiles({ packageJson: "{ not json", lockfiles: ["bun.lock"] })).toEqual(empty);
@@ -230,10 +237,87 @@ test("renderProjectCommands: only known lines are emitted", () => {
   ]);
 });
 
+// --- scoped/fast check preference (O-13) -------------------------------------
+
+test("scoped variant detected under the `<check>:changed` convention and preferred when rendering", () => {
+  const p = detectRepoProfileFromFiles({
+    packageJson: JSON.stringify({ scripts: { test: "vitest run", "test:changed": "vitest related" } }),
+    lockfiles: ["package-lock.json"],
+  });
+  expect(p.test).toBe("npm run test");
+  expect(p.testScoped).toBe("npm run test:changed");
+  const block = renderProjectCommands(p, { installed: true });
+  expect(block).toContain("test: npm run test:changed");
+  expect(block).not.toContain("test: npm run test\n");
+});
+
+test("scoped-only script with no full command never sets the scoped field", () => {
+  const p = detectRepoProfileFromFiles({
+    packageJson: JSON.stringify({ scripts: { "test:changed": "vitest related" } }),
+    lockfiles: [],
+  });
+  expect(p.test).toBeNull();
+  expect(p.testScoped).toBeNull();
+});
+
+test("scoped variants are independent per check", () => {
+  const p = detectRepoProfileFromFiles({
+    packageJson: JSON.stringify({ scripts: { test: "vitest run", "test:changed": "vitest related", lint: "eslint ." } }),
+    lockfiles: [],
+  });
+  expect(p.testScoped).toBe("npm run test:changed");
+  expect(p.lintScoped).toBeNull();
+  const block = renderProjectCommands(p, { installed: true });
+  expect(block).toContain("test: npm run test:changed");
+  expect(block).toContain("lint: npm run lint");
+});
+
+test("scoped lookup uses the canonical label, not the alias that satisfied the full command", () => {
+  const p = detectRepoProfileFromFiles({
+    packageJson: JSON.stringify({ scripts: { tsc: "tsc", "typecheck:changed": "tsc --incremental" } }),
+    lockfiles: [],
+  });
+  expect(p.typecheck).toBe("npm run tsc");
+  expect(p.typecheckScoped).toBe("npm run typecheck:changed");
+});
+
+test("renderProjectCommands: skipChecks drops that check's line entirely, others unaffected", () => {
+  const p = detectRepoProfileFromFiles({ packageJson: FULL_PKG, lockfiles: ["package-lock.json"] });
+  const skip: ReadonlySet<CheckName> = new Set(["test"]);
+  const block = renderProjectCommands(p, { installed: true, skipChecks: skip });
+  expect(block).not.toContain("test:");
+  expect(block).toContain("typecheck: npm run typecheck");
+  expect(block).toContain("lint: npm run lint");
+  expect(block).toContain("build: npm run build");
+});
+
+test("renderProjectCommands: no skipChecks at all → byte-identical to before this change", () => {
+  const p = detectRepoProfileFromFiles({ packageJson: FULL_PKG, lockfiles: ["package-lock.json"] });
+  const block = renderProjectCommands(p, { installed: false });
+  expect(block.startsWith("## Project commands\n")).toBe(true);
+  expect(block).toContain("install: npm ci");
+  expect(block).toContain("typecheck: npm run typecheck");
+  expect(block).toContain("lint: npm run lint");
+  expect(block).toContain("test: npm run test");
+  expect(block).toContain("build: npm run build");
+  expect(Buffer.byteLength(block, "utf8")).toBeLessThan(400);
+});
+
+test("renderProjectCommands: skipChecks covering every known check still renders the install line", () => {
+  const p = detectRepoProfileFromFiles({ packageJson: FULL_PKG, lockfiles: ["package-lock.json"] });
+  const skip: ReadonlySet<CheckName> = new Set(["typecheck", "lint", "test", "build"]);
+  const block = renderProjectCommands(p, { installed: false, skipChecks: skip });
+  expect(block).toBe("## Project commands\ninstall: npm ci");
+});
+
 // --- ensureDependenciesInstalled ---------------------------------------------
 
 function fakeProfile(install: string | null): RepoProfile {
-  return { packageManager: "npm", install, typecheck: null, lint: null, test: null, build: null, workspaces: false, lockfile: "package-lock.json" };
+  return {
+    packageManager: "npm", install, typecheck: null, lint: null, test: null, build: null,
+    typecheckScoped: null, lintScoped: null, testScoped: null, buildScoped: null,
+    workspaces: false, lockfile: "package-lock.json",
+  };
 }
 
 test("install runs when node_modules is missing, then writes the marker", async () => {

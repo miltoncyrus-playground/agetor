@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   findUnreferencedAcs, isTestPath, readTestFiles, precheckPasses, renderPrecheck,
-  runPipelinePrecheck, testerSkipEnabled, precheckEnabled,
+  runPipelinePrecheck, testerSkipEnabled, precheckEnabled, precheckPassedChecks,
 } from "./pipeline-precheck.ts";
 import type { RepoProfile } from "./repo-profile.ts";
 
 const profile = (over: Partial<RepoProfile>): RepoProfile => ({
-  packageManager: "npm", install: "npm ci", typecheck: null, lint: null, test: null, build: null, workspaces: false, lockfile: null, ...over,
+  packageManager: "npm", install: "npm ci", typecheck: null, lint: null, test: null, build: null,
+  typecheckScoped: null, lintScoped: null, testScoped: null, buildScoped: null,
+  workspaces: false, lockfile: null, ...over,
 });
 
 test("findUnreferencedAcs is literal and word-bounded (AC-1 does not match AC-10)", () => {
@@ -45,6 +47,16 @@ test("precheckPasses: needs at least one command, all ok, no unreferenced ACs", 
   expect(precheckPasses({ results: [], unreferencedAcs: [], ranAt: 0 })).toBe(false);
   expect(precheckPasses({ results: [ok], unreferencedAcs: ["AC-1"], ranAt: 0 })).toBe(false);
   expect(precheckPasses({ results: [ok, { ...ok, name: "lint", ok: false, exitCode: 1 }], unreferencedAcs: [], ranAt: 0 })).toBe(false);
+});
+
+test("precheckPassedChecks returns only the ok:true result names", () => {
+  const ok = { name: "test" as const, cmd: "x", ok: true, exitCode: 0, tail: "" };
+  const failed = { name: "lint" as const, cmd: "y", ok: false, exitCode: 1, tail: "boom" };
+  expect(precheckPassedChecks({ results: [ok, failed], unreferencedAcs: [], ranAt: 0 })).toEqual(new Set(["test"]));
+});
+
+test("precheckPassedChecks: empty summary → empty set", () => {
+  expect(precheckPassedChecks({ results: [], unreferencedAcs: [], ranAt: 0 })).toEqual(new Set());
 });
 
 test("runPipelinePrecheck runs only the known commands, keeps tails for failures only, scans ACs", async () => {
