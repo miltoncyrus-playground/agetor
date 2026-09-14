@@ -279,8 +279,11 @@ export function extractHandoff(
  *  agree on the exact sentinel. */
 export const HANDOFF_HEADING = "## From earlier stages";
 
-/** True when `p` is `lane` itself or lives under `lane/` (directory prefix). */
-function inLane(p: string, lane: string): boolean {
+/** True when `p` is `lane` itself or lives under `lane/` (directory prefix).
+ *  Exported: also used by `claude-md-filter.ts` (O-15) for its
+ *  orchestration-flow path-overlap check, so the two call sites can never
+ *  drift apart. */
+export function inLane(p: string, lane: string): boolean {
   const l = lane.replace(/\/+$/, "");
   if (!l) return true;
   return p === l || p.startsWith(l + "/");
