@@ -3,7 +3,9 @@ import { Folder, GitBranch, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { SearchSelect } from "@/components/ui/search-select";
 import { CloneProjectDialog } from "@/components/kanban/CloneProjectDialog";
-import type { Project } from "../../../shared/types.ts";
+import { FolderPickerDialog } from "./FolderPickerDialog";
+import { shouldFallbackToHeadlessPicker } from "@/lib/project-browse-fallback";
+import type { Project, TaskReference } from "../../../shared/types.ts";
 
 interface Props {
   value: string;
@@ -48,6 +50,7 @@ export function ProjectPicker({
   const [projects, setProjects] = useState<Project[]>([]);
   const [picking, setPicking] = useState(false);
   const [cloneOpen, setCloneOpen] = useState(false);
+  const [dialog, setDialog] = useState<null | { candidates: string[] }>(null);
 
   const refresh = async () => {
     try { setProjects(await api.listProjects()); }
@@ -86,6 +89,12 @@ export function ProjectPicker({
     items.unshift({ value, label: basename(value) || value, hint: value });
   }
 
+  const registerAndSelect = async (path: string) => {
+    await api.addProject(path);
+    await refresh();
+    onChange(path);
+  };
+
   const onBrowse = async () => {
     if (picking) return;
     setPicking(true);
@@ -95,8 +104,18 @@ export function ProjectPicker({
         await refresh();
         onChange(project.path);
       }
-    } catch { /* surface elsewhere — the picker just no-ops on failure */ }
-    finally { setPicking(false); }
+    } catch (e) {
+      if (!shouldFallbackToHeadlessPicker(e)) return; // AC-8: non-501 stays silent, no fallback
+      try {
+        const result = await api.pickRefs("folder", value || undefined);
+        if (result.kind === "refs") {
+          const path = result.refs[0]?.path;
+          if (path) await registerAndSelect(path);
+        } else {
+          setDialog({ candidates: result.candidates });
+        }
+      } catch { /* fallback attempt itself failed — stay silent, matching AC-8 */ }
+    } finally { setPicking(false); }
   };
 
   return (
@@ -117,6 +136,7 @@ export function ProjectPicker({
           <>
             <button
               type="button"
+              data-testid="project-picker-browse"
               onClick={onBrowse}
               disabled={picking}
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/60 disabled:opacity-50"
@@ -143,6 +163,18 @@ export function ProjectPicker({
         onClose={() => setCloneOpen(false)}
         onCloned={() => { void refresh(); }}
       />
+      {dialog && (
+        <FolderPickerDialog
+          open
+          mode="folder"
+          candidates={dialog.candidates}
+          onDone={async (refs: TaskReference[]) => {
+            setDialog(null);
+            const path = refs[0]?.path;
+            if (path) await registerAndSelect(path);
+          }}
+        />
+      )}
     </>
   );
 }
