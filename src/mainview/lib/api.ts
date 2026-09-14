@@ -533,6 +533,11 @@ export const api = {
     ),
   renameProject: (p: string, name: string) =>
     j<Project>("/projects", { method: "PATCH", body: JSON.stringify({ path: p, name }) }),
+  /** Register a project by absolute path — the headless-picker-fallback
+   *  equivalent of `pickProject`'s native "canceled or succeeded" round trip.
+   *  Throws `ApiError` (400/404) if the path is missing/relative/non-existent. */
+  addProject: (path: string) =>
+    j<Project>("/projects", { method: "POST", body: JSON.stringify({ path }) }),
   /** Per-project branch nomenclature. GET resolves to built-in defaults when the
    *  project has no stored config, so the form always gets a usable shape. */
   getProjectBranchConfig: (p: string) =>
