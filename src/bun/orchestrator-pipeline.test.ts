@@ -1341,6 +1341,326 @@ test("pipeline: startTask on a pipeline claude-code task writes a filtered CLAUD
   expect(existsSync(path.join(plainWorkdir, ".agetor", "CLAUDE.filtered.md"))).toBe(false);
 });
 
+// ─── stage/file-gated CLAUDE.md trimming (O-15) ──────────────────────────────
+
+test("subtaskFilesForChild: returns the subtask's own files array when present", async () => {
+  const { subtaskFilesForChild } = await import("./build-scheduler.ts");
+  const dir = await makeWorkdir(false);
+  writeTasksPlan(dir, {
+    subtasks: [
+      { id: "s1", title: "S1", prompt: "do s1", dependsOn: [], acceptanceCriteria: [], files: ["src/bun/foo.ts", "src/bun/bar.ts"] },
+    ],
+  });
+  const parent = { worktreePath: dir, workdir: dir } as import("../shared/types.ts").Task;
+  expect(subtaskFilesForChild(parent, "s1")).toEqual(["src/bun/foo.ts", "src/bun/bar.ts"]);
+});
+
+test("subtaskFilesForChild: null when files is empty or omitted", async () => {
+  const { subtaskFilesForChild } = await import("./build-scheduler.ts");
+  const dir = await makeWorkdir(false);
+  writeTasksPlan(dir, {
+    subtasks: [
+      { id: "s1", title: "S1", prompt: "do s1", dependsOn: [], acceptanceCriteria: [], files: [] },
+      { id: "s2", title: "S2", prompt: "do s2", dependsOn: [], acceptanceCriteria: [] },
+    ],
+  });
+  const parent = { worktreePath: dir, workdir: dir } as import("../shared/types.ts").Task;
+  expect(subtaskFilesForChild(parent, "s1")).toBeNull();
+  expect(subtaskFilesForChild(parent, "s2")).toBeNull();
+});
+
+test("subtaskFilesForChild: null for an unknown subtaskId", async () => {
+  const { subtaskFilesForChild } = await import("./build-scheduler.ts");
+  const dir = await makeWorkdir(false);
+  writeTasksPlan(dir, {
+    subtasks: [{ id: "s1", title: "S1", prompt: "do s1", dependsOn: [], acceptanceCriteria: [], files: ["src/bun/foo.ts"] }],
+  });
+  const parent = { worktreePath: dir, workdir: dir } as import("../shared/types.ts").Task;
+  expect(subtaskFilesForChild(parent, "nope")).toBeNull();
+});
+
+test("subtaskFilesForChild: null when TASKS.json is missing or invalid", async () => {
+  const { subtaskFilesForChild } = await import("./build-scheduler.ts");
+  const missingDir = await makeWorkdir(false);
+  const parentMissing = { worktreePath: missingDir, workdir: missingDir } as import("../shared/types.ts").Task;
+  expect(subtaskFilesForChild(parentMissing, "s1")).toBeNull();
+
+  const invalidDir = await makeWorkdir(false);
+  writeFileSync(path.join(invalidDir, "TASKS.json"), "{ not json");
+  const parentInvalid = { worktreePath: invalidDir, workdir: invalidDir } as import("../shared/types.ts").Task;
+  expect(subtaskFilesForChild(parentInvalid, "s1")).toBeNull();
+});
+
+test("parseReviewDiffStatPaths: parses a plain line, a rename, a brace-rename, and skips a malformed line", async () => {
+  const { parseReviewDiffStatPaths } = await import("./orchestrator.ts");
+  const stat = [
+    " src/bun/foo.ts | 5 +++--",
+    " src/bun/old.ts => src/bun/new.ts | 3 +--",
+    " src/bun/{old => new}/thing.ts | 2 ++",
+    "this line has no pipe at all",
+  ].join("\n");
+  const paths = parseReviewDiffStatPaths(stat);
+  expect(paths).toContain("src/bun/foo.ts");
+  expect(paths).toContain("src/bun/old.ts");
+  expect(paths).toContain("src/bun/new.ts");
+  expect(paths).toContain("src/bun/old/thing.ts");
+  expect(paths).toContain("src/bun/new/thing.ts");
+  expect(paths).not.toContain("this line has no pipe at all");
+});
+
+test("pipelineOverlapFiles: a build child resolves via subtaskFilesForChild", async () => {
+  const { pipelineOverlapFiles, createTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const workdir = await makeWorkdir(false);
+  writeTasksPlan(workdir, {
+    subtasks: [{ id: "s1", title: "S1", prompt: "do s1", dependsOn: [], acceptanceCriteria: [], files: ["src/bun/foo.ts"] }],
+  });
+  const createdParent = await createTask({
+    title: "o15-parent", prompt: "x", agent: "claude-code", workdir, isolation: "none", taskType: "task", pipeline: true,
+  });
+  if ("error" in createdParent) throw new Error(createdParent.error);
+  const parentId = createdParent.task.id;
+
+  const now = Date.now();
+  const child = {
+    ...tasks.get(parentId)!,
+    id: crypto.randomUUID(),
+    parentTaskId: parentId,
+    planSubtaskId: "s1",
+    pipelineStage: null,
+    worktreePath: workdir,
+    workdir,
+    createdAt: now,
+    updatedAt: now,
+  };
+  expect(pipelineOverlapFiles(child, null)).toEqual(["src/bun/foo.ts"]);
+});
+
+test("pipelineOverlapFiles: a code-review task resolves via extras.reviewDiff.stat", async () => {
+  const { pipelineOverlapFiles, createTask } = await import("./orchestrator.ts");
+  const workdir = await makeWorkdir(false);
+  const created = await createTask({
+    title: "o15-review", prompt: "x", agent: "claude-code", workdir, isolation: "none", taskType: "task", pipeline: true,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const task = { ...created.task, pipelineStage: "code-review" as const };
+  const extras = {
+    reviewDiff: {
+      file: "/tmp/x.diff", bytes: 10, sinceSha: "a", headSha: "b", empty: false,
+      stat: " src/bun/foo.ts | 5 +++--\n src/mainview/App.tsx | 2 ++",
+    },
+  };
+  expect(pipelineOverlapFiles(task, extras)).toEqual(["src/bun/foo.ts", "src/mainview/App.tsx"]);
+});
+
+test("pipelineOverlapFiles: testing/building (or any non-matching task) returns null without touching extras beyond the code-review check", async () => {
+  const { pipelineOverlapFiles, createTask } = await import("./orchestrator.ts");
+  const workdir = await makeWorkdir(false);
+  const created = await createTask({
+    title: "o15-testing", prompt: "x", agent: "claude-code", workdir, isolation: "none", taskType: "task", pipeline: true,
+  });
+  if ("error" in created) throw new Error(created.error);
+
+  const testingTask = { ...created.task, pipelineStage: "testing" as const };
+  // extras.reviewDiff is populated on purpose — if pipelineOverlapFiles read
+  // it for a non-code-review stage it would wrongly return a non-null list.
+  const extrasWithReviewDiff = {
+    reviewDiff: { file: "/tmp/x.diff", bytes: 10, sinceSha: "a", headSha: "b", empty: false, stat: " src/bun/foo.ts | 1 +" },
+  };
+  expect(pipelineOverlapFiles(testingTask, extrasWithReviewDiff)).toBeNull();
+
+  const buildingTask = { ...created.task, pipelineStage: "building" as const };
+  expect(pipelineOverlapFiles(buildingTask, extrasWithReviewDiff)).toBeNull();
+});
+
+const O15_ORCHESTRATION_FLOW = `
+
+### Orchestration flow
+
+1. **Item one** intro prose.
+2. **Item two** intro prose.
+3. **Item three** intro prose.
+4. **Item four** intro prose.
+5. **Task context menu** — see \`src/mainview/lib/task-context-menu.ts\`.
+6. **Filler six** prose.
+7. **Filler seven** prose.
+8. **Filler eight** prose.
+9. **Tasks from issues** — see \`src/shared/issue-task.ts\`.
+10. **Shared task-composition modules** — see \`src/mainview/components/kanban/PromptComposer.tsx\`.
+11. **\`@\` file references** — see \`src/shared/at-refs.ts\`.
+12. **Filler twelve** prose.
+13. **Filler thirteen** prose, running to end of section.
+`;
+
+const O15_FIXTURE = `# repo rules
+
+### Agent command shape
+
+Intro paragraph.
+
+- **\`claude-code\`** → claude-code guidance line.
+- **\`codex\`** → codex guidance line.
+
+### Claude session lifecycle
+
+Lifecycle prose that must survive.
+${O15_ORCHESTRATION_FLOW}
+## JubarteAI Agent Identity
+
+This repository participates in the JubarteAI agent fleet.
+
+### Never
+
+Some never-do list, running to end of file.
+`;
+
+test("resolvePipelineSystemPromptFile (4-arg): a specify-stage call drops items 5-13 of Orchestration flow entirely", async () => {
+  const { resolvePipelineSystemPromptFile } = await import("./orchestrator.ts");
+  const { readFileSync } = await import("node:fs");
+  const cwd = await makeWorkdir(false);
+  const claudeMdPath = path.join(cwd, "CLAUDE.md");
+  writeFileSync(claudeMdPath, O15_FIXTURE);
+
+  const out = resolvePipelineSystemPromptFile(claudeMdPath, "claude-code", cwd, { pipelineStage: "specify", isChild: false, files: null });
+  expect(out).not.toBeNull();
+  const content = readFileSync(out!, "utf8");
+  expect(content).toContain("Item one");
+  expect(content).toContain("Item four");
+  expect(content).not.toContain("Task context menu");
+  expect(content).not.toContain("Tasks from issues");
+  expect(content).not.toContain("Shared task-composition modules");
+  expect(content).not.toContain("`@` file references");
+  expect(content).not.toContain("Filler six");
+  expect(content).not.toContain("Filler thirteen");
+});
+
+test("resolvePipelineSystemPromptFile (4-arg): code-review with non-overlapping files drops only the four filterable items", async () => {
+  const { resolvePipelineSystemPromptFile } = await import("./orchestrator.ts");
+  const { readFileSync } = await import("node:fs");
+  const cwd = await makeWorkdir(false);
+  const claudeMdPath = path.join(cwd, "CLAUDE.md");
+  writeFileSync(claudeMdPath, O15_FIXTURE);
+
+  const out = resolvePipelineSystemPromptFile(claudeMdPath, "claude-code", cwd, {
+    pipelineStage: "code-review",
+    isChild: false,
+    files: ["src/bun/unrelated.ts"],
+  });
+  expect(out).not.toBeNull();
+  const content = readFileSync(out!, "utf8");
+  expect(content).toContain("Item one");
+  expect(content).toContain("Filler six");
+  expect(content).toContain("Filler thirteen");
+  expect(content).not.toContain("Task context menu");
+  expect(content).not.toContain("Tasks from issues");
+  expect(content).not.toContain("Shared task-composition modules");
+  expect(content).not.toContain("`@` file references");
+});
+
+test("resolvePipelineSystemPromptFile (4-arg): testing/building with no files keeps everything", async () => {
+  const { resolvePipelineSystemPromptFile } = await import("./orchestrator.ts");
+  const { readFileSync } = await import("node:fs");
+
+  for (const stage of ["testing", "building"] as const) {
+    const cwd = await makeWorkdir(false);
+    const claudeMdPath = path.join(cwd, "CLAUDE.md");
+    writeFileSync(claudeMdPath, O15_FIXTURE);
+    const out = resolvePipelineSystemPromptFile(claudeMdPath, "claude-code", cwd, { pipelineStage: stage, isChild: false, files: null });
+    expect(out).not.toBeNull();
+    const content = readFileSync(out!, "utf8");
+    expect(content).toContain("Task context menu");
+    expect(content).toContain("Tasks from issues");
+    expect(content).toContain("Shared task-composition modules");
+    expect(content).toContain("`@` file references");
+  }
+});
+
+test("resolvePipelineSystemPromptFile (4-arg): building+isChild with partially-overlapping files keeps only the overlapping item", async () => {
+  const { resolvePipelineSystemPromptFile } = await import("./orchestrator.ts");
+  const { readFileSync } = await import("node:fs");
+  const cwd = await makeWorkdir(false);
+  const claudeMdPath = path.join(cwd, "CLAUDE.md");
+  writeFileSync(claudeMdPath, O15_FIXTURE);
+
+  const out = resolvePipelineSystemPromptFile(claudeMdPath, "claude-code", cwd, {
+    pipelineStage: null,
+    isChild: true,
+    files: ["src/shared/issue-task.ts"],
+  });
+  expect(out).not.toBeNull();
+  const content = readFileSync(out!, "utf8");
+  expect(content).not.toContain("Task context menu");
+  expect(content).toContain("Tasks from issues");
+  expect(content).not.toContain("Shared task-composition modules");
+  expect(content).not.toContain("`@` file references");
+});
+
+test("pipeline: a build-child spawn writes a filtered CLAUDE.md dropping non-overlapping filterable items and keeping the overlapping one", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { existsSync, readFileSync } = await import("node:fs");
+
+  const workdir = await makeWorkdir(false);
+  writeFileSync(path.join(workdir, "CLAUDE.md"), O15_FIXTURE);
+  writeTasksPlan(workdir, {
+    subtasks: [{ id: "s1", title: "S1", prompt: "do s1", dependsOn: [], acceptanceCriteria: [], files: ["src/shared/issue-task.ts"] }],
+  });
+
+  const createdParent = await createTask({
+    title: "o15-child-parent", prompt: "x", agent: "claude-code", workdir, isolation: "none", taskType: "task", pipeline: true,
+  });
+  if ("error" in createdParent) throw new Error(createdParent.error);
+
+  const createdChild = await createTask({
+    title: "o15-child", prompt: "implement s1", agent: "claude-code", workdir, isolation: "none", taskType: "task",
+    column: "building", parentTaskId: createdParent.task.id, planSubtaskId: "s1",
+  });
+  if ("error" in createdChild) throw new Error(createdChild.error);
+
+  await startAndGetRunId(startTask, createdChild.task.id);
+
+  const filteredPath = path.join(workdir, ".agetor", "CLAUDE.filtered.md");
+  expect(existsSync(filteredPath)).toBe(true);
+  const content = readFileSync(filteredPath, "utf8");
+  expect(content).not.toContain("Task context menu");
+  expect(content).toContain("Tasks from issues");
+  expect(content).not.toContain("Shared task-composition modules");
+  expect(content).not.toContain("`@` file references");
+});
+
+test("pipeline: a testing-stage spawn keeps all four filterable Orchestration-flow items", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { existsSync, readFileSync } = await import("node:fs");
+
+  const workdir = await makeWorkdir(true);
+  writeFileSync(path.join(workdir, "CLAUDE.md"), O15_FIXTURE);
+  const taskId = crypto.randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: "o15-testing-spawn", prompt: "x", column: "backlog", agent: "claude-code",
+    workdir, isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: "auto", model: "opus-4.7", effort: "high",
+    fast: false, maxMode: false, plans: [],
+    references: [], backlog: [], satisfiedSubtasks: [], draft: null, runId: null,
+    hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    createdAt: now, updatedAt: now, archivedAt: null,
+    pipelineStage: "testing", planApproved: true, implementationApproved: true,
+    revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null,
+  });
+
+  await startAndGetRunId(startTask, taskId);
+
+  const filteredPath = path.join(workdir, ".agetor", "CLAUDE.filtered.md");
+  expect(existsSync(filteredPath)).toBe(true);
+  const content = readFileSync(filteredPath, "utf8");
+  expect(content).toContain("Task context menu");
+  expect(content).toContain("Tasks from issues");
+  expect(content).toContain("Shared task-composition modules");
+  expect(content).toContain("`@` file references");
+});
+
 // ─── stage session closed at settle (O-7) ────────────────────────────────────
 
 test("pipeline: a settled stage's session is closed on advance and on done, recorded as a status event on the settled run", async () => {

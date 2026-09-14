@@ -142,7 +142,7 @@ import {
   type PlanReviewVerdict,
   type TestingVerdict,
 } from "./pipeline-prompts.ts";
-import { tickBuild, completeChildBuild, buildBarrierState } from "./build-scheduler.ts";
+import { tickBuild, completeChildBuild, buildBarrierState, subtaskFilesForChild } from "./build-scheduler.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import type {
   BlockReason,
@@ -1157,6 +1157,7 @@ export function resolvePipelineSystemPromptFile(
   claudeMdPath: string | null,
   agentKind: AgentKind,
   cwd: string,
+  ctx: { pipelineStage?: Task["pipelineStage"]; isChild?: boolean; files?: string[] | null } = {},
 ): string | null {
   if (claudeMdPath == null) return null;
   if (!claudeMdFilterEnabled()) return claudeMdPath;
@@ -1168,7 +1169,12 @@ export function resolvePipelineSystemPromptFile(
   }
   let filtered: string;
   try {
-    filtered = filterClaudeMdForPipeline(original, { agentKind });
+    filtered = filterClaudeMdForPipeline(original, {
+      agentKind,
+      pipelineStage: ctx.pipelineStage ?? null,
+      isChild: ctx.isChild ?? false,
+      files: ctx.files ?? null,
+    });
   } catch {
     return claudeMdPath;
   }
@@ -1182,6 +1188,53 @@ export function resolvePipelineSystemPromptFile(
   } catch {
     return claudeMdPath;
   }
+}
+
+/** `git diff --stat` line shape: `<path> | <n> <bar>` or a rename
+ *  (`old => new` or `dir/{old => new}/file`). Parses whichever leading
+ *  path(s) each line names; unparseable lines are skipped (fewer files in
+ *  the signal only makes Layer 2 more conservative, never less). */
+export function parseReviewDiffStatPaths(stat: string): string[] {
+  const out: string[] = [];
+  for (const line of stat.split("\n")) {
+    const m = /^\s*(.+?)\s+\|\s+\d+/.exec(line);
+    if (!m) continue;
+    const p = m[1]!.trim();
+    if (!p) continue;
+    const brace = /^(.*)\{(.*) => (.*)\}(.*)$/.exec(p);
+    if (brace) {
+      out.push(`${brace[1]}${brace[2]}${brace[4]}`.trim(), `${brace[1]}${brace[3]}${brace[4]}`.trim());
+      continue;
+    }
+    const arrow = /^(.*) => (.*)$/.exec(p);
+    if (arrow) {
+      out.push(arrow[1]!.trim(), arrow[2]!.trim());
+      continue;
+    }
+    out.push(p);
+  }
+  return out.filter(Boolean);
+}
+
+/**
+ * O-15 Layer 2 signal: the stage-appropriate file list for a pipeline turn,
+ * or `null` when none exists for this stage (testing/building, by design —
+ * no new git call is added for them) or resolution fails for any reason.
+ * Exported for direct unit tests.
+ */
+export function pipelineOverlapFiles(task: Task, extras: StageExtras | null): string[] | null {
+  if (task.parentTaskId != null && task.planSubtaskId != null) {
+    const parent = tasks.get(task.parentTaskId);
+    if (!parent) return null;
+    return subtaskFilesForChild(parent, task.planSubtaskId);
+  }
+  if (task.pipelineStage === "code-review") {
+    const stat = extras?.reviewDiff?.stat;
+    if (!stat) return null;
+    const paths = parseReviewDiffStatPaths(stat);
+    return paths.length > 0 ? paths : null;
+  }
+  return null;
 }
 
 /**
@@ -1533,7 +1586,19 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
 
   const lean = pipelineLeanContext(task, harness.kind, prepared.cwd);
   const leanContext = lean
-    ? { ...lean, appendSystemPromptFile: resolvePipelineSystemPromptFile(lean.appendSystemPromptFile ?? null, harness.kind, prepared.cwd) }
+    ? {
+        ...lean,
+        appendSystemPromptFile: resolvePipelineSystemPromptFile(
+          lean.appendSystemPromptFile ?? null,
+          harness.kind,
+          prepared.cwd,
+          {
+            pipelineStage: task.pipelineStage,
+            isChild: task.parentTaskId != null,
+            files: pipelineOverlapFiles(task, extras),
+          },
+        ),
+      }
     : lean;
   const { agent, message } = await spawnAgentOrFail({
     taskId,
