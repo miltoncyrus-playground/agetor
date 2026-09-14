@@ -15,6 +15,26 @@ import type { Task } from "../shared/types.ts";
  *  takes the fragile deferred-paste route (postmortem RC-1). */
 export const CHILD_HANDOFF_CHAR_BUDGET = 700;
 
+/** A subtask's own `files` ownership list — the same scoping already used
+ *  for the child's stage-handoff `onlyPaths`, reused unchanged by O-15's
+ *  orchestration-flow overlap filter. `null` when the parent's TASKS.json
+ *  can't be read/parsed, the subtask isn't declared, or it declares no file
+ *  ownership (owns the whole workspace) — callers must treat `null` as "no
+ *  signal", not "no files". Never throws. */
+export function subtaskFilesForChild(parent: Task, subtaskId: string): string[] | null {
+  try {
+    const planPath = join(parent.worktreePath ?? parent.workdir, PIPELINE_BUILD_PLAN_FILE);
+    if (!existsSync(planPath)) return null;
+    const parsed = parseBuildPlan(readFileSync(planPath, "utf8"));
+    if (!parsed.ok) return null;
+    const subtask = parsed.plan.subtasks.find((s) => s.id === subtaskId);
+    if (!subtask) return null;
+    return subtask.files.length > 0 ? subtask.files : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * DAG scheduler for a "building" stage's FRESH entry (from pre-builder
  * success — see orchestrator.ts's advancePipelineStage, case "pre-builder").
@@ -277,7 +297,7 @@ async function doTick(parentTaskId: string): Promise<void> {
     try {
       handoff = renderHandoff(pipelineState.getHandoffs(parent.id), {
         charBudget: CHILD_HANDOFF_CHAR_BUDGET,
-        onlyPaths: subtask.files.length > 0 ? subtask.files : undefined,
+        onlyPaths: subtaskFilesForChild(parent, subtask.id) ?? undefined,
       }) || null;
     } catch (err) {
       console.error(`[agetor] child handoff render failed for ${parent.id}/${subtask.id}:`, err);
