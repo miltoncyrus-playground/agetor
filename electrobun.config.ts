@@ -4,7 +4,7 @@ export default {
   app: {
     name: "Agetor",
     identifier: "sh.alamops.agetor",
-    version: "0.1.7",
+    version: "0.1.10",
     // Registers agetor:// so a clicked terminal-notifier notification's
     // `-open agetor://task/<id>` (see src/bun/notifier.ts) routes back into
     // this app as an "open-url" event, which src/bun/deep-link.ts parses
@@ -58,6 +58,13 @@ export default {
       // inner executable. No third-party binary, no Rosetta. The agetor://
       // scheme registered above is what the click routes back through.
       "vendor/notifier": "bin",
+      // Our own native arm64 "disclaim" helper — execs a spawned command as
+      // TCC-responsible for itself instead of inheriting Agetor's responsible
+      // process identity (built by scripts/build-disclaim.ts from
+      // native/disclaim/). Lands at Contents/Resources/app/bin/disclaim;
+      // src/bun/disclaim.ts:bundledDisclaimPath() points at it. See
+      // docs/plans/stop-agetor-tcc-appdata-spam.md.
+      "vendor/disclaim": "bin",
     },
     watchIgnore: ["dist/**", ".agetor/**", "vendor/**"],
     mac: {

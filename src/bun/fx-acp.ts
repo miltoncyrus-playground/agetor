@@ -1,15 +1,18 @@
 import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { Subprocess } from "bun";
-import type { FxUsagePayload, RunEventStream } from "../shared/types.ts";
+import type { FxRecoveryPayload, FxUsagePayload, RunEventStream } from "../shared/types.ts";
 import {
   FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_TURN_KEYS,
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
 } from "../shared/types.ts";
+import { fxRecoverySummaryLine, isFxRecoveryResumable, parseFxRecoveryMeta } from "../shared/fx-recovery.ts";
 import { isImagePath } from "../shared/attachments.ts";
+import { disclaimArgv } from "./disclaim.ts";
 import { SENT_FILES_TOOL_NAME } from "../shared/sent-files.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
 import {
@@ -79,44 +82,55 @@ import {
  * in-branch reply never fires and `handleServerRequest`'s catch-all fallback
  * writes the sole reply instead.
  *
- * ── Protocol index (verified against fx v0.0.4, v0.0.6, v0.0.7 and v0.0.8 —
- *    0.0.8 facts dated 2026-09-08: a binary probe of the v0.0.8 release, a
- *    full source-tarball diff v0.0.7…v0.0.8, and the same ACP probe re-run
- *    against the installed 0.0.7 binary to separate real 0.0.8 deltas from
- *    pre-existing 0.0.7 behavior — + ACP's canonical schema.json) ──
+ * ── Protocol index (verified against fx v0.0.4, v0.0.6, v0.0.7, v0.0.8,
+ *    v0.0.9 and v0.0.10 — 0.0.9/0.0.10 facts dated 2026-09-14: binary probes
+ *    of the v0.0.9 (`build_revision e26e97ec4040`) and v0.0.10
+ *    (`1210c2756ea8`) releases, a full source-tarball diff v0.0.8…v0.0.10,
+ *    and the same ACP probe re-run against the installed 0.0.8 binary to
+ *    separate real 0.0.9/0.0.10 deltas from pre-existing 0.0.8 behavior;
+ *    0.0.8 facts dated 2026-09-08 per the same three-way method run then —
+ *    + ACP's canonical schema.json) ──
  *
  *   - `initialize`                  SPIKE-VERIFIED             handshake; unauth fails here (see describeHandshakeFailure)
- *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; mode nudge is best-effort (see runFxTurn)
- *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602/-32600 alike (see runFxTurn)
+ *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; mode nudge is best-effort (see runFxTurn); configOptions gains an `effort` entry (0.0.9+, model-dependent — see applyFxEffort)
+ *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602/-32600 alike (see runFxTurn); both replay a paused checkpoint's history structurally as of 0.0.9 — see the 0.0.9/0.0.10 facts block below
  *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn); result gains a `usage` object as of 0.0.8
- *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate); text deltas folded per message and (0.0.8+) per messageId (see FxTextCoalescer)
+ *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate); text deltas folded per message and (0.0.8+) per messageId (see FxTextCoalescer); dropped wholesale while `state.replaying` except `session_info_update` (0.0.9+ — see handleServerNotification)
  *   - `session/request_permission`  LIVE-VERIFIED 0.0.8 (ask mode)  card flow  (see respondPermissionRequest)
  *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn); 0.0.8 spike confirms it now actually interrupts in-flight work
+ *   - `session/set_config_option`   SPIKE-VERIFIED (0.0.10)    `{configId:"effort", value}` — sets the active session's reasoning effort (see applyFxEffort); silent no-op on 0.0.8
  *   - death                         —                          unexpected exit before settlement (see the `exited` watcher)
  *
- * ── Facts verified against fx 0.0.5 through 0.0.8 (spike + release notes +
+ * ── Facts verified against fx 0.0.5 through 0.0.10 (spike + release notes +
  *    Zig source diff; 0.0.5-0.0.7 facts dated 2026-08-31/09-01, 0.0.8 facts
- *    dated 2026-09-08 per the three-way verification named above) ──
+ *    dated 2026-09-08, re-verified unchanged at 0.0.9/0.0.10 on 2026-09-14 —
+ *    every fact below is confirmed by the full source diff v0.0.8…v0.0.10,
+ *    which touches `src/acp/*` only for the effort/replay/title deltas
+ *    covered in the 0.0.9/0.0.10 facts block that follows this one — per the
+ *    three-way verification named above) ──
  *
  *   - **No sandbox since 0.0.5** — fx retired its command sandbox; approved
  *     tool calls run as ordinary host subprocesses. Agetor's permission mode
  *     (`session/set_mode` + this driver's `session/request_permission`
  *     policy, see `respondPermissionRequest`) is the ONLY gate fx has left —
  *     there is no `sandbox_denied` outcome to parse and never was one here.
- *     Still true at 0.0.8 (0.0.7 even added an fx-side test asserting legacy
- *     `sandbox` settings keys stay inert); 0.0.8's tool inventory changed
- *     (see below) but the no-sandbox / permission-mode-is-the-only-gate
- *     model did not.
+ *     Still true at 0.0.8, and again at 0.0.10 (0.0.7 even added an fx-side
+ *     test asserting legacy `sandbox` settings keys stay inert); 0.0.8's
+ *     tool inventory changed (see below) but the no-sandbox /
+ *     permission-mode-is-the-only-gate model did not — the v0.0.8…v0.0.10
+ *     source diff touches no sandbox-related code at all.
  *   - **Credential re-checks on `session/prompt` AND `session/resume`
- *     (0.0.5+; re-check paths unchanged through 0.0.8 — `jsonrpc.zig` is
- *     byte-identical 0.0.6→0.0.7→0.0.8; `server.zig` gained the new
- *     active-session gate in 0.0.8, see below, but the credential-recheck
- *     codepaths within it are unchanged)** — an unauthenticated/
+ *     (0.0.5+; re-check paths unchanged through 0.0.10 — `jsonrpc.zig` is
+ *     byte-identical 0.0.6→0.0.7→0.0.8, and the 0.0.9→0.0.10 `src/acp/*`
+ *     diff is a 4-line credential-refresh cache tweak unrelated to these
+ *     codepaths; `server.zig` gained the new active-session gate in 0.0.8,
+ *     see below, but the credential-recheck codepaths within it are
+ *     unchanged)** — an unauthenticated/
  *     deauthorized binary no longer fails only at `initialize`; either call
  *     can return `-32600` mid-session with the same "fx needs access to
  *     Vercel AI Gateway…" text or a provider-specific variant (e.g. "fx
  *     needs a Codex subscription login for this model. Run fx login
- *     codex."), byte-identical through 0.0.8 (0.0.7 recased these from "Fx"
+ *     codex."), byte-identical through 0.0.10 (0.0.7 recased these from "Fx"
  *     to lowercase "fx" — cosmetic only). `-32600` is JSON-RPC's generic
  *     "Invalid Request" code, not an auth-specific one — fx merely reuses it
  *     for credential failures — so `session/resume`'s `-32600` is treated
@@ -132,7 +146,7 @@ import {
  *     is unaffected by any of this — mid-turn there's nothing to fall back
  *     to, so it still fails the turn immediately, also surfacing fx's
  *     message verbatim via `rawMessage`. **Invalid vs. missing credential
- *     are different failures** (true on 0.0.7 and 0.0.8, spike-confirmed): a
+ *     are different failures** (true on 0.0.7 through 0.0.10, spike-confirmed): a
  *     *missing* credential still fails at `initialize` with `-32600` as
  *     above, but an *invalid* (present but wrong) one does not —
  *     `session/new` succeeds and `session/prompt` instead resolves normally
@@ -151,9 +165,12 @@ import {
  *     `runFxTurn`) — RunPanel renders it as a small provider chip. Absence
  *     (0.0.4 binaries, or a response that omits the array) is tolerated
  *     silently; no chip that turn. `src/acp/server.zig` is byte-identical
- *     0.0.6→0.0.7, and 0.0.8 keeps the same three provider values
- *     (spike-confirmed). **`provider`, `model` AND `mode` entries are ALL
- *     real wire entries, confirmed on 0.0.7 and 0.0.8 alike** — an earlier
+ *     0.0.6→0.0.7, and 0.0.8 through 0.0.10 keep the same three provider
+ *     values (spike-confirmed at each). **A fourth entry, `id: "effort"`, is
+ *     additive as of 0.0.9 — see the 0.0.9/0.0.10 facts block below and
+ *     `parseFxEffortOption`/`applyFxEffort`.** **`provider`, `model` AND
+ *     `mode` entries are ALL real wire entries, confirmed on 0.0.7 through
+ *     0.0.10 alike** — an earlier
  *     dossier claimed the mode/model entries were TUI-only strings a
  *     `strings` scan happened to pick up; that was wrong — that probe never
  *     got past an unauthenticated `initialize` far enough to see a real
@@ -180,8 +197,8 @@ import {
  *     DORMANT (ACP-spec-correct `mapFxUpdate` branches fx never actually
  *     sent) and are now live; the mapping itself is unchanged, it's just no
  *     longer dormant. `plan` and `current_mode_update` still have no fx
- *     writer at 0.0.8 — their `mapFxUpdate` branches (the former feeds the
- *     TODO tracker) stay dormant.
+ *     writer at 0.0.10 (re-grepped the v0.0.10 tree) — their `mapFxUpdate`
+ *     branches (the former feeds the TODO tracker) stay dormant.
  *   - **`session/prompt`'s result gains a `usage` object (0.0.8)** —
  *     `{inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
  *     reasoningTokens}`, each key present only when known (`{}` observed on
@@ -226,27 +243,159 @@ import {
  *     last (normalized) title emitted this turn becomes one
  *     `FX_SESSION_TITLE_STATUS_PREFIX` status chunk (`fx-title: <title>`);
  *     RunPanel renders the latest one as a muted chip beside the provider
- *     chip. The 0.0.7-era variant of this event (no `title`, just
- *     `_meta.fx.modelResponseRecovery`) still carries no title and so still
- *     emits nothing, as does a title that normalizes to empty.
+ *     chip. A `session_info_update` that carries no `title` field at all (an
+ *     update whose only payload is `_meta.fx.modelResponseRecovery` — see
+ *     the recovery-channel fact below — or any other titleless update) and
+ *     a title that normalizes to empty both contribute nothing to THIS
+ *     title logic specifically, though the same update may still have
+ *     emitted a recovery chunk from the other, independent half of this
+ *     branch.
+ *   - **`session_info_update`'s `_meta.fx.modelResponseRecovery` retry
+ *     -progress channel is LIVE, not legacy** — it ships alongside (not
+ *     instead of) the `{title, updatedAt}` shape above, has been on the wire
+ *     since fx 0.0.7, and is still live and unchanged through 0.0.10 (an earlier
+ *     version of this file mislabeled it "the legacy pre-0.0.8 shape"; that
+ *     was wrong — it's simply the OTHER thing this one update kind can
+ *     carry, checked independently of `title` in `mapFxUpdate`'s
+ *     `session_info_update` case). Per Gateway-retry attempt (twice — with
+ *     and without `delaySeconds`) fx sends `{sessionUpdate:
+ *     "session_info_update", _meta:{fx:{modelResponseRecovery:{state:
+ *     "active", kind, cause, action, attempt, attemptLimit, delaySeconds?,
+ *     durable, message}}}}`; a terminal `state:"paused"` once fx exhausts
+ *     its retry budget (`requiredAction:"continue_later"` is the only
+ *     variant Resume acts on); `state:"recovered"` when a retry succeeds;
+ *     and `modelResponseRecovery:null` when fx drops the checkpoint. This
+ *     driver maps it via `src/shared/fx-recovery.ts`'s `parseFxRecoveryMeta`
+ *     to the `FX_RECOVERY_STATUS_PREFIX` sentinel (`src/shared/types.ts`),
+ *     deduped against the last PLAIN payload emitted this turn (the dedupe
+ *     key never includes the `replayed` marker described below, so a live
+ *     payload byte-identical to a replayed one still dedupes/resets the same
+ *     way), plus a persisted, terminal-transition-only plain status line for
+ *     `paused`/`recovered` (`fxRecoverySummaryLine`) — RunPanel derives a
+ *     live progress notice and a Resume affordance from the sentinel stream,
+ *     and the plain lines are what `agetor logs`/the TUI/the transcript show
+ *     after the fact. **While replaying** (see the `session/resume` bullet
+ *     below), the EMITTED sentinel body additionally carries `replayed:
+ *     true` (never `replayed: false` — the field is simply absent on a live
+ *     sentinel) so downstream progress renderers can distinguish replayed
+ *     history from a fresh update.
+ *   - **`session/resume` REPLAYS session history — including a `paused`
+ *     recovery update — onto the NEW run, before the resume response
+ *     itself resolves.** `runFxTurn` flags `state.replaying` for exactly
+ *     that window (see `FxSessionState.replaying`'s doc). **As of 0.0.9**
+ *     (see the 0.0.9/0.0.10 facts block below for the wire-level detail),
+ *     that replay is no longer a single text blob — it's the SAME
+ *     structured `tool_call`/`tool_call_update`/`agent_message_chunk`
+ *     sequence `sendExecutionHistory` uses for `session/load`'s full-history
+ *     replay — so `handleServerNotification` now drops every replayed
+ *     content update wholesale (`state.replaying` true and
+ *     `update.sessionUpdate !== "session_info_update"`) instead of letting
+ *     it reach `dispatchSessionUpdate`/`mapFxUpdate` at all: the run's own
+ *     persisted events already cover that history, same rationale as the
+ *     `session/load` fallback's `state.suppressUpdates` discard just below.
+ *     `session_info_update` is the one kind still let through — the recovery
+ *     sentinel above still emits during replay (so this run's own live state
+ *     stays correct, and now carries the `replayed: true` marker), but the
+ *     terminal summary line does not — it already reached the transcript on
+ *     the run where the pause/recovery genuinely happened, and re-firing it
+ *     on every resume would spam a stale explanation into each follow-up.
+ *     (On 0.0.8, before this driver dropped replayed content, the same
+ *     window instead re-emitted fx's one-shot text blob as a stray assistant
+ *     bubble on the resume run — pre-existing, just less visible than the
+ *     0.0.9+ structured replay would have been had this driver not started
+ *     dropping it.) **The instant `state.replaying` flips back to `false`
+ *     (both the success and the error/fallback exit of the `session/resume`
+ *     call), `state.lastRecoveryJson` is reset to `undefined`** — without
+ *     this, a live update arriving right after the replay window that
+ *     happens to be byte-identical to the last replayed payload (e.g. a
+ *     `continueRecovery` turn that immediately re-pauses at the same
+ *     attempt/message) would be silently deduped against the replay and
+ *     never reach the user at all: no sentinel, no summary line, no
+ *     `state.lastRecovery` set for the `refused` enrichment below. A
+ *     replayed `paused` update specifically also sets `state.replayedPaused`
+ *     — read once `session/prompt` has actually RESOLVED (see below), not
+ *     before it's sent. The coalescer never sees a replayed
+ *     `agent_message_chunk`/`agent_thought_chunk` at all now (they're
+ *     dropped upstream in `handleServerNotification`), so there's nothing
+ *     buffered to flush when the replay window closes — no separate flush
+ *     call is needed here.
+ *   - **`continueRecovery` (fx ≥0.0.8) resumes a paused response without
+ *     re-sending the prompt** — `FxLaunchOptions.continueRecovery: true`
+ *     (requires `resumeSessionId`; checked in `runFxTurn` before any RPC
+ *     traffic) sends `session/prompt` with an EMPTY `prompt: []` array plus
+ *     `_meta:{fx:{continueRecovery:true}}` instead of new prompt text — fx
+ *     rejects a continue call that also carries prompt content. A second
+ *     continue against an already-consumed checkpoint, or a session that
+ *     never supported durable recovery, answers `-32602` with fx's own
+ *     user-actionable text ("No paused model response to continue", "This
+ *     session does not support durable recovery", "Recovery continuation
+ *     cannot include a new prompt") — surfaced verbatim via `RpcError
+ *     .rawMessage`, the same treatment `-32600` credential failures get.
+ *     A `refused` stop whose LIVE (non-replayed) recovery state is a
+ *     Resume-actionable `paused` checkpoint (`fxRefusedStatusLine`, which
+ *     defers to the shared `isFxRecoveryResumable` predicate — the SAME one
+ *     every Resume affordance gates on, not a bespoke `state === "paused"`
+ *     check) gets its status line enriched with the attempt count and
+ *     "resumable" — see the stopReason switch in `runFxTurn`.
+ *   - **A NORMAL (non-`continueRecovery`) prompt on a session whose replay
+ *     carried a `paused` checkpoint emits the `{state:"cleared"}` sentinel
+ *     only AFTER `session/prompt` RESOLVES with a result (any stopReason),
+ *     right before the stopReason switch — never before the prompt is
+ *     sent.** This used to fire pre-send, on the theory that fx consumes the
+ *     checkpoint the instant an ordinary prompt runs regardless of how the
+ *     turn ends (still true) — but pre-send emission meant a transport
+ *     -level failure of the `session/prompt` RPC itself (`-32600`, a
+ *     timeout, the process dying) left the transcript's last recovery
+ *     sentinel reading `cleared` while the checkpoint actually SURVIVES in
+ *     fx (the prompt never ran), so every Resume affordance vanished for a
+ *     still-resumable pause. Now: every RpcError/timeout/death path on
+ *     `session/prompt` `return`s before reaching this point, so those paths
+ *     correctly emit nothing and leave `state.replayedPaused` untouched for
+ *     a future retry to still see.
+ *   - **`tool_call_update`'s held/denied error content is an ACP
+ *     `ToolCallContent[]` array on real fx — never `rawOutput`.**
+ *     Source-verified against fx 0.0.8's `src/acp/types.zig
+ *     writeToolCallUpdate`: a `tool_call_update` carries only `toolCallId`,
+ *     `status`, `content:[{"type":"content","content":{"type":"text","text":
+ *     "<held JSON string>"}}]`, and an optional `command_result` — there is
+ *     no `rawOutput` field on this update kind at all, ever. The held/denied
+ *     text itself is `{"error":{"type":"tool_review_held"|
+ *     "tool_permission_denied","reason":"review_unavailable", …}}` (see the
+ *     `tool_call_update` case's "Held-tool guidance" comment). `toolResultContent`
+ *     (which builds the REAL `tool_result` chunk's `content` field and is
+ *     unaffected by this) used to hand `fxToolReviewError` the whole content
+ *     ARRAY, which it rejected outright — so this guidance never fired
+ *     against real fx traffic. `fxToolReviewError` now walks the
+ *     `ToolCallContent[]` shape (via `acpTextContentValue`, which also
+ *     tolerates a bare `{type:"text",text}` block with no wrapper),
+ *     `JSON.parse`s each item's text, and returns the first parsed
+ *     `{error:{...}}` match — while still accepting a plain string or an
+ *     already-parsed object for robustness (pre-existing shapes, never
+ *     actually seen on the wire, but harmless to keep).
  *   - **Session ids are 12-char base64url as of 0.0.8** (`session_layout.zig`,
  *     down from 0.0.7's 50 characters) — 0.0.7's longer ids still validate
  *     and resume against a 0.0.8 binary, so a persisted `runs.fx_session_id`
  *     survives the machine upgrade with no migration.
  *   - **New security gate: the target session must be the process's active
- *     one (0.0.8)** — `session/prompt`/`cancel`/`set_mode`/
- *     `set_config_option` now all reject a `sessionId` that isn't the
+ *     one (0.0.8, unchanged through 0.0.10)** — `session/prompt`/`cancel`/
+ *     `set_mode`/`set_config_option` all reject a `sessionId` that isn't the
  *     process's current session (`server.zig decideSessionTarget`). Agetor
  *     spawns exactly one `fx acp` child per turn, holding exactly one
  *     session, so this always resolves `.exact` — nothing for this driver to
  *     change.
- *   - **`initialize` leniency (0.0.8)** — `protocolVersion: 999` (a value fx
- *     doesn't recognize) is accepted rather than rejected; this driver keeps
- *     sending the number `1` regardless, so nothing here changes driver
- *     behavior (see the inline comment on the `initialize` call in
- *     `runFxTurn` — it used to also claim a *stringified* protocolVersion
- *     gets rejected with -32602, but that was never actually spike-verified;
- *     dropped). `promptCapabilities.image` in the `initialize` result is now
+ *   - **`initialize` leniency (0.0.8, unchanged through 0.0.10)** —
+ *     `protocolVersion: 999` (a value fx doesn't recognize but well-typed as
+ *     a number) is accepted rather than rejected; this driver keeps sending
+ *     the number `1` regardless, so nothing here changes driver behavior
+ *     (see the inline comment on the `initialize` call in `runFxTurn`).
+ *     **A *stringified* `protocolVersion` is rejected**, re-verified today
+ *     (2026-09-14) on both 0.0.10 and 0.0.8:
+ *     `{"protocolVersion":"1", …}` → `-32602 "Invalid initialize params"` on
+ *     each (`scratchpad/spikes/fx-0010-probe/acp-0.0.10-pv-str1-out.txt`,
+ *     `acp-0.0.8-pv-str1-out.txt`) — the driver has always sent the number,
+ *     so nothing changes here either; this just restores the fact after an
+ *     earlier pass wrongly dropped it as "never spike-verified".
+ *     `promptCapabilities.image` in the `initialize` result is now
  *     `true` (was previously unset/false) — agetor's composer sends text +
  *     file references only, never an image content block, so this is inert
  *     for us too.
@@ -258,17 +407,18 @@ import {
  *     `toolCallName`/`toolCallInput`), so the inventory change needs no
  *     driver code — noted here purely so a stale tool name in a transcript
  *     or test fixture isn't mistaken for a bug.
- *   - **`session/cancel` now actually stops the work (0.0.8)** — previously
- *     schema-derived and unverified whether fx honored it; the 0.0.8 spike
- *     confirms a cancelled turn's in-flight tool work stops rather than
- *     running to completion in the background. No driver change — this
- *     driver already treats `session/cancel` as fire-and-forget and races
- *     `session/prompt`'s own resolution (see `cancelFxTurn`).
+ *   - **`session/cancel` now actually stops the work (0.0.8, unchanged
+ *     through 0.0.10)** — previously schema-derived and unverified whether fx
+ *     honored it; the 0.0.8 spike confirms a cancelled turn's in-flight tool
+ *     work stops rather than running to completion in the background. No
+ *     driver change — this driver already treats `session/cancel` as
+ *     fire-and-forget and races `session/prompt`'s own resolution (see
+ *     `cancelFxTurn`).
  *   - **fx's wire `stopReason` strings never matched the ACP-canonical names
- *     this driver used to switch on (pre-existing bug, true on 0.0.7 and
- *     0.0.8 alike)** — fx's actual values are `end_turn`,
+ *     this driver used to switch on (pre-existing bug, true on 0.0.7 through
+ *     0.0.10 alike)** — fx's actual values are `end_turn`,
  *     `max_output_tokens`, `max_model_turns`, `refused`, `cancelled`
- *     (`types.zig StopReason`, byte-identical both versions); the driver's
+ *     (`types.zig StopReason`, byte-identical every version checked); the driver's
  *     switch named `max_tokens`/`max_turn_requests`/`refusal` instead, so
  *     every such turn fell into the generic "unexpected stopReason" branch
  *     (still correctly `settleFx(state, 1)`, so no run was ever
@@ -277,22 +427,25 @@ import {
  *     strings and the ACP-canonical names, the latter kept for forward
  *     compatibility.
  *   - **`FX_PERMISSION_MODE` still accepts exactly `yolo`/`auto`/`ask`
- *     (0.0.8)** — `--full-access`/`/permissions full-access` is 0.0.8's new
- *     UI/CLI wording for the same `.yolo` enum value
+ *     (0.0.8, unchanged through 0.0.10)** — `--full-access`/`/permissions
+ *     full-access` is 0.0.8's UI/CLI wording for the same `.yolo` enum value
  *     (`config_runtime.zig parsePermissionMode`; fx's own README: "saved
  *     settings and JSON output retain `yolo`"); this driver keeps sending
  *     the env var value `yolo` (see `AGENT_OPTIONS.fx.modes` in
  *     `src/shared/types.ts` for the picker-facing "Full access" relabel —
- *     the stored id is unchanged).
+ *     the stored id is unchanged). An invalid/unknown `FX_PERMISSION_MODE`
+ *     value still silently falls back to fx's own `auto` — unchanged through
+ *     0.0.10.
  *   - **`agent_message_chunk` carries raw Markdown, not rendered text
- *     (0.0.7+, unchanged at 0.0.8)** — 0.0.6 streamed ANSI-stripped,
+ *     (0.0.7+, unchanged through 0.0.10)** — 0.0.6 streamed ANSI-stripped,
  *     already-rendered text and discarded the markdown source; 0.0.7 flips
  *     that (`src/acp/prompt.zig`): the chunk now carries the raw Markdown
  *     source instead, and a resumed response no longer repeats text already
  *     delivered. Neither needs a driver change here — chunks were already
  *     forwarded verbatim and rendered as markdown downstream by the webview.
- *   - **Project `.mcp.json` merges into ACP sessions (0.0.7+, unchanged at
- *     0.0.8)** — `session/new` AND `session/resume` merge the workspace's
+ *   - **Project `.mcp.json` merges into ACP sessions (0.0.7+, unchanged
+ *     through 0.0.10 — `mcp_servers.zig` is a 0-diff v0.0.8…v0.0.10)** —
+ *     `session/new` AND `session/resume` merge the workspace's
  *     project-level `.mcp.json` MCP servers into the session (trust-gated by
  *     fx's own approval flow / `allow_acp_mcp`). This driver still passes
  *     `mcpServers: []` on every `session/new`/`session/load` call below, but
@@ -313,7 +466,7 @@ import {
  *     `session/request_permission` (`respondPermissionRequest`), and at
  *     settlement (`settleFx`).
  *   - **fx's `[context] …` diagnostics ride `agent_message_chunk`
- *     (unchanged at 0.0.8)** — ACP has no diagnostic channel, so 0.0.7's
+ *     (unchanged through 0.0.10)** — ACP has no diagnostic channel, so 0.0.7's
  *     context-budget warnings (`[context] skill description "x" truncated:
  *     observed=… effective=1024 bytes …; override with --context-limit
  *     skill_description_bytes=BYTES|off`, plus the project-instructions /
@@ -325,6 +478,122 @@ import {
  *     flag — `fx acp --context-limit …` is rejected by the subcommand's own
  *     usage check — so `AGETOR_FX_ARGS`, which lands after `acp`, cannot
  *     carry it today.
+ *
+ * ── Facts new in fx 0.0.9, retained unchanged in 0.0.10 (binary probes of
+ *    v0.0.9 `build_revision e26e97ec4040` and v0.0.10 `1210c2756ea8`, a full
+ *    source-tarball diff v0.0.8…v0.0.10, and the same ACP probe re-run
+ *    against the installed 0.0.8 binary — all dated 2026-09-14; the
+ *    0.0.9→0.0.10 diff of `src/acp/*` itself is a 4-line credential-refresh
+ *    cache tweak, so every 0.0.9 fact below still holds verbatim at 0.0.10) ──
+ *
+ *   - **Reasoning effort rides `configOptions` (0.0.9+)** —
+ *     `session/new`/`session/resume`/`session/load` results gain a FOURTH
+ *     `configOptions` entry, after `provider`/`model`/`mode`:
+ *     `{"id":"effort","name":"Reasoning Effort","description":"Controls how
+ *     much the model thinks before responding","category":"thought_level",
+ *     "type":"select","currentValue":<label>,"options":[{"value":"auto",
+ *     "name":"default"},{"value":<v>,"name":<v>},…]}` — present ONLY when
+ *     the active model advertises efforts (`sessions.zig
+ *     effortConfigState`, sourced from the Gateway catalog's per-model
+ *     `reasoning_options[{type:"effort", values}]`). Live-probed across all
+ *     28 curated fx models (spike `fx-0010-efforts`): 16 advertise efforts,
+ *     12 advertise none. Example (the owner's default model): `zai/glm-5.3-
+ *     flash` → `auto, low, high, max`. **`session/set_config_option
+ *     {sessionId, configId:"effort", value}` sets it** (`server.zig:2222-
+ *     2247`, see `applyFxEffort` below; `ReasoningEffort.parse` in
+ *     `src/core/shared/types.zig` accepts any ≤64-byte alphanumeric/`-_.`
+ *     name, so "unrecognized" and "not listed for this model" are the SAME
+ *     error path, live-verified: `configId:"effort", value:"bogus-value"`
+ *     against `zai/glm-5.3-flash` answered `-32602 "Reasoning effort is not
+ *     available for the active model"`, not "Invalid reasoning effort" —
+ *     `scratchpad/spikes/fx-0010-probe/acp-0.0.10-effort2-out.txt:9`).
+ *     `auto`/`adaptive`/`default` all parse to fx's own default; a value the
+ *     active model doesn't list — INCLUDING any unrecognized-but-well-formed
+ *     id — → `-32602 "Reasoning effort is not available for the active
+ *     model"`; a value fx's parser rejects outright (empty, over 64 bytes, or
+ *     containing a character outside alphanumeric/`-_.`) → `-32602 "Invalid
+ *     reasoning effort"`; no option at all on the active model → `-32602
+ *     "Reasoning effort is unavailable for the active model"`. The set
+ *     PERSISTS on the session (`commitActiveSessionEffort` → a
+ *     `preferences_changed` session event → `session_log.zig`'s projection,
+ *     re-emitted by `writeLoadSessionResponse`'s `configOptions`,
+ *     source-derived AND live-verified 2026-09-14 on the upgraded 0.0.10
+ *     with a real `fx login` (`deepseek/deepseek-v4-flash`): turn 1 set
+ *     `effort=high` (its own response echoed `currentValue:"high"`, and fx's
+ *     log shows `provider_options … effort=high reasoning=selected` on the
+ *     Gateway request); a fresh process's `session/resume` of that session
+ *     then reported the `effort` option with `currentValue:"high"` — the
+ *     round trip holds, so `applyFxEffort`'s "silent when `currentValue`
+ *     already matches" shortcut skips exactly one redundant RPC per
+ *     follow-up turn). **On a 0.0.8 binary the same call is a
+ *     silent no-op** — no error, but `currentValue` never changes, because
+ *     0.0.8 never advertises the `effort` configOptions entry at all (this
+ *     driver's `parseFxEffortOption` returns `null` for such a result, which
+ *     `applyFxEffort` treats as "option absent", not as an error).
+ *   - **`session/resume` AND `session/load` both replay a paused
+ *     checkpoint's execution history as STRUCTURED `tool_call`/
+ *     `tool_call_update` frames, not a text blob (0.0.9+)** —
+ *     `sendExecutionHistory` (`sessions.zig:1300-1450`) now emits a real
+ *     `tool_call` (status `pending`) followed by a `tool_call_update`
+ *     (`completed`/`failed`, with content) per historical call, interleaved
+ *     with `agent_message_chunk` assistant text carrying fresh `messageId`s
+ *     — where 0.0.8 sent one undifferentiated text dump. `session/load`'s
+ *     replay (`sendActiveHistoryUpdates`) was already discarded wholesale
+ *     here via `state.suppressUpdates`, so 0.0.9's structural change to it
+ *     needed no driver change. `session/resume`'s replay
+ *     (`sendPendingRecoveryUpdate`, `sessions.zig:803-830`) is different: it
+ *     replays the paused turn's user text, its tool calls, its partial
+ *     assistant text, then the `paused` recovery update — ALL before the
+ *     `session/resume` RPC response itself resolves — and this driver used
+ *     to let every bit of that reach `dispatchSessionUpdate`/`mapFxUpdate`
+ *     (only the recovery sentinel's OWN terminal-summary-line suppression
+ *     protected against a stale line; the structured tool/assistant frames
+ *     themselves would have landed as duplicate `tool_use`/`tool_result`/
+ *     `assistant` events on the resume run's own event stream, `seq`/dedup
+ *     keys minted fresh per turn so nothing would have caught them). Fixed
+ *     here: `handleServerNotification` now drops every `session/update`
+ *     notification while `state.replaying` is true UNLESS its
+ *     `sessionUpdate` is `session_info_update` — the run's persisted events
+ *     already cover that history (identical rationale to the `session/load`
+ *     discard), and live turn output only starts once `session/prompt`
+ *     itself is sent. See `FxSessionState.replaying`'s doc and the
+ *     `session/resume` bullet above for what still gets through.
+ *   - **Session titles are now LLM-generated in the background (0.0.9+)**
+ *     (`prompt.zig maybeStartAcpTitleTask`, gated by a `session_titles`
+ *     setting) — still rides `session_info_update {title, updatedAt}`
+ *     exactly as before; no driver change.
+ *   - **The `subagent` tool gained `model`/`effort` overrides and mid-task
+ *     feedback (0.0.9+)** — tool inventory names are otherwise unchanged;
+ *     every `tool_call` still renders generically here regardless of name.
+ *   - **Cosmetic: `-c`/`--continue`'s help copy changed** ("latest" →
+ *     "remembered" workspace session) — no behavior change.
+ *   - **Everything else is confirmed UNCHANGED through 0.0.10** by the full
+ *     source diff and the re-run probe against 0.0.8: the `fx acp` flag set
+ *     (`--model`/`--log-file`, `--context-limit` still rejected after
+ *     `acp`); `initialize` leniency and the `-32600` credential-gate texts
+ *     (missing vs. invalid, generic vs. provider-specific); the 12-method
+ *     surface (`session/{cancel,close,list,load,new,prompt,remove,
+ *     request_permission,resume,set_config_option,set_mode,update}`); the
+ *     eight `session/update` writers (`plan`/`current_mode_update` still
+ *     have no writer); the `stopReason` vocabulary; `session/prompt`'s
+ *     `usage` shape; `continueRecovery` and its "No paused model response to
+ *     continue" text (`prompt.zig:748`, byte-unchanged);
+ *     `model_response_recovery.zig` is a 0-diff (the retry-storm state
+ *     machine); permission option kinds (`allow_once`/`allow_always`/
+ *     `reject_once`); the hard-wired reviewer `openai/gpt-5.6-luna` and its
+ *     deny-on-403 behavior; the held/denied JSON shape; `FX_PERMISSION_MODE`
+ *     (`yolo`/`auto`/`ask`, `full-access`→`yolo`, an invalid/unrecognized
+ *     value still falling back silently to fx's own `auto`); all 60 `FX_*`
+ *     env vars (still no `FX_HOME`); the `status --json`/`models --json`
+ *     field shapes; the unauthenticated Gateway catalog, which read **247**
+ *     ids on all three of the 0.0.8, 0.0.9 and 0.0.10 binaries on
+ *     2026-09-14 (every curated id present on all three); the default model
+ *     `moonshotai/kimi-k3`; 12-char base64url session ids; the `~/.fx/`
+ *     on-disk layout; the `.mcp.json` project-config merge
+ *     (`mcp_servers.zig` 0-diff); and the `session/set_mode` registry
+ *     (`code`→`auto`, `ask`→`ask`, still no `yolo` mode id — the "never
+ *     nudge yolo" rule in `acpModeIdFor` stands unchanged). Build revisions
+ *     for the record: v0.0.9 = `e26e97ec4040`, v0.0.10 = `1210c2756ea8`.
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -374,6 +643,16 @@ function ensureLogDirForArgv(argv: string[]): void {
   const logFile = argv[idx + 1]!;
   const dir = path.dirname(logFile);
   if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+/** Pulls the value immediately following `flag` out of `argv` — used by
+ *  `spawnFxViaAcp` to recover the launch model id from `--model <id>` when
+ *  `FxLaunchOptions.model` isn't supplied (see its doc comment). Returns
+ *  `undefined` when the flag is absent or is the last element. */
+function argvValueAfter(argv: string[], flag: string): string | undefined {
+  const idx = argv.indexOf(flag);
+  if (idx === -1 || idx + 1 >= argv.length) return undefined;
+  return argv[idx + 1];
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -439,6 +718,85 @@ interface FxSessionState {
    *  See the `session_info_update` case in `mapFxUpdate` and the file
    *  header's session-title fact. */
   lastTitle?: string;
+  /** JSON of the last `FX_RECOVERY_STATUS_PREFIX` sentinel body emitted this
+   *  turn — carried forward across `dispatchSessionUpdate` calls the same
+   *  way `lastTitle` is, so an identical consecutive recovery payload (fx
+   *  resends the same `modelResponseRecovery` object more than once) is
+   *  deduped instead of re-emitted. See the `session_info_update` case in
+   *  `mapFxUpdate`. */
+  lastRecoveryJson?: string;
+  /** True from the moment `session/resume` is sent until its response
+   *  settles (success or error) — see `runFxTurn`. fx replays the session's
+   *  prior `session/update` history onto the NEW run while this is true —
+   *  as of fx 0.0.9 that's a STRUCTURED replay (real `tool_call`/
+   *  `tool_call_update`/`agent_message_chunk` frames, source-verified
+   *  `sessions.zig sendPendingRecoveryUpdate`/`sendExecutionHistory`; 0.0.8
+   *  sent one undifferentiated text blob instead). `handleServerNotification`
+   *  drops EVERY content kind while this flag is true — `agent_message_chunk`,
+   *  `agent_thought_chunk`, `tool_call`, `tool_call_update`, `usage_update`,
+   *  and any future variant — the run's own persisted events already cover
+   *  that history. `session_info_update` is the one kind still forwarded to
+   *  `dispatchSessionUpdate`/`mapFxUpdate`, since it carries the two
+   *  sentinels a resume run still needs LIVE: the recovery sentinel (so this
+   *  run's own paused/resumed state derives correctly — it still emits with
+   *  a `replayed: true` marker, but its terminal paused/recovered SUMMARY
+   *  LINE is suppressed, since that line already reached the transcript on
+   *  the run where the pause actually happened and re-firing it on every
+   *  resume would spam a stale explanation into every follow-up turn) and
+   *  the session-title sentinel.
+   *
+   *  **Cleared in `handleLine`, not in the `await sendRpc(...)` continuation
+   *  in `runFxTurn`.** `pumpStdout` drains a whole stdout chunk
+   *  synchronously, dispatching every complete line it contains to
+   *  `handleLine` in one pass; the `await` on the `session/resume` call only
+   *  resumes as a microtask AFTER that synchronous pass finishes. So a
+   *  `session/update` notification fx writes into the SAME stdout chunk as
+   *  the `session/resume` response — after the response line, still before
+   *  agetor's own `session/prompt` — would reach `handleServerNotification`
+   *  while `replaying` was still `true` if the flag were only flipped by the
+   *  awaiting code, dropping a genuinely-live update as if it were replay.
+   *  `handleLine`'s reply branch clears `replaying` (and `lastRecoveryJson`,
+   *  `replayRpcId`) the instant it observes the matching reply line, which
+   *  is correctly ordered relative to every other line in that same chunk;
+   *  `runFxTurn`'s resets after `await sendRpc(...)` resolves are kept as
+   *  belt-and-braces (idempotent — a no-op once `handleLine` already did it)
+   *  for the success/error/timeout paths that never reach `handleLine` at
+   *  all. Latent today — fx emits nothing between the `session/resume`
+   *  response and agetor's own `session/prompt` — but real for a future
+   *  0.0.9-style structured-replay frame that lands late. See
+   *  `replayRpcId`. */
+  replaying?: boolean;
+  /** The JSON-RPC id of the in-flight `session/resume` call, set right
+   *  before `sendRpc(state, "session/resume", …)` is issued and read (then
+   *  cleared) by `handleLine`'s reply branch to know WHICH reply line means
+   *  "the replay window closed" — see `replaying`'s doc above for why that
+   *  can't just be "whenever `runFxTurn`'s await resumes". Cleared on both
+   *  the success and error reply paths. */
+  replayRpcId?: number;
+  /** Set when a `paused` recovery update arrives while `replaying` is true
+   *  — i.e. `session/resume` replayed a paused checkpoint onto this run.
+   *  Read once a NORMAL (non-`continueRecovery`) `session/prompt` call has
+   *  actually RESOLVED with a result (any stopReason) — never before it's
+   *  sent, and never on an RpcError/timeout/death path, all of which
+   *  `return` before reaching that point and so correctly leave this flag
+   *  untouched: fx consumes the checkpoint the moment an ordinary prompt
+   *  runs (`prompt.zig` closes the interrupted turn), so `runFxTurn` emits a
+   *  `{state:"cleared"}` sentinel and resets this flag right after the
+   *  prompt resolves — otherwise a succeeded follow-up turn would still show
+   *  a stale Resume affordance from the replayed pause, and (the bug this
+   *  timing fixes) a transport-level prompt failure would wrongly clear the
+   *  Resume affordance for a checkpoint that's actually still intact in fx. */
+  replayedPaused?: boolean;
+  /** The last NON-replayed recovery payload observed this turn (i.e. one
+   *  that arrived live, not via `session/resume`'s history replay) — read by
+   *  the `refused`/`refusal` stopReason branch to enrich the "fx turn
+   *  ended: …" status line when this run itself is the one that paused. */
+  lastRecovery?: FxRecoveryPayload;
+  /** True once this turn has already emitted the "held tool call" guidance
+   *  status line (see the `tool_call_update` case in `mapFxUpdate`) — caps
+   *  it at one per run even if fx holds several tool calls in a row for the
+   *  same reason. */
+  reviewHeldWarned?: boolean;
 
   resolved: boolean;
   killRequested: boolean;
@@ -591,7 +949,7 @@ class RpcTimeoutError extends Error {}
 /** Rejection shape for a real JSON-RPC error reply from fx (as opposed to
  *  `RpcTimeoutError`, which is ours). `code` is the JSON-RPC error code —
  *  callers use it to distinguish a credential re-check failure (`-32600`,
- *  see the header's "Facts verified against fx 0.0.5 through 0.0.8" section)
+ *  see the header's "Facts verified against fx 0.0.5 through 0.0.10" section)
  *  from every other protocol error, without re-parsing `message`. The message
  *  text itself is UNCHANGED from before this class existed
  *  (`"<fx message> (code <n>)"`) so every existing message-based assertion
@@ -686,6 +1044,17 @@ function handleLine(state: FxSessionState, line: string): void {
     const pending = state.pending.get(id);
     if (!pending) return; // stale/unknown id — ignore
     state.pending.delete(id);
+    // Close the `session/resume` replay window the instant its reply LINE
+    // is observed, not whenever `runFxTurn`'s `await sendRpc(...)` happens
+    // to resume as a microtask — see `FxSessionState.replaying`'s doc for
+    // why those can differ within one stdout chunk. Covers both the
+    // success and error reply shapes; `runFxTurn`'s own resets after the
+    // `await` are a harmless no-op once this has already run.
+    if (state.replaying && state.replayRpcId === id) {
+      state.replaying = false;
+      state.lastRecoveryJson = undefined;
+      state.replayRpcId = undefined;
+    }
     if (msg.error) {
       const rawMessage = msg.error.message ?? "fx acp error";
       pending.reject(
@@ -782,7 +1151,8 @@ async function respondPermissionRequest(
 
   const options = Array.isArray(params?.options) ? params!.options! : [];
 
-  // Live caveat (fx 0.0.8, 2026-09-08): in `auto` mode fx runs its OWN
+  // Live caveat (fx 0.0.8, 2026-09-08; source-confirmed unchanged through
+  // 0.0.10, 2026-09-14): in `auto` mode fx runs its OWN
   // review first, hard-wired to `openai/gpt-5.6-luna`; on an account that
   // gets HTTP 403 for that tier fx answers `decision=unavailable →
   // deny, recovery=agent_replan` and tells the model the action was held —
@@ -897,6 +1267,18 @@ function handleServerNotification(state: FxSessionState, method: string, params:
   if (method !== "session/update") return; // forward-compat ignore
   if (state.suppressUpdates) return; // discarding replay during session/load fallback
   const update = (params as { update?: Record<string, unknown> } | undefined)?.update;
+  // While `session/resume` is replaying a prior session's history onto this
+  // NEW run (0.0.9+: structured `tool_call`/`tool_call_update`/
+  // `agent_message_chunk` frames — see `FxSessionState.replaying`'s doc and
+  // the file header's "Facts new in fx 0.0.9" section), every content kind
+  // is dropped here, before it ever reaches `dispatchSessionUpdate`/
+  // `mapFxUpdate` — the run's own persisted events already cover that
+  // history. `session_info_update` is the one kind still let through: it
+  // carries the recovery sentinel (still needed live, so this run's own
+  // paused/resumed state derives correctly — see `mapFxUpdate`'s
+  // `ctx.replaying` handling for how its terminal summary line is
+  // separately suppressed) and the session-title sentinel.
+  if (state.replaying && update?.sessionUpdate !== "session_info_update") return;
   if (update) dispatchSessionUpdate(state, update);
 }
 
@@ -955,6 +1337,90 @@ function toolResultContent(update: Record<string, unknown>): unknown {
   if ("rawOutput" in update) return update.rawOutput;
   if ("content" in update) return update.content;
   return update;
+}
+
+/** Pull the JSON-text payload out of one ACP `ToolCallContent` array item —
+ *  the wire shape `content` actually carries for a `tool_call_update` (see
+ *  {@link fxToolReviewError}'s doc comment). Two variants observed/schema
+ *  -valid: the documented wrapper `{ type: "content", content: { type:
+ *  "text", text } }`, and a bare `{ type: "text", text }` block in case a
+ *  future fx build (or another ACP-speaking harness) omits the wrapper.
+ *  `undefined` for anything else — a `diff`/`terminal` item, an
+ *  `image`/`resource_link` inner block, or a malformed item. */
+function acpTextContentValue(item: unknown): string | undefined {
+  if (!item || typeof item !== "object") return undefined;
+  const obj = item as Record<string, unknown>;
+  if (obj.type === "content" && obj.content && typeof obj.content === "object" && !Array.isArray(obj.content)) {
+    const inner = obj.content as Record<string, unknown>;
+    return inner.type === "text" && typeof inner.text === "string" ? inner.text : undefined;
+  }
+  if (obj.type === "text" && typeof obj.text === "string") return obj.text;
+  return undefined;
+}
+
+/** `{error:{type,reason}}` out of an already-parsed plain object — shared by
+ *  every {@link fxToolReviewError} input shape (object, string, and each
+ *  array item's decoded text) so the "what counts as a review-held error
+ *  object" rule lives in exactly one place. */
+function fxToolReviewErrorFromObject(parsed: unknown): { type?: unknown; reason?: unknown } | undefined {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const err = (parsed as Record<string, unknown>).error;
+  if (!err || typeof err !== "object" || Array.isArray(err)) return undefined;
+  return err as { type?: unknown; reason?: unknown };
+}
+
+/**
+ * Best-effort detection of fx's review-held/permission-denied error shape
+ * inside a completed-or-failed tool call's result content — see the
+ * `tool_call_update` case's "Held-tool guidance" comment for why this
+ * exists. `content` is whatever {@link toolResultContent} produced for the
+ * paired `tool_result` chunk, and its real wire shape (source-verified
+ * against fx 0.0.8's `src/acp/types.zig writeToolCallUpdate` — there is no
+ * `rawOutput` on a `tool_call_update` at all, ever) is an ACP
+ * `ToolCallContent[]` array: `[{ type: "content", content: { type: "text",
+ * text: "<held JSON string>" } }]`, where the held/denied text is
+ * `{"error":{"type":"tool_review_held"|"tool_permission_denied",
+ * "reason":"review_unavailable", …}}`. This function walks that array (via
+ * {@link acpTextContentValue}, which also tolerates a bare `{type:"text",
+ * text}` block with no wrapper), `JSON.parse`s each item's text, and returns
+ * the first parsed `{error:{...}}` match. It also still accepts a plain
+ * string (fx's error JSON with no ACP envelope around it at all, in case a
+ * future/alternate fx build stringifies directly) and an already-parsed
+ * plain object (e.g. via `rawOutput`, which this driver's own
+ * `toolResultContent` prefers when present) — both pre-existing shapes this
+ * driver has tolerated from the start, kept for robustness even though real
+ * fx 0.0.8 traffic only ever takes the array path. Never throws — a
+ * non-array/non-string/non-object `content`, an array with no text item that
+ * parses to `{error:{...}}`, a string that isn't valid JSON, or a parsed
+ * value with no `error` object all yield `undefined`, which the caller reads
+ * the same as "not a review-held error" rather than a `type`/`reason` it has
+ * to separately null-check.
+ */
+function fxToolReviewError(content: unknown): { type?: unknown; reason?: unknown } | undefined {
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      const text = acpTextContentValue(item);
+      if (text === undefined) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        continue;
+      }
+      const err = fxToolReviewErrorFromObject(parsed);
+      if (err) return err;
+    }
+    return undefined;
+  }
+  let parsed: unknown = content;
+  if (typeof content === "string") {
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return undefined;
+    }
+  }
+  return fxToolReviewErrorFromObject(parsed);
 }
 
 /** One `file://` `resource_link` content block found in a completed tool
@@ -1026,8 +1492,8 @@ export interface FxChunk {
  *  plus the project-instructions / skill-catalog / MCP siblings a binary
  *  `strings` scan shows) and — ACP having no diagnostic channel — ships them
  *  as the turn's first `agent_message_chunk`, one chunk with one line per
- *  warning. Observed live against 0.0.7 (2026-09-01); unchanged at 0.0.8
- *  (spike + source diff, 2026-09-08). */
+ *  warning. Observed live against 0.0.7 (2026-09-01); unchanged through 0.0.10
+ *  (spike + source diff, 2026-09-08 and re-confirmed 2026-09-14). */
 export const FX_CONTEXT_DIAGNOSTIC_PREFIX = "[context] ";
 
 /** True when every non-blank line of `text` is one of fx's `[context] …`
@@ -1133,11 +1599,22 @@ export class FxTextCoalescer {
  *  across a run's updates (rather than per-call) must pass the SAME ctx
  *  object to every `mapFxUpdate` call for that run, or otherwise carry
  *  `lastTitle` forward itself (see `dispatchSessionUpdate`, which does the
- *  latter against `FxSessionState.lastTitle`). */
+ *  latter against `FxSessionState.lastTitle`). The five recovery/review
+ *  fields below mirror that same pattern one-for-one against
+ *  `FxSessionState.lastRecoveryJson`/`replaying`/`replayedPaused`/
+ *  `lastRecovery`/`reviewHeldWarned` — see those fields' doc comments on
+ *  `FxSessionState` for what each one means; `dispatchSessionUpdate` reads
+ *  all five off `state` into a fresh `ctx` before every `mapFxUpdate` call
+ *  and writes all five back afterwards, exactly like `lastTitle`. */
 export interface FxUpdateCtx {
   runId: string;
   nextSeq: () => number;
   lastTitle?: string;
+  lastRecoveryJson?: string;
+  replaying?: boolean;
+  replayedPaused?: boolean;
+  lastRecovery?: FxRecoveryPayload;
+  reviewHeldWarned?: boolean;
 }
 
 /**
@@ -1223,13 +1700,46 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       // so drop the event rather than emit an unpairable orphan.
       if (typeof update.toolCallId !== "string") return [];
       const id = update.toolCallId;
+      const resultContent = toolResultContent(update);
       const chunks: FxChunk[] = [
         {
           stream: "tool_result",
-          data: JSON.stringify({ toolUseId: id, content: toolResultContent(update), isError: status === "failed" }),
+          data: JSON.stringify({ toolUseId: id, content: resultContent, isError: status === "failed" }),
           lineUuid: `fx:tool:${id}:result`,
         },
       ];
+
+      // ── Held-tool guidance ──
+      // fx's hard-wired auto-mode reviewer can be unavailable on an account
+      // (e.g. HTTP 403 for that tier — see `respondPermissionRequest`'s
+      // "Live caveat" comment on `session/request_permission`), in which
+      // case fx never escalates a permission request at all: it just holds
+      // or denies the call and tells the MODEL why, as a JSON error object
+      // riding the same content
+      // this tool_result's `content` field above was just built from —
+      // `{"error":{"type":"tool_review_held"|"tool_permission_denied",
+      // "reason":"review_unavailable", …}}`. Surface that to the USER too,
+      // once per run (`ctx.reviewHeldWarned`), so they know to switch modes
+      // rather than watch every tool call silently fail. Any other error
+      // shape/reason (a real permission denial, an unrelated tool failure)
+      // emits nothing here — this is guidance for one specific, otherwise
+      // silent failure mode, not a generic error reporter.
+      if (!ctx.reviewHeldWarned) {
+        const reviewError = fxToolReviewError(resultContent);
+        if (
+          reviewError &&
+          (reviewError.type === "tool_review_held" || reviewError.type === "tool_permission_denied") &&
+          reviewError.reason === "review_unavailable"
+        ) {
+          ctx.reviewHeldWarned = true;
+          chunks.push({
+            stream: "status",
+            data:
+              "⚠ fx held this tool call — its safety reviewer (auto mode) is unavailable on this account, so tools can't run. Switch this task's mode to Full access (or Ask) to let tools run.",
+            lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
+          });
+        }
+      }
 
       // ── Dormant: `resource_link` → synthetic `SendUserFile` tool_use/result ──
       // fx 0.0.7's ACP implementation, source- and binary-string-verified
@@ -1345,6 +1855,76 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
     }
 
     case "session_info_update": {
+      // Two independent facts can ride this one update kind — fx's retry
+      // -progress channel (`_meta.fx.modelResponseRecovery`, live since
+      // 0.0.7) and the `{title, updatedAt}` session-title shape (fx ≥0.0.8,
+      // see the file header) — checked and emitted separately below, in
+      // that order, so an update carrying both (or either alone) is handled
+      // the same way regardless of which fields are present.
+      const chunks: FxChunk[] = [];
+
+      // ── Recovery channel ──
+      // `parseFxRecoveryMeta` returns `undefined` when this update carries
+      // no `_meta.fx.modelResponseRecovery` key at all (most updates —
+      // nothing to do here), or a payload (possibly `{state:"cleared"}` for
+      // the wire's explicit `null`) when it does. Dedup against the last
+      // payload JSON emitted THIS turn (`ctx.lastRecoveryJson`, mirroring
+      // `ctx.lastTitle`'s dedupe) — an identical consecutive payload emits
+      // nothing at all, not even a repeated sentinel.
+      const recovery = parseFxRecoveryMeta(update);
+      if (recovery != null) {
+        // Dedupe key is computed from the PLAIN payload — never including
+        // the `replayed` marker below — so a live payload that happens to
+        // be byte-identical to the last replayed one still dedupes/resets
+        // exactly per finding #2 (reset at replay close) rather than being
+        // treated as distinct merely because one carries the marker and the
+        // other doesn't.
+        const recoveryJson = JSON.stringify(recovery);
+        if (recoveryJson !== ctx.lastRecoveryJson) {
+          ctx.lastRecoveryJson = recoveryJson;
+          // Finding #8: while replaying (`session/resume` replaying prior
+          // history onto a NEW run — see below), stamp the EMITTED sentinel
+          // body with `replayed: true` so downstream progress renderers
+          // (RunPanel's live notice, `agetor logs`, the TUI) can tell a
+          // replayed "attempt N/M" from a live one — replayed history is
+          // persisted onto this run's own event stream, so without a marker
+          // it would read as fresh progress. A live (non-replayed) sentinel
+          // carries no such field at all (not even `replayed: false`).
+          const emittedPayload: FxRecoveryPayload & { replayed?: boolean } = ctx.replaying
+            ? { ...recovery, replayed: true }
+            : recovery;
+          chunks.push({
+            stream: "status",
+            data: FX_RECOVERY_STATUS_PREFIX + JSON.stringify(emittedPayload),
+            lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
+          });
+          if (ctx.replaying) {
+            // session/resume replaying this session's prior history onto a
+            // NEW run — the sentinel above still lands (so this run's live
+            // state derivation is correct), but the terminal summary line
+            // below is suppressed: it already reached the transcript on the
+            // run where the pause/recovery actually happened. A replayed
+            // `paused` update specifically also flags `replayedPaused`, read
+            // by `runFxTurn` right before it sends a normal follow-up prompt
+            // (see the file header + `FxSessionState.replayedPaused`).
+            if (recovery.state === "paused") ctx.replayedPaused = true;
+          } else {
+            // A live (non-replayed) update — record it for the `refused`/
+            // `refusal` stopReason branch to enrich its status line when
+            // THIS run is the one that paused, and emit the persisted,
+            // terminal-transition-only summary line (paused/recovered only
+            // — `fxRecoverySummaryLine` returns `null` for `active`/
+            // `cleared`, nothing final to say yet).
+            ctx.lastRecovery = recovery;
+            const summary = fxRecoverySummaryLine(recovery);
+            if (summary !== null) {
+              chunks.push({ stream: "status", data: summary, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` });
+            }
+          }
+        }
+      }
+
+      // ── Session title ──
       // {title, updatedAt} (fx ≥0.0.8), fired at lifecycle points and after
       // every turn — see the file header. Normalize before every check:
       // collapse all whitespace (newlines/tabs/repeated spaces) to a single
@@ -1352,24 +1932,28 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
       // titles are model-generated text with no length guarantee, mirroring
       // extractFxProviderValue's 64-char provider-value bound below. The
       // placeholder/dedupe checks run against the NORMALIZED title: fx's own
-      // placeholder ("Untitled session"), the pre-0.0.8-era variant of this
-      // event (no `title`, just `_meta.fx.modelResponseRecovery`), and a
-      // title that normalizes to empty all carry no usable title and must
-      // emit nothing; a repeat of the same normalized title already emitted
-      // this turn (via `ctx.lastTitle`, mutated below) is deduped rather
-      // than re-emitted.
+      // placeholder ("Untitled session"), a recovery-only update (no
+      // `title` field at all — the two facts above are independent, and an
+      // update can carry the recovery meta without ever carrying a title),
+      // and a title that normalizes to empty all carry no usable TITLE and
+      // so contribute nothing here (though the update may still have
+      // emitted a recovery chunk above); a repeat of the same normalized
+      // title already emitted this turn (via `ctx.lastTitle`, mutated
+      // below) is deduped rather than re-emitted.
       const rawTitle = (update as { title?: unknown }).title;
-      if (typeof rawTitle !== "string" || rawTitle.length === 0) return [];
-      const title = rawTitle.replace(/\s+/g, " ").trim().slice(0, FX_SESSION_TITLE_MAX_LEN);
-      if (!title || title === "Untitled session" || title === ctx.lastTitle) return [];
-      ctx.lastTitle = title;
-      return [
-        {
-          stream: "status",
-          data: FX_SESSION_TITLE_STATUS_PREFIX + title,
-          lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
-        },
-      ];
+      if (typeof rawTitle === "string" && rawTitle.length > 0) {
+        const title = rawTitle.replace(/\s+/g, " ").trim().slice(0, FX_SESSION_TITLE_MAX_LEN);
+        if (title && title !== "Untitled session" && title !== ctx.lastTitle) {
+          ctx.lastTitle = title;
+          chunks.push({
+            stream: "status",
+            data: FX_SESSION_TITLE_STATUS_PREFIX + title,
+            lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
+          });
+        }
+      }
+
+      return chunks;
     }
 
     default:
@@ -1388,11 +1972,25 @@ export function mapFxUpdate(update: Record<string, unknown>, ctx: FxUpdateCtx): 
  *  through `emit` (dedup + settled-turn gating), same as before the
  *  extraction. */
 function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unknown>): void {
-  const ctx: FxUpdateCtx = { runId: state.runId, nextSeq: () => state.seq++, lastTitle: state.lastTitle };
+  const ctx: FxUpdateCtx = {
+    runId: state.runId,
+    nextSeq: () => state.seq++,
+    lastTitle: state.lastTitle,
+    lastRecoveryJson: state.lastRecoveryJson,
+    replaying: state.replaying,
+    replayedPaused: state.replayedPaused,
+    lastRecovery: state.lastRecovery,
+    reviewHeldWarned: state.reviewHeldWarned,
+  };
   for (const c of mapFxUpdate(update, ctx)) {
     emit(state, c.stream, c.data, c.lineUuid, c.messageId);
   }
   state.lastTitle = ctx.lastTitle;
+  state.lastRecoveryJson = ctx.lastRecoveryJson;
+  state.replaying = ctx.replaying;
+  state.replayedPaused = ctx.replayedPaused;
+  state.lastRecovery = ctx.lastRecovery;
+  state.reviewHeldWarned = ctx.reviewHeldWarned;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -1594,7 +2192,7 @@ function acpModeIdFor(mode: FxMode): string | null {
 
 /** Pull the active provider id out of a `session/new`/`session/resume`/
  *  `session/load` result's `configOptions` array (0.0.5+, additive — see
- *  the file header's "Facts verified against fx 0.0.5 through 0.0.8"
+ *  the file header's "Facts verified against fx 0.0.5 through 0.0.10"
  *  section). Pure and exported for the same reason `mapFxUpdate` is: unit-testable
  *  against a raw result object without spawning a child. Tolerates a
  *  missing/non-array `configOptions` (0.0.4 binaries, or a response that
@@ -1622,6 +2220,146 @@ export function extractFxProviderValue(result: unknown): string | null {
     }
   }
   return null;
+}
+
+/** Pull the `id: "effort"` entry out of a `session/new`/`session/resume`/
+ *  `session/load` result's `configOptions` array (fx ≥0.0.9, additive — see
+ *  the file header's "Facts new in fx 0.0.9" section). Returns `null` when
+ *  `configOptions` isn't an array, or carries no entry whose `id` is
+ *  `"effort"` — the case on a 0.0.8 binary, and on any binary when the
+ *  active model doesn't advertise efforts at all. A present entry with an
+ *  empty `values` array (an `effort` id with nothing actually offered) is
+ *  returned as `{current, values: []}`, NOT folded into the `null` case
+ *  here — `applyFxEffort` is the one that treats the two as equivalent
+ *  ("option absent"), so a caller that wants to tell "no entry at all" from
+ *  "entry present but empty" apart can still do so. Pure and exported so the
+ *  fake-ACP-server driver
+ *  tests can exercise it without spawning a child; tolerates every
+ *  malformed shape without throwing: a non-string `currentValue` reads as
+ *  `null`, a missing/non-array `options` reads as `values: []`, and a
+ *  non-string option `value` is skipped rather than included. */
+export function parseFxEffortOption(configOptions: unknown): { current: string | null; values: string[] } | null {
+  if (!Array.isArray(configOptions)) return null;
+  const entry = configOptions.find(
+    (o) => o && typeof o === "object" && (o as { id?: unknown }).id === "effort",
+  ) as { currentValue?: unknown; options?: unknown } | undefined;
+  if (!entry) return null;
+  const rawOptions = Array.isArray(entry.options) ? entry.options : [];
+  const values = rawOptions
+    .map((o: unknown) => (o && typeof o === "object" ? (o as { value?: unknown }).value : undefined))
+    .filter((v: unknown): v is string => typeof v === "string");
+  const current = typeof entry.currentValue === "string" ? entry.currentValue : null;
+  return { current, values };
+}
+
+/** Best-effort application of the task's stored reasoning effort to the
+ *  active fx session — never throws and never fails the turn; every failure
+ *  path degrades to a visible status breadcrumb instead. Called from
+ *  `runFxTurn` right after `session/new` resolves, and again after a
+ *  successful `session/resume` or `session/load` (all three results carry
+ *  `configOptions` — see the file header's "Facts new in fx 0.0.9"
+ *  section), always BEFORE `session/prompt` is sent.
+ *
+ *  `opts.effort` is agetor's stored effort id
+ *  (`low|medium|high|xhigh|max|none|auto`) or `null`/`undefined`, meaning
+ *  "the task has no effort set — don't touch fx's session at all" (silent
+ *  return). `opts.model` is used only to name the model in a breadcrumb;
+ *  falls back to a generic phrase when absent.
+ *
+ *  Decision table (see docs/plans/fx-0.0.10-compat.md §3.3):
+ *    - `effort` null                                  → silent, no RPC.
+ *    - `configOptions` carries no `effort` entry, OR
+ *      carries one with an empty `values` list
+ *      ("option absent" — the two are treated the same,
+ *      see `parseFxEffortOption`'s doc) AND
+ *      `effort !== "auto"`                             → status breadcrumb,
+ *                                                          no RPC.
+ *    - "option absent" (as above) AND
+ *      `effort === "auto"`                             → silent (fx's own
+ *                                                          default needs no
+ *                                                          nudge when the
+ *                                                          model can't even
+ *                                                          set one — this
+ *                                                          also covers a
+ *                                                          present-but-empty
+ *                                                          entry, not just a
+ *                                                          missing one).
+ *    - entry present, non-empty, but doesn't list `effort` → status
+ *                                                          breadcrumb naming
+ *                                                          the offered
+ *                                                          values, no RPC.
+ *    - entry present, lists `effort`,
+ *      `currentValue === effort` already                → silent, no RPC.
+ *    - entry present, lists `effort`, differs            → `session/
+ *                                                          set_config_option`;
+ *                                                          success is silent,
+ *                                                          any error (RPC,
+ *                                                          timeout, other)
+ *                                                          degrades to a
+ *                                                          status breadcrumb
+ *                                                          carrying fx's own
+ *                                                          message. */
+async function applyFxEffort(
+  state: FxSessionState,
+  sessionResult: unknown,
+  opts: { effort?: string | null; model?: string },
+): Promise<void> {
+  const effort = opts.effort ?? null;
+  if (effort === null) return;
+  const modelLabel = opts.model ?? "the active model";
+  const parsed = parseFxEffortOption(
+    (sessionResult as { configOptions?: unknown } | undefined)?.configOptions,
+  );
+  // A missing `effort` entry and a present-but-empty one (`values: []`,
+  // e.g. `auto` is the only thing fx would ever offer to begin with) are
+  // both "the model exposes no reasoning-effort setting" — neither has a
+  // concrete value for `effort` to match against or set, so both take the
+  // same silent-for-auto / breadcrumb-otherwise path (see the decision
+  // table above and Phase 5 review: this used to send an empty-`values`
+  // entry into the "isn't offered (offers: )" breadcrumb below instead,
+  // which is wrong even for `effort === "auto"`).
+  if (parsed === null || parsed.values.length === 0) {
+    if (effort === "auto") return;
+    emit(
+      state,
+      "status",
+      `fx: ${modelLabel} exposes no reasoning-effort setting — running at fx's default`,
+      `fx:${state.runId}:${state.seq++}`,
+    );
+    return;
+  }
+  if (!parsed.values.includes(effort)) {
+    emit(
+      state,
+      "status",
+      `fx: effort ${effort} isn't offered for ${modelLabel} (offers: ${parsed.values.join(", ")}) — running at fx's default`,
+      `fx:${state.runId}:${state.seq++}`,
+    );
+    return;
+  }
+  if (parsed.current === effort) return;
+  try {
+    await withTimeout(
+      sendRpc(state, "session/set_config_option", {
+        sessionId: state.sessionId,
+        configId: "effort",
+        value: effort,
+      }),
+      RPC_HANDSHAKE_TIMEOUT_MS,
+      "session/set_config_option",
+    );
+    if (state.resolved) return;
+    // success — silent, nothing to emit.
+  } catch (err) {
+    if (state.resolved) return;
+    const message = err instanceof RpcError ? (err.rawMessage ?? err.message) : String(err);
+    emit(
+      state,
+      "status",
+      `fx: couldn't set effort ${effort} — ${message} — running at fx's default`,
+      `fx:${state.runId}:${state.seq++}`,
+    );
+  }
 }
 
 /** Reads `session/prompt`'s (fx ≥0.0.8) `usage` object and, if at least one
@@ -1652,12 +2390,34 @@ function maybeEmitPromptUsage(state: FxSessionState, usage: unknown): void {
 
 async function runFxTurn(
   state: FxSessionState,
-  opts: { cwd: string; promptText: string; resumeSessionId?: string },
+  opts: {
+    cwd: string;
+    promptText: string;
+    resumeSessionId?: string;
+    continueRecovery?: boolean;
+    /** Agetor's stored effort id, applied via `applyFxEffort` after
+     *  `session/new`/a successful `session/resume`/`session/load` — see
+     *  `FxLaunchOptions.effort`. */
+    effort?: string | null;
+    /** The launch model id, used only for `applyFxEffort`'s breadcrumb text
+     *  — see `FxLaunchOptions.model`. */
+    model?: string;
+  },
 ): Promise<void> {
+  // A continue-recovery turn only makes sense against a prior session — fx
+  // ≥0.0.8's `_meta.fx.continueRecovery` resumes a paused checkpoint by
+  // session id, it does not (and cannot) start one fresh. Fail fast, before
+  // spawning any RPC traffic, rather than sending a `continueRecovery`
+  // prompt against a brand-new `session/new` session fx would just reject.
+  if (opts.continueRecovery && !opts.resumeSessionId) {
+    failTurn(state, "fx acp: continueRecovery requires a prior session id");
+    return;
+  }
+
   // Emits the `FX_PROVIDER_STATUS_PREFIX` status chunk at most once per
   // turn, from whichever of session/new|resume|load's results carries a
   // `configOptions` provider entry first — see the file header's "Facts
-  // verified against fx 0.0.5 through 0.0.8" section.
+  // verified against fx 0.0.5 through 0.0.10" section.
   let providerEmitted = false;
   function maybeEmitProvider(result: unknown): void {
     if (providerEmitted) return;
@@ -1674,13 +2434,15 @@ async function runFxTurn(
       sendRpc(state, "initialize", {
         // Send the NUMBER 1 — ACP's schema defines protocolVersion as a
         // number and this driver has always sent one, so nothing here
-        // changes. (A prior version of this comment claimed fx rejects a
-        // *stringified* protocolVersion with -32602; that was never
-        // actually spike-verified — the probe scenario meant to test it
-        // sent numeric 1 by mistake — so the claim is dropped. What IS
-        // 0.0.8 spike-verified: an unrecognized numeric protocolVersion,
-        // e.g. 999, is accepted leniently rather than rejected. Neither
-        // fact changes what this driver sends.)
+        // changes. Re-verified 2026-09-14 on both 0.0.10 and 0.0.8: a
+        // *stringified* protocolVersion (`"1"`) IS rejected with
+        // `-32602 "Invalid initialize params"`
+        // (scratchpad/spikes/fx-0010-probe/acp-0.0.10-pv-str1-out.txt,
+        // acp-0.0.8-pv-str1-out.txt) — an earlier pass of this comment
+        // wrongly dropped that fact as "never spike-verified". Separately,
+        // an unrecognized but well-typed NUMERIC protocolVersion, e.g. 999,
+        // is accepted leniently rather than rejected. Neither fact changes
+        // what this driver sends.
         protocolVersion: 1,
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
         clientInfo: { name: "agetor", version: "0" },
@@ -1698,15 +2460,57 @@ async function runFxTurn(
   if (opts.resumeSessionId) {
     state.sessionId = opts.resumeSessionId;
     let resumed = false;
+    // fx replays the session's prior `session/update` history (including a
+    // still-`paused` recovery checkpoint, if there is one) onto THIS run
+    // before the `session/resume` response itself arrives — see the file
+    // header + `FxSessionState.replaying`. As of 0.0.9 that replay is
+    // structured (`tool_call`/`tool_call_update`/`agent_message_chunk`
+    // frames, not one text blob), so `state.replaying` is now also the gate
+    // `handleServerNotification` uses to drop every replayed content update
+    // wholesale — only `session_info_update` (the recovery + title
+    // sentinels) still reaches `dispatchSessionUpdate` while this is true.
+    // Flip the flag right around the call, on both the success and error
+    // paths, so it's `true` for exactly the replayed updates and nothing
+    // else; the `session/load` fallback below discards its replay wholesale
+    // instead (`state.suppressUpdates`, which drops EVERY kind including
+    // `session_info_update`) and needs no flag of its own.
+    state.replaying = true;
+    // Recorded so `handleLine`'s reply branch can close the replay window
+    // the instant it SEES this reply's line — see `FxSessionState.replaying`
+    // and `replayRpcId`'s docs. `sendRpc` assigns `state.nextRpcId` and
+    // increments it synchronously before this call returns, so reading it
+    // first is exactly the id the resume request goes out with.
+    state.replayRpcId = state.nextRpcId;
+    let resumeResult: unknown;
     try {
-      const resumeResult = await withTimeout(
+      resumeResult = await withTimeout(
         sendRpc(state, "session/resume", { sessionId: opts.resumeSessionId }),
         RPC_HANDSHAKE_TIMEOUT_MS,
         "session/resume",
       );
+      // Belt-and-braces: `handleLine`'s reply branch already cleared
+      // `replaying`/`lastRecoveryJson`/`replayRpcId` the instant it observed
+      // this reply's line (see its doc for why that matters within one
+      // stdout chunk) — these are a no-op on that path. They still matter
+      // on their own for a resolution that DIDN'T go through `handleLine`
+      // (none exist today, but keeping the resets here costs nothing and
+      // guards against future codepaths that resolve `sendRpc` another way).
+      // Reset the dedupe key the replay window just seeded — see finding #2
+      // ("replay-seeded dedupe can swallow the first live payload of a
+      // resumed turn") in the file header's recovery-channel facts. Without
+      // this, a live update right after replay that happens to be
+      // byte-identical to the last replayed one (e.g. a continueRecovery
+      // turn that immediately re-pauses at the same attempt/message) would
+      // be silently deduped against the replay and never reach the user.
+      state.replaying = false;
+      state.lastRecoveryJson = undefined;
+      state.replayRpcId = undefined;
       maybeEmitProvider(resumeResult);
       resumed = true;
     } catch (err) {
+      state.replaying = false;
+      state.lastRecoveryJson = undefined;
+      state.replayRpcId = undefined;
       if (isTimeoutError(err)) {
         failTurn(state, describeHandshakeFailure(err, "session/resume", RPC_HANDSHAKE_TIMEOUT_MS));
         return;
@@ -1715,17 +2519,26 @@ async function runFxTurn(
       // error) — fall back to session/load below. `-32600` is JSON-RPC's
       // generic "Invalid Request" code, not an auth-specific one — fx
       // merely reuses it for credential failures (0.0.5+, confirmed through
-      // 0.0.8 — see the file header) — so it gets no special early-exit here: whether this
+      // 0.0.10 — see the file header) — so it gets no special early-exit here: whether this
       // -32600 was the credential gate or fx rejecting resume as
       // unsupported, `session/load`'s own outcome (below) is what decides
       // the turn.
     }
     if (state.resolved) return;
+    if (resumed) {
+      // Apply the task's stored effort before session/prompt — resumeResult
+      // carries the same configOptions shape session/new does (see
+      // applyFxEffort). Best-effort: never throws, never fails the turn.
+      await applyFxEffort(state, resumeResult, opts);
+      if (state.resolved) return;
+    }
     if (!resumed) {
       // fx replays the session's prior `session/update` history while
-      // `session/load` is pending (SCHEMA-DERIVED — unexercised in the
-      // spike) — the run's own persisted events already cover that
-      // history, so it's discarded here rather than double-emitted.
+      // `session/load` is pending — 0.0.9+: structured `tool_call`/
+      // `tool_call_update` frames plus assistant text, source-verified
+      // `sessions.zig sendActiveHistoryUpdates`/`sendExecutionHistory` — the
+      // run's own persisted events already cover that history, so it's
+      // still discarded wholesale here rather than double-emitted.
       state.suppressUpdates = true;
       try {
         const loadResult = await withTimeout(
@@ -1734,13 +2547,18 @@ async function runFxTurn(
           "session/load",
         );
         maybeEmitProvider(loadResult);
+        state.suppressUpdates = false;
+        // loadResult carries the same configOptions shape session/new/resume
+        // do — apply the task's stored effort here too, before session/prompt.
+        await applyFxEffort(state, loadResult, opts);
+        if (state.resolved) return;
       } catch (err) {
         state.suppressUpdates = false;
         if (isTimeoutError(err)) {
           failTurn(state, describeHandshakeFailure(err, "session/load", RPC_HANDSHAKE_TIMEOUT_MS));
         } else if (err instanceof RpcError && err.code === -32600) {
           // Credential re-check failed here too (0.0.5+, confirmed through
-          // 0.0.8 — see the file header) — authoritative either way it reads: the same gate
+          // 0.0.10 — see the file header) — authoritative either way it reads: the same gate
           // resume just hit (load can't do better), or a non-auth "Invalid
           // Request" for which `session/load` was precisely the graceful
           // path to try. Surface fx's text verbatim, no wrapper.
@@ -1750,7 +2568,6 @@ async function runFxTurn(
         }
         return;
       }
-      state.suppressUpdates = false;
     }
     if (state.resolved) return;
   } else {
@@ -1778,6 +2595,12 @@ async function runFxTurn(
     state.onSessionId?.(sessionId);
     maybeEmitProvider(sessionResult);
 
+    // Apply the task's stored effort — best-effort, never throws, never
+    // fails the turn (see applyFxEffort). Order relative to the mode nudge
+    // below is irrelevant — they touch independent configOptions entries.
+    await applyFxEffort(state, sessionResult, opts);
+    if (state.resolved) return;
+
     // Best-effort mode nudge — never blocks or fails the turn.
     const desiredModeId = acpModeIdFor(state.mode);
     const availableModes = sessionResult?.modes?.availableModes ?? [];
@@ -1786,21 +2609,36 @@ async function runFxTurn(
     }
   }
 
-  // 3. session/prompt — the ONLY turn-completion signal; no timeout.
+  // 3. session/prompt — the ONLY turn-completion signal; no timeout. A
+  // continue-recovery turn sends fx's documented `_meta.fx.continueRecovery`
+  // shape instead of a normal text prompt: an EMPTY `prompt` array (fx
+  // rejects a continue call that also carries new prompt content — see the
+  // -32602 handling below) plus the `continueRecovery: true` flag telling fx
+  // to resume the paused response it already has a checkpoint for.
+  const promptParams = opts.continueRecovery
+    ? { sessionId: state.sessionId, prompt: [], _meta: { fx: { continueRecovery: true } } }
+    : { sessionId: state.sessionId, prompt: [{ type: "text", text: opts.promptText }] };
+
   let promptResult: { stopReason?: string; usage?: unknown } | undefined;
   try {
-    promptResult = (await sendRpc(state, "session/prompt", {
-      sessionId: state.sessionId,
-      prompt: [{ type: "text", text: opts.promptText }],
-    })) as typeof promptResult;
+    promptResult = (await sendRpc(state, "session/prompt", promptParams)) as typeof promptResult;
   } catch (err) {
     if (state.resolved) return; // already settled via cancel/death
     if (err instanceof RpcError && err.code === -32600) {
       // Credential re-check failed mid-prompt (0.0.5+, confirmed through
-      // 0.0.8 — see the file header) — fx's text is user-actionable on its
+      // 0.0.10 — see the file header) — fx's text is user-actionable on its
       // own; surface it verbatim (via rawMessage, with no "(code -32600)"
       // suffix) instead of wrapping it in our own "session/prompt failed:"
       // prefix.
+      failTurn(state, err.rawMessage);
+    } else if (opts.continueRecovery && err instanceof RpcError && err.code === -32602) {
+      // fx's own validation errors for a continue-recovery call are
+      // user-actionable on their own — "No paused model response to
+      // continue", "This session does not support durable recovery",
+      // "Recovery continuation cannot include a new prompt" — surface
+      // verbatim exactly like the -32600 credential case above, rather than
+      // the generic wrapper below (which a plain "-32602 (code -32602)"
+      // wrapped string would read as an internal error, not guidance).
       failTurn(state, err.rawMessage);
     } else {
       failTurn(state, `fx acp: session/prompt failed: ${errMessage(err)}`);
@@ -1808,6 +2646,32 @@ async function runFxTurn(
     return;
   }
   if (state.resolved) return; // cancel/death already settled us
+
+  // A NORMAL (non-continue) prompt just RAN on a session whose replay
+  // carried a `paused` recovery checkpoint — fx consumes that checkpoint the
+  // moment an ordinary prompt runs (see the file header), so by now it's
+  // genuinely gone regardless of this turn's own outcome. Emit the
+  // `{state:"cleared"}` sentinel here, only once `session/prompt` has
+  // actually RESOLVED with a result (any stopReason) — not before sending it
+  // (see finding #4 in the file header: emitting it pre-send made the
+  // transcript's last sentinel read "cleared" even when the RPC itself then
+  // failed at the transport/credential level, e.g. `-32600`/timeout/process
+  // death, which leaves the checkpoint intact in fx while every Resume
+  // affordance had already vanished from agetor) — and before the
+  // stopReason switch below, so it lands regardless of how the turn ended.
+  // The RpcError/timeout/death paths above all `return` before reaching
+  // here, so they correctly emit nothing and leave `replayedPaused` as-is.
+  // Reset the two fields that fed it so a later replay in the SAME process
+  // (there isn't one today, but nothing here relies on that) can't
+  // re-trigger this branch a second time.
+  if (!opts.continueRecovery && state.replayedPaused) {
+    const cleared: FxRecoveryPayload = { state: "cleared" };
+    const clearedJson = JSON.stringify(cleared);
+    emit(state, "status", FX_RECOVERY_STATUS_PREFIX + clearedJson, `fx:${state.runId}:${state.seq++}`);
+    state.lastRecoveryJson = clearedJson;
+    state.lastRecovery = undefined;
+    state.replayedPaused = false;
+  }
 
   // fx ≥0.0.8's `usage` object on the prompt result — the `turn` half of
   // the shared `FX_USAGE_STATUS_PREFIX` sentinel (see the file header).
@@ -1827,7 +2691,7 @@ async function runFxTurn(
       settleFx(state, 1);
       return;
     // fx's actual wire strings (`types.zig StopReason`, byte-identical
-    // 0.0.7→0.0.8): `max_output_tokens`, `max_model_turns`, `refused`. The
+    // 0.0.7→0.0.10): `max_output_tokens`, `max_model_turns`, `refused`. The
     // ACP-canonical names (`max_tokens`, `max_turn_requests`, `refusal`)
     // this switch used to check ALONE never matched anything fx actually
     // sends — every real non-end_turn/non-cancelled stop fell through to
@@ -1845,15 +2709,52 @@ async function runFxTurn(
     case "max_output_tokens":
     case "max_turn_requests":
     case "max_model_turns":
-    case "refusal":
-    case "refused":
       emit(state, "status", `fx turn ended: ${stopReason}`);
       settleFx(state, 1);
       return;
+    case "refusal":
+    case "refused": {
+      // A `refused` stop is exactly what fx reports when it exhausted its
+      // Gateway retry budget and gave up (see the file header's recovery
+      // -channel facts) — `state.lastRecovery` is only set from a LIVE
+      // (non-replayed) recovery update this turn (see the
+      // `session_info_update` case in `mapFxUpdate`), so this only enriches
+      // when THIS run is the one that actually paused, never a resumed
+      // follow-up merely replaying an old checkpoint. See
+      // `fxRefusedStatusLine` for the resumability check itself.
+      emit(state, "status", fxRefusedStatusLine(stopReason, state.lastRecovery));
+      settleFx(state, 1);
+      return;
+    }
     default:
       emit(state, "status", `fx turn ended with unexpected stopReason: ${stopReason}`);
       settleFx(state, 1);
   }
+}
+
+/**
+ * The plain "fx turn ended: `<stopReason>`" status line emitted for a
+ * `refused`/`refusal` stop, enriched with the attempt count and a
+ * "resumable" note exactly when `recovery` is a paused checkpoint the
+ * Resume affordance can actually act on — i.e. {@link isFxRecoveryResumable}
+ * (`state === "paused"` AND `requiredAction` absent or `continue_later`),
+ * the SAME predicate every Resume affordance (RunPanel's paused notice, the
+ * CLI, the TUI) already gates on. Finding #3 in the file header: this used
+ * to check `recovery?.state === "paused"` alone, which could enrich a
+ * status line with "— resumable" for a pause Resume can't actually act on
+ * (e.g. `requiredAction: "inspect_uncertain_tool"`, which needs a human
+ * decision). Exported and pure so it's unit-testable without spawning a
+ * fake ACP server; the only caller is the stopReason switch in `runFxTurn`.
+ * The attempt fraction is omitted entirely when either number is unknown,
+ * rather than printing a partial "N/undefined".
+ */
+export function fxRefusedStatusLine(stopReason: string, recovery: FxRecoveryPayload | undefined): string {
+  if (!isFxRecoveryResumable(recovery)) return `fx turn ended: ${stopReason}`;
+  const fraction =
+    typeof recovery!.attempt === "number" && typeof recovery!.attemptLimit === "number"
+      ? ` after ${recovery!.attempt}/${recovery!.attemptLimit} attempts`
+      : "";
+  return `fx turn ended: ${stopReason} (response paused${fraction} — resumable)`;
 }
 
 function isTimeoutError(err: unknown): boolean {
@@ -1901,6 +2802,30 @@ export interface FxLaunchOptions {
   /** Set on a follow-up turn to resume (or, on failure, load) a prior ACP
    *  session instead of opening a new one via `session/new`. */
   resumeSessionId?: string;
+  /** fx ≥0.0.8's `_meta.fx.continueRecovery` turn shape — continues a model
+   *  response fx paused after exhausting its Gateway retry budget, instead
+   *  of sending a new prompt. Requires `resumeSessionId` (fx resumes a
+   *  specific session's checkpoint, it can't start one fresh); `promptText`
+   *  is ignored on this kind of turn — fx rejects a continue call that also
+   *  carries new prompt content (see `runFxTurn`'s `session/prompt` params
+   *  and its `-32602` handling). */
+  continueRecovery?: boolean;
+  /** Agetor's stored effort id for this task (`low|medium|high|xhigh|max|
+   *  none|auto`), sent verbatim as fx's `session/set_config_option` `value`
+   *  — see `applyFxEffort`. `null`/`undefined` means the task has no effort
+   *  set, in which case this driver sends nothing and leaves the session's
+   *  effort exactly as fx's own default. Wired end-to-end from `agents.ts`
+   *  as of wave 2 (see `docs/plans/fx-0.0.10-compat.md` T4) — optional here
+   *  so this file typechecks standalone during wave 1. */
+  effort?: string | null;
+  /** The launch model id (fx's Gateway model id, e.g. `zai/glm-5.3-flash`)
+   *  — used only for `applyFxEffort`'s breadcrumb text, never sent as its
+   *  own RPC field (the model itself is already pinned by `argv`'s
+   *  `--model` flag at spawn time). Optional and falls back to the element
+   *  following `--model` in `argv` when omitted, so a wave-1 caller that
+   *  doesn't pass it explicitly still gets a real model name in any
+   *  breadcrumb rather than the generic "the active model" fallback. */
+  model?: string;
   onChunk: ChunkHandler;
   /** Fires once with fx's `sessionId`, immediately after `session/new`
    *  resolves on the first turn (persisted as `runs.fx_session_id`). Not
@@ -1928,7 +2853,20 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
   }
 
-  const proc = Bun.spawn([bin, ...rest], {
+  // `opts.model` isn't threaded through from `agents.ts` until wave 2 (see
+  // `FxLaunchOptions.model`'s doc) — fall back to the argv's own `--model`
+  // value so `applyFxEffort`'s breadcrumb names a real model in the
+  // meantime, and forever after for any caller that omits it. Note this
+  // reads `opts.argv`, the ORIGINAL fx argv — the disclaim wrap below only
+  // changes what is handed to `Bun.spawn`, so model recovery is unaffected.
+  const model = opts.model ?? argvValueAfter(opts.argv, "--model");
+
+  // fx has no tmux server to disclaim (see the file header — plain
+  // Bun.spawn over piped stdio), so the child itself is wrapped directly.
+  // `disclaimArgv` exec-replaces via POSIX_SPAWN_SETEXEC, preserving Bun's
+  // own pid and the piped stdio fds into fx; it returns the argv unchanged
+  // when disclaim is disabled/unavailable/non-darwin.
+  const proc = Bun.spawn(disclaimArgv([bin, ...rest]), {
     cwd: opts.cwd,
     env,
     stdin: "pipe",
@@ -1993,6 +2931,9 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     cwd: opts.cwd,
     promptText: opts.promptText,
     resumeSessionId: opts.resumeSessionId,
+    continueRecovery: opts.continueRecovery,
+    effort: opts.effort,
+    model,
   }).catch((err) => {
     failTurn(state, `fx acp: unexpected driver error: ${errMessage(err)}`);
   });

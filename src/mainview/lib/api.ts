@@ -1,5 +1,6 @@
 import type {
   AgentKind,
+  AgentProfile,
   AgentStatus,
   AppEvent,
   BranchInfo,
@@ -437,6 +438,23 @@ export type PickRefsResult =
   | { kind: "refs"; refs: TaskReference[] }
   | { kind: "candidates"; candidates: string[] };
 
+/** Body shape for `POST /agent-profiles` / `PATCH /agent-profiles/:id` — see
+ *  `docs/plans/agent-profiles.md` §3 for the full contract. `harness` is a
+ *  harness id (same semantics as `Task.agent` / `createTask`'s `agent`).
+ *  `effort`/`mode` follow the task PATCH guard's null-clear-only philosophy;
+ *  `skills` are bare names (no leading `/`), normalized server-side. */
+export interface AgentProfileInput {
+  name: string;
+  harness: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  fast: boolean;
+  maxMode: boolean;
+  instructions: string;
+  skills: string[];
+}
+
 export const api = {
   defaults: () => j<AppDefaults>("/defaults"),
   info: () => j<{ version: string }>("/info"),
@@ -505,6 +523,22 @@ export const api = {
     }),
   deleteSavedPrompt: (id: string) =>
     j<{ ok: true }>(`/saved-prompts/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  listAgentProfiles: () => j<AgentProfile[]>("/agent-profiles"),
+  getAgentProfile: (id: string) => j<AgentProfile>(`/agent-profiles/${encodeURIComponent(id)}`),
+  createAgentProfile: (input: AgentProfileInput) =>
+    j<AgentProfile>("/agent-profiles", { method: "POST", body: JSON.stringify(input) }),
+  updateAgentProfile: (id: string, patch: Partial<AgentProfileInput>) =>
+    j<AgentProfile>(`/agent-profiles/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteAgentProfile: (id: string) =>
+    j<void>(`/agent-profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** Detach a task from its bound agent profile — the values it copied stay
+   *  on the task row, but the four dropdowns (+ cursor fast/max) unlock.
+   *  404 unknown task, 409 archived. */
+  detachTaskAgentProfile: (taskId: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/agent-profile`, { method: "DELETE" }),
   listAgentModels: () => j<AgentModelMap>("/agent-models"),
   /** Per-harness model catalog (fx account-scoped, one entry per enabled
    *  harness) — see `HarnessModelMap`. */
@@ -1210,11 +1244,15 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
-  listAgentCapabilities: (opts: { agent: string; workdir: string; branch?: string }) => {
+  listAgentCapabilities: (opts: { agent: string; workdir?: string | null; branch?: string }) => {
     // Slash commands/skills + MCP/skill/plugin extensions in one fetch. `agent`
     // is a harness id (built-ins use id-equals-kind, so "claude-code" / "codex"
     // still works). The server resolves to the harness via getByIdOrKind and
-    // reads from the harness's own home when set.
+    // reads from the harness's own home when set. `workdir` is optional — the
+    // server always includes user-level entries + plugins even without one
+    // (project-level commands/skills only exist once a workdir is known);
+    // omitted/empty means "no workdir" rather than an empty-string one, same
+    // convention as `listProjectFiles`'s `ref`.
     const q = new URLSearchParams({ agent: opts.agent });
     if (opts.workdir) q.set("workdir", opts.workdir);
     if (opts.branch) q.set("branch", opts.branch);
@@ -1287,6 +1325,11 @@ export const api = {
     /** Opt-in: create as a pipeline task (see NewTaskForm's "Run as
      *  pipeline" checkbox). Matches CreateTaskInput.pipeline server-side. */
     pipeline?: boolean;
+    /** Id of an {@link AgentProfile} to launch from — the server resolves it
+     *  and overrides `agent`/`model`/`effort`/`mode`/`fast`/`maxMode` from the
+     *  profile (body-provided values for those fields are ignored); 400 on an
+     *  unknown id. */
+    agentProfileId?: string | null;
   }) =>
     // retry: false — a replay would create a duplicate task + branch.
     j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
@@ -1295,7 +1338,9 @@ export const api = {
   moveTask: (id: string, column: ColumnId) =>
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
-  startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
+  // `pending: true` (optional): the server returned before the agent spawn
+  // finished; the run row already exists (task-details-blank-while-session-restores.md §3.1).
+  startTask: (id: string) => j<{ runId: string; pending?: true }>(`/tasks/${id}/start`, { method: "POST" }),
   /** `force: true` bypasses the done-column gate (still rejects an active
    *  run) — used by the Worktrees page's "Archive & delete" flow to archive
    *  a stale worktree's task regardless of its current column. `stopRun:
@@ -1435,7 +1480,9 @@ export const api = {
       // `unresolvedRefs` = raw `@` tokens the server-side expansion left
       // verbatim. The webview deliberately doesn't render it post-send —
       // PromptComposer's inline warning covers it pre-send.
-      | { delivered: true; runId: string; unresolvedRefs?: string[] }
+      // `pending: true` (optional): the server returned before the agent spawn
+      // finished; the run row already exists (task-details-blank-while-session-restores.md §3.1).
+      | { delivered: true; runId: string; unresolvedRefs?: string[]; pending?: true }
       | { delivered: false; reason: string; withheld?: boolean; savedToBacklog?: boolean }
     >(
       `/runs/${runId}/input`,
@@ -1501,6 +1548,30 @@ export const api = {
   approvePlan: (taskId: string, planId: string) =>
     j<Task>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}/approve`, {
       method: "POST",
+    }, { retry: false }),
+
+  /** Resume a PAUSED fx model response (Vercel AI Gateway rate-limit
+   *  recovery — see `resumeFxRecovery` in orchestrator.ts). Sends no new
+   *  prompt; fx continues from its own checkpoint. `retry: false` — like
+   *  `approvePlan`, a replay would spawn a second continue-recovery run
+   *  against a checkpoint the first request already consumed. Rejected
+   *  (400/404/409) via the thrown `ApiError` when the task isn't fx, is
+   *  archived, has no resumable paused response, or already has a turn
+   *  in flight. */
+  resumeFxRecovery: (taskId: string) =>
+    j<{ ok: true; runId: string }>(`/tasks/${encodeURIComponent(taskId)}/fx-resume`, {
+      method: "POST",
+    }, { retry: false }),
+
+  /** Cancel a pending fx auto-resume timer (`task.fxRecovery.autoResume`)
+   *  without touching the pause itself — the paused response stays paused,
+   *  resumable only via a manual `resumeFxRecovery` from here on. `retry:
+   *  false` — like `resumeFxRecovery`, a replay against an already-cancelled
+   *  (or already-fired) timer should surface as a real 400/404, not be
+   *  silently retried. */
+  cancelFxAutoResume: (taskId: string) =>
+    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/fx-auto-resume`, {
+      method: "DELETE",
     }, { retry: false }),
 
   // Composer draft — the single unsent text+refs autosaved from the task

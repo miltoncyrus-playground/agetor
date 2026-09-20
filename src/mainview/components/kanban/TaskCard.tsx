@@ -1,12 +1,14 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { ListTodo, Paperclip } from "lucide-react";
+import { ListTodo, Paperclip, PauseCircle } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
+import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-auto-resume";
 import { PIPELINE_STAGE_COLUMNS, taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
+import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { cardStateLabel } from "@/lib/card-state";
 import { displayColumnMeta, toDisplayColumn } from "@/lib/display-columns";
 import { AGE_BADGE_MIN_MS, formatAge } from "@/lib/board-status";
@@ -47,6 +49,14 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen, isOpen, on
   const archived = task.archivedAt != null;
   const parentTask = task.parentTaskId ? tasksById.get(task.parentTaskId) : undefined;
   const childProgress = task.pipelineStage != null ? childCountsByParent.get(task.id) : undefined;
+  // `fx-paused-badge`'s live countdown (see the badge below) — called
+  // unconditionally, before any conditional return, so hook order stays
+  // stable whether or not this task is actually paused right now; ticks
+  // only while `task.fxRecovery.autoResume.at` is actually set (see
+  // `useCountdown`'s own doc comment). `task.fxRecovery` is server-managed
+  // — this card never inspects `task.agent` to decide whether to show it.
+  const fxAutoResumeAt = task.fxRecovery?.autoResume?.at ?? null;
+  const fxAutoResumeCountdown = useCountdown(fxAutoResumeAt);
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
@@ -194,6 +204,24 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen, isOpen, on
             {todo.completed}/{todo.total}
           </span>
         )}
+        {/* fx's response is paused on a resumable Gateway checkpoint
+         *  (`Task.fxRecovery`, server-managed — see `TaskFxRecovery` in
+         *  shared/types.ts). Gated on the shared `isTaskFxPaused` helper,
+         *  never on `task.agent`, so it stays correct if fx is ever aliased
+         *  under a different harness id. Text/title come from
+         *  `fxPausedBadgeText`/`fxPausedBadgeTitle` (`@/lib/fx-auto-resume`)
+         *  — "paused" or a live "auto-resume m:ss" countdown. Icon + text
+         *  only, matching this card's no-Badge-chrome convention. */}
+        {isTaskFxPaused(task) && task.fxRecovery && (
+          <span
+            className="mt-px flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums text-warning"
+            data-testid="fx-paused-badge"
+            title={fxPausedBadgeTitle(task.fxRecovery)}
+          >
+            <PauseCircle className="size-2.5" aria-hidden />
+            {fxPausedBadgeText(task.fxRecovery, fxAutoResumeCountdown)}
+          </span>
+        )}
         {sentCount > 0 && (
           <span
             className="mt-px flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums text-muted-foreground"
@@ -210,8 +238,22 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen, isOpen, on
         )}
       </div>
       <div className="flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
-        <AgentIcon kind={task.agent} className="size-3 shrink-0" />
-        <span className="shrink-0">{task.agent}</span>
+        {/* When the task was launched from a saved agent profile, show its
+         *  name (with the harness id as the tooltip) instead of the raw
+         *  harness id — the snapshot is server-managed and always present
+         *  once `agentProfileId` is set (plan D1/D14), so no live profile
+         *  lookup is needed here. */}
+        {task.agentProfile ? (
+          <span className="flex min-w-0 shrink-0 items-center gap-1" title={task.agent} data-testid="task-card-agent-profile">
+            <AgentIcon kind={task.agentProfile.harnessKind} className="size-3 shrink-0" />
+            <span className="shrink-0">{task.agentProfile.name}</span>
+          </span>
+        ) : (
+          <>
+            <AgentIcon kind={task.agent} className="size-3 shrink-0" />
+            <span className="shrink-0">{task.agent}</span>
+          </>
+        )}
         <span className="opacity-40">·</span>
         {isActivelyMidStage ? (
           // The "agent actively working" pulse — deliberately NOT the amber

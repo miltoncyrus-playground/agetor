@@ -16,8 +16,10 @@ import {
   Mail,
   MailOpen,
   Play,
+  PlayCircle,
   Settings,
   Square,
+  TimerOff,
   Trash2,
   X,
   type LucideIcon,
@@ -50,6 +52,7 @@ import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
+import { useAgentProfiles } from "@/lib/agent-profiles";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
 import { ThemeProvider, useTheme } from "@/components/theme-provider";
@@ -63,7 +66,7 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
+import { dismissPending, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { parseThemePreference } from "@/lib/theme";
@@ -75,6 +78,8 @@ import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisi
 import type { SettingsSectionId } from "@/lib/settings-dialog-view";
 import { reconcileById } from "@/lib/reconcile";
 import { parseStickyUserMessagesPreference, STICKY_USER_MESSAGES_PREF } from "@/lib/user-message-display";
+import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_PREF } from "@/lib/fx-auto-resume-prefs";
+import { parseFxAutoResumePrefs } from "../shared/fx-recovery.ts";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
 /**
@@ -131,6 +136,8 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   open: FolderOpen,
   start: Play,
   stop: Square,
+  "resume-recovery": PlayCircle,
+  "cancel-auto-resume": TimerOff,
   "mark-done": CheckCircle2,
   archive: Archive,
   unarchive: ArchiveRestore,
@@ -160,6 +167,11 @@ function AppInner() {
   // harness step tell "not loaded yet" (skip the disabled/enabled
   // distinction) apart from "loaded, and it happens to be empty".
   const [harnessesLoaded, setHarnessesLoaded] = useState(false);
+  // Module-cached agent-profile list, shared with every mounted picker
+  // (NewTaskForm, RunPanel's header chip + task-details lock) so switching
+  // tabs/panels never re-triggers a redundant `GET /agent-profiles` — see
+  // `useAgentProfiles`'s own doc comment.
+  const { profiles, loaded: profilesLoaded, refresh: refreshProfiles } = useAgentProfiles();
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
   // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
   // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
@@ -188,6 +200,11 @@ function AppInner() {
   // retain the last-sent-message reminder until they opt into the standard
   // scrolling chat list in Settings.
   const [stickyUserMessages, setStickyUserMessages] = useState(true);
+  // fx auto-resume prefs (`FX_AUTO_RESUME_PREF` / `FX_AUTO_RESUME_DELAY_PREF`
+  // — see `docs/plans/fx-recovery-follow-ups.md` §3). Missing preferences
+  // resolve to "on" / the default delay via `parseFxAutoResumePrefs`, same
+  // shape the orchestrator reads at schedule time.
+  const [fxAutoResumePrefs, setFxAutoResumePrefs] = useState(() => parseFxAutoResumePrefs({}));
   // Section the Settings dialog should land on when it next opens — set by
   // onboarding's "Enable in Settings…" deep link, cleared on close so the
   // plain gear-icon open still lands on General.
@@ -288,6 +305,7 @@ function AppInner() {
       // closes) re-reads just this key via the same route.
       setOnboardingDismissedPref(prefs[ONBOARDING_DISMISSED_PREF]);
       setStickyUserMessages(parseStickyUserMessagesPreference(prefs[STICKY_USER_MESSAGES_PREF]));
+      setFxAutoResumePrefs(parseFxAutoResumePrefs(prefs));
       setPrefsLoaded(true);
     }).catch(() => { /* keep the boot-seeded preferences; onboarding stays hidden (prefsLoaded=false) rather than guess */ });
     // Run once at boot only — intentionally not re-run when either local
@@ -309,6 +327,13 @@ function AppInner() {
   // function's doc comment. A ref (not state) since it's pure bookkeeping
   // that must survive across polls without itself triggering a render.
   const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
+  // In-flight guards for the 2s `refresh()` / 15s `refreshAgents()` interval
+  // pollers below (task-details-blank-while-session-restores.md §3.1/§3.4):
+  // a tick is skipped while the previous poll of the same kind hasn't
+  // resolved yet, so a slow request never stacks with the next tick's.
+  const refreshPollInFlightRef = useRef(false);
+  const refreshAgentsPollInFlightRef = useRef(false);
+  const refreshProjectsPollInFlightRef = useRef(false);
 
   /** Re-list tasks. Returns the fetched list so callers that need to inspect a
    *  task right after a mutation don't have to issue a second GET. `null` on
@@ -455,16 +480,43 @@ function AppInner() {
     // bug previously fixed there.
     const t = setInterval(() => {
       if (!document.hidden) {
-        void refresh();
-        void refreshProjects();
+        // Skip this tick if the previous `refresh()` poll is still in
+        // flight — see `refreshPollInFlightRef`'s comment above.
+        if (!refreshPollInFlightRef.current) {
+          refreshPollInFlightRef.current = true;
+          void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+        }
+        // Same guard, its own ref — a slow `/projects` fetch must not stack
+        // with the next 2s tick either.
+        if (!refreshProjectsPollInFlightRef.current) {
+          refreshProjectsPollInFlightRef.current = true;
+          void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
+        }
       }
     }, 2000);
-    const a = setInterval(() => { if (!document.hidden) void refreshAgents(); }, 15_000);
+    const a = setInterval(() => {
+      if (!document.hidden && !refreshAgentsPollInFlightRef.current) {
+        refreshAgentsPollInFlightRef.current = true;
+        void refreshAgents().finally(() => { refreshAgentsPollInFlightRef.current = false; });
+      }
+    }, 15_000);
     const onVisible = () => {
       if (document.hidden) return;
-      void refresh();
-      void refreshProjects();
-      void refreshAgents();
+      // Route through the same in-flight guard the interval poll uses — a
+      // focus/visibility event landing mid-poll must not stack a second
+      // `/tasks` request on top of one already in flight.
+      if (!refreshPollInFlightRef.current) {
+        refreshPollInFlightRef.current = true;
+        void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+      }
+      if (!refreshProjectsPollInFlightRef.current) {
+        refreshProjectsPollInFlightRef.current = true;
+        void refreshProjects().finally(() => { refreshProjectsPollInFlightRef.current = false; });
+      }
+      if (!refreshAgentsPollInFlightRef.current) {
+        refreshAgentsPollInFlightRef.current = true;
+        void refreshAgents().finally(() => { refreshAgentsPollInFlightRef.current = false; });
+      }
       // fx login (and any other harness auth flow) often happens in a
       // separate window/terminal — returning focus to agetor should reflect
       // whatever the account's catalog looks like now, not whatever it was
@@ -581,6 +633,17 @@ function AppInner() {
     readStateGen.current.set(id, next);
     return next;
   }, []);
+
+  // Shared optimistic-merge helper: patches only the named fields of one
+  // task, never the whole snapshot — a wholesale replace could revert a
+  // concurrent optimistic patch (e.g. the SSE column handler's
+  // running→review flip, or another in-flight partial update). The
+  // mark-seen effect below is the original caller; RunPanel's
+  // `onTaskFieldsChanged` (e.g. an agent-profile Detach) reuses the same
+  // helper rather than growing its own merge logic.
+  const mergeTaskFields = useCallback((id: string, partial: Partial<Task>) => {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...partial } : t)));
+  }, []);
   useEffect(() => {
     const currentId = selected?.id ?? null;
     const previousId = prevMarkSeenIdRef.current;
@@ -594,13 +657,12 @@ function AppInner() {
           // Stale response guard — see `readStateGen` above.
           if (readStateGen.current.get(id) !== gen) return;
           // Optimistic reconcile — don't wait for the next 2s poll to clear
-          // the dot. Merges ONLY the `unread` field: `updated` is a snapshot
-          // taken server-side at POST time and lands asynchronously, so a
-          // wholesale replace could revert a concurrent optimistic patch
-          // (e.g. the SSE column handler's running→review flip).
-          setTasks((prev) =>
-            prev.map((t) => (t.id === updated.id ? { ...t, unread: updated.unread } : t)),
-          );
+          // the dot. Merges ONLY the `unread` field via the shared helper
+          // above: `updated` is a snapshot taken server-side at POST time
+          // and lands asynchronously, so a wholesale replace could revert a
+          // concurrent optimistic patch (e.g. the SSE column handler's
+          // running→review flip).
+          mergeTaskFields(updated.id, { unread: updated.unread });
         })
         .catch((e) => {
           // Fire-and-forget: a failed mark-seen must never block or break
@@ -609,7 +671,7 @@ function AppInner() {
         });
     }
     prevMarkSeenIdRef.current = currentId;
-  }, [selected?.id, bumpReadStateGen]);
+  }, [selected?.id, bumpReadStateGen, mergeTaskFields]);
 
   // `panelMounted` follows `selected !== null` on open but lags by the
   // RunPanel's exit animation on close, so the Toaster doesn't snap back to
@@ -854,6 +916,22 @@ function AppInner() {
         });
         return;
       }
+      if (ev.kind === "fx-auto-resume") {
+        // Live-only signal (a replayed historical schedule/cancel must not
+        // re-notify), same contract as `files-sent` above. Only the two
+        // outcomes worth interrupting the user for get a toast — `fired`
+        // (info: a resume just went out) and `exhausted` (error: the chain
+        // gave up, manual action needed). `scheduled`/`cancelled`/`disabled`
+        // drive only the card badge / RunPanel notice / context-menu state,
+        // all read from the task's own polled `fxRecovery` field, not this
+        // event — so they're silent here by design.
+        if (ev.state === "fired") {
+          toastFxAutoResumeFired({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen, attempt: ev.attempt, max: ev.max });
+        } else if (ev.state === "exhausted") {
+          toastFxAutoResumeExhausted({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen, max: ev.max });
+        }
+        return;
+      }
       // column transitions. Patch `tasks` optimistically so the board and any
       // open run panel (via the selected-sync effect) reflect the new column
       // the instant the backend pushes it — rather than waiting up to 2s for
@@ -1066,6 +1144,10 @@ function AppInner() {
   }, []);
   const openSettingsHarnesses = useCallback(() => {
     setSettingsInitialSection("harnesses");
+    setSettingsOpen(true);
+  }, []);
+  const openSettingsAgents = useCallback(() => {
+    setSettingsInitialSection("agents");
     setSettingsOpen(true);
   }, []);
   const onFocusNewTask = useCallback(() => {
@@ -1372,6 +1454,18 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       case "stop":
         void cancel(t);
         break;
+      case "resume-recovery":
+        void api.resumeFxRecovery(t.id).catch((e: unknown) => {
+          const message = e instanceof Error ? e.message : String(e);
+          toast.error("Couldn't resume", { description: message });
+        });
+        break;
+      case "cancel-auto-resume":
+        void api.cancelFxAutoResume(t.id).catch((e: unknown) => {
+          const message = e instanceof Error ? e.message : String(e);
+          toast.error("Couldn't cancel auto-resume", { description: message });
+        });
+        break;
       case "mark-done":
         void markDone(t);
         break;
@@ -1583,6 +1677,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         <NewTaskForm
           agents={agents}
           harnesses={harnesses}
+          profiles={profiles}
+          onOpenSettingsAgents={openSettingsAgents}
           agentModels={agentModels}
           harnessModels={harnessModels}
           onRefreshModels={onRefreshModels}
@@ -1736,10 +1832,13 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         stickyUserMessages={stickyUserMessages}
         agents={agents}
         harnesses={harnesses}
+        profiles={profilesLoaded ? profiles : null}
+        onOpenSettingsAgents={openSettingsAgents}
         agentModels={agentModels}
         harnessModels={harnessModels}
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
+        onTaskFieldsChanged={mergeTaskFields}
         onClose={() => setSelected(null)}
         onShowDiff={setDiffTask}
         onArchive={archive}
@@ -1800,6 +1899,28 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             setStickyUserMessages((current) => current === sticky ? !sticky : current);
           });
         }}
+        fxAutoResume={fxAutoResumePrefs}
+        onFxAutoResumeChange={(next) => {
+          const prevEnabled = fxAutoResumePrefs.enabled;
+          const prevDelaySec = fxAutoResumePrefs.delaySec;
+          setFxAutoResumePrefs(next);
+          // Each field reverts independently (same "still the latest
+          // selection" guard as `onStickyUserMessagesChange` above) so a
+          // failed delay write can't also stomp an unrelated, already-
+          // succeeded toggle flip, and vice versa.
+          if (next.enabled !== prevEnabled) {
+            void api.setPreference(FX_AUTO_RESUME_PREF, next.enabled ? "on" : "off").catch(() => {
+              setFxAutoResumePrefs((current) =>
+                current.enabled === next.enabled ? { ...current, enabled: prevEnabled } : current);
+            });
+          }
+          if (next.delaySec !== prevDelaySec) {
+            void api.setPreference(FX_AUTO_RESUME_DELAY_PREF, String(next.delaySec)).catch(() => {
+              setFxAutoResumePrefs((current) =>
+                current.delaySec === next.delaySec ? { ...current, delaySec: prevDelaySec } : current);
+            });
+          }
+        }}
         onClose={() => {
           setSettingsOpen(false);
           // Clear the deep-link so a later plain gear-icon open lands back
@@ -1810,6 +1931,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           // simplest correct option without threading a dedicated callback
           // through SettingsDialog.
           refetchOnboardingPref();
+          // Same posture as harnesses/saved-prompts (A4: no SSE broadcast for
+          // profile CRUD) — refetch once on close so an already-open picker
+          // elsewhere (NewTaskForm, RunPanel) picks up a create/edit/delete
+          // made in the Agents section without a remount.
+          void refreshProfiles();
         }}
         onChange={refreshAgents}
         homeDir={homeDir}

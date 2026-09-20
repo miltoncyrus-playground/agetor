@@ -65,26 +65,30 @@ import m047 from "./047_fx_session_id.sql" with { type: "text" };
 import m048 from "./048_issue_url.sql" with { type: "text" };
 import m049 from "./049_retire_gemini_3_pro_preview.sql" with { type: "text" };
 import m050 from "./050_sent_files.sql" with { type: "text" };
-// The pipeline branch's migrations 035-040/042 (originally numbered against
-// a 031-head trunk); renumbered to 051-057 on merge with upstream/main,
-// which had already claimed 032-050 (same renumber-with-alias pattern used
-// throughout this file). Pipeline's own 041_harness_quota is NOT ported —
-// superseded by upstream's 043_harness_usage/usage-tracker system, which
-// covers claude-code/codex/cursor rather than claude-only.
-import m051 from "./051_pipeline_tasks.sql" with { type: "text" };
-import m052 from "./052_prebuilder_children.sql" with { type: "text" };
-import m053 from "./053_block_reason.sql" with { type: "text" };
-import m054 from "./054_sdd_pipeline_stages.sql" with { type: "text" };
-import m055 from "./055_pipeline_bounce_fingerprint.sql" with { type: "text" };
-import m056 from "./056_account_usage.sql" with { type: "text" };
-import m057 from "./057_satisfied_subtasks.sql" with { type: "text" };
-// O-10 per-run token usage was authored as 043 on the token-efficiency branch
-// (pre-upstream-sync numbering); renumbered to 058 on port, original id kept
-// as an alias (same renumber-with-alias pattern).
-import m058 from "./058_run_usage.sql" with { type: "text" };
-// Pipeline between-stage state was authored as 044 on the token-efficiency
-// branch; renumbered to 059 on port, original id kept as an alias.
-import m059 from "./059_pipeline_stage_state.sql" with { type: "text" };
+import m051 from "./051_fx_recovery.sql" with { type: "text" };
+import m052 from "./052_agent_profiles.sql" with { type: "text" };
+import m053 from "./053_task_agent_profile.sql" with { type: "text" };
+// The fork's pipeline branch originally claimed 051-057 here (numbered
+// against a 031-head trunk, before this repo had its own 051_fx_recovery /
+// 052_agent_profiles / 053_task_agent_profile) plus 058/059 for two later
+// token-efficiency-branch migrations; renumbered to 060-068 on syncing
+// upstream/main (v0.1.10) back into the fork, which had independently
+// claimed 051-053 for unrelated features in the meantime (same
+// renumber-with-alias pattern used throughout this file — every id this
+// block has ever used, at every prior renumber, is kept as an alias so a
+// dev DB that already applied it under an older id is not re-migrated).
+// Pipeline's own 041_harness_quota is NOT ported — superseded by upstream's
+// 043_harness_usage/usage-tracker system, which covers claude-code/codex/
+// cursor rather than claude-only.
+import m060 from "./060_pipeline_tasks.sql" with { type: "text" };
+import m061 from "./061_prebuilder_children.sql" with { type: "text" };
+import m062 from "./062_block_reason.sql" with { type: "text" };
+import m063 from "./063_sdd_pipeline_stages.sql" with { type: "text" };
+import m064 from "./064_pipeline_bounce_fingerprint.sql" with { type: "text" };
+import m065 from "./065_account_usage.sql" with { type: "text" };
+import m066 from "./066_satisfied_subtasks.sql" with { type: "text" };
+import m067 from "./067_run_usage.sql" with { type: "text" };
+import m068 from "./068_pipeline_stage_state.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -143,13 +147,16 @@ export const migrations: Migration[] = [
   { id: "048_issue_url", sql: m048 },
   { id: "049_retire_gemini_3_pro_preview", sql: m049 },
   { id: "050_sent_files", sql: m050 },
-  { id: "051_pipeline_tasks", sql: m051, aliases: ["035_pipeline_tasks"] },
-  { id: "052_prebuilder_children", sql: m052, aliases: ["036_prebuilder_children"] },
-  { id: "053_block_reason", sql: m053, aliases: ["037_block_reason"] },
-  { id: "054_sdd_pipeline_stages", sql: m054, aliases: ["038_sdd_pipeline_stages"] },
-  { id: "055_pipeline_bounce_fingerprint", sql: m055, aliases: ["039_pipeline_bounce_fingerprint"] },
-  { id: "056_account_usage", sql: m056, aliases: ["040_account_usage"] },
-  { id: "057_satisfied_subtasks", sql: m057, aliases: ["042_satisfied_subtasks"] },
-  { id: "058_run_usage", sql: m058, aliases: ["043_run_usage"] },
-  { id: "059_pipeline_stage_state", sql: m059, aliases: ["044_pipeline_stage_state"] },
+  { id: "051_fx_recovery", sql: m051 },
+  { id: "052_agent_profiles", sql: m052 },
+  { id: "053_task_agent_profile", sql: m053 },
+  { id: "060_pipeline_tasks", sql: m060, aliases: ["035_pipeline_tasks", "051_pipeline_tasks"] },
+  { id: "061_prebuilder_children", sql: m061, aliases: ["036_prebuilder_children", "052_prebuilder_children"] },
+  { id: "062_block_reason", sql: m062, aliases: ["037_block_reason", "053_block_reason"] },
+  { id: "063_sdd_pipeline_stages", sql: m063, aliases: ["038_sdd_pipeline_stages", "054_sdd_pipeline_stages"] },
+  { id: "064_pipeline_bounce_fingerprint", sql: m064, aliases: ["039_pipeline_bounce_fingerprint", "055_pipeline_bounce_fingerprint"] },
+  { id: "065_account_usage", sql: m065, aliases: ["040_account_usage", "056_account_usage"] },
+  { id: "066_satisfied_subtasks", sql: m066, aliases: ["042_satisfied_subtasks", "057_satisfied_subtasks"] },
+  { id: "067_run_usage", sql: m067, aliases: ["043_run_usage", "058_run_usage"] },
+  { id: "068_pipeline_stage_state", sql: m068, aliases: ["044_pipeline_stage_state", "059_pipeline_stage_state"] },
 ];

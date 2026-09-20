@@ -12,6 +12,7 @@ import type {
   HarnessStatus,
   HarnessUsage,
   AgentKind,
+  AgentProfile,
   BranchInfo,
   TaskReference,
   TaskDiff,
@@ -136,8 +137,11 @@ export class AgetorClient {
   /** `unresolvedRefs` (omitted when empty) lists the raw `@`-tokens (verbatim,
    *  `@` included) in the task's prompt that didn't resolve to a real file
    *  under the freshly-materialized worktree/workdir — CLAUDE.md §12's
-   *  send-time expansion contract. Advisory only; the run still starts. */
-  startTask(id: string): Promise<{ runId: string; unresolvedRefs?: string[] }> {
+   *  send-time expansion contract. Advisory only; the run still starts.
+   *  `pending` (omitted when falsy): spawn hasn't settled yet — run row exists, agent launch continues detached (plan §3.1). */
+  startTask(
+    id: string,
+  ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true }> {
     return this.req("POST", `/tasks/${id}/start`, undefined, START_TIMEOUT_MS);
   }
   archiveTask(id: string): Promise<Task> {
@@ -159,11 +163,18 @@ export class AgetorClient {
   // ── runs ─────────────────────────────────────────────────────────────────
   /** `unresolvedRefs` (omitted when empty) mirrors `startTask`'s field — the
    *  raw `@`-tokens in `line` that didn't resolve against the task's live
-   *  cwd. Advisory only; delivery isn't blocked on it. */
+   *  cwd. Advisory only; delivery isn't blocked on it.
+   *  `pending` (omitted when falsy): spawn hasn't settled yet — run row exists, agent launch continues detached (plan §3.1). */
   sendInput(
     runId: string,
     line: string,
-  ): Promise<{ delivered: boolean; runId?: string; reason?: string; unresolvedRefs?: string[] }> {
+  ): Promise<{
+    delivered: boolean;
+    runId?: string;
+    reason?: string;
+    unresolvedRefs?: string[];
+    pending?: true;
+  }> {
     return this.req("POST", `/runs/${runId}/input`, { line });
   }
   cancelRun(runId: string): Promise<{ ok?: boolean; cancelled?: boolean }> {
@@ -194,6 +205,28 @@ export class AgetorClient {
     body: { optionId: string } | { cancel: true },
   ): Promise<{ ok: boolean }> {
     return this.req("POST", `/fx-permissions/${id}/answer`, body);
+  }
+  /** Continue an fx response a Vercel AI Gateway rate limit (or another
+   *  recoverable provider error) paused mid-turn — `docs/plans/
+   *  fix-fx-harness-rate-limit.md` §3.5. Sends no new prompt; the server
+   *  spawns a fresh run in the task's existing fx session with
+   *  `_meta.fx.continueRecovery: true`, resuming from fx's own checkpoint.
+   *  Only an fx task whose latest run ended with a resumable `paused`
+   *  recovery sentinel qualifies — the server 400s/404s/409s otherwise, and
+   *  that error text (including fx's own verbatim `-32602` message on a
+   *  rejected continue) propagates as a thrown `ApiError` like every other
+   *  call here. */
+  resumeFxRecovery(taskId: string): Promise<{ ok: true; runId: string }> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/fx-resume`);
+  }
+  /** Cancel a pending fx auto-resume timer (`docs/plans/
+   *  fx-recovery-follow-ups.md` §3.4) without resuming the paused response
+   *  itself — the task stays paused, `task.fxRecovery.autoResume` clears to
+   *  `null` with `autoResumeStopped: "cancelled"`. 400 when the task isn't
+   *  currently paused with a pending timer, 404 for a bad task id; both
+   *  propagate as a thrown `ApiError` like every other call here. */
+  cancelFxAutoResume(taskId: string): Promise<{ ok: true }> {
+    return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/fx-auto-resume`);
   }
 
   // ── projects ───────────────────────────────────────────────────────────────
@@ -269,6 +302,37 @@ export class AgetorClient {
   }
   defaults(): Promise<{ home: string; cwd: string; dataDir: string }> {
     return this.req("GET", "/defaults");
+  }
+
+  // ── agent profiles ──────────────────────────────────────────────────────
+  /** `GET /agent-profiles` — every profile, name ASC. */
+  listAgentProfiles(): Promise<AgentProfile[]> {
+    return this.req("GET", "/agent-profiles");
+  }
+  /** `GET /agent-profiles/:id` — 404 propagates as a thrown `ApiError`. */
+  getAgentProfile(id: string): Promise<AgentProfile> {
+    return this.req("GET", `/agent-profiles/${encodeURIComponent(id)}`);
+  }
+  /** `POST /agent-profiles` — 400 unknown/invalid harness, 409 duplicate
+   *  (case-insensitive, trimmed) name; both propagate as a thrown `ApiError`. */
+  createAgentProfile(input: AgentProfileInput): Promise<AgentProfile> {
+    return this.req("POST", "/agent-profiles", input);
+  }
+  /** `PATCH /agent-profiles/:id` — same validation as create. */
+  patchAgentProfile(id: string, patch: Partial<AgentProfileInput>): Promise<AgentProfile> {
+    return this.req("PATCH", `/agent-profiles/${encodeURIComponent(id)}`, patch);
+  }
+  /** `DELETE /agent-profiles/:id` — never blocked; tasks that already ran
+   *  keep their snapshot. */
+  deleteAgentProfile(id: string): Promise<void> {
+    return this.req("DELETE", `/agent-profiles/${encodeURIComponent(id)}`);
+  }
+  /** `DELETE /tasks/:id/agent-profile` — detach a bound task from its
+   *  profile (keeps the copied agent/model/effort/mode/fast/maxMode values,
+   *  unlocks them for PATCH). Returns the full updated `Task`; 404 unknown
+   *  task, 409 archived. */
+  detachTaskAgentProfile(taskId: string): Promise<Task> {
+    return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/agent-profile`);
   }
 
   // ── preferences (cross-session key/value store) ────────────────────────────
@@ -367,6 +431,28 @@ export interface CreateTaskInput {
   issueUrl?: string;
   /** Rendered issue + comment-thread snapshot; requires `issueUrl`. */
   issueSnapshot?: string;
+  /** Id of an {@link AgentProfile} to launch from (create-only) — the server
+   *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`fast`/
+   *  `maxMode` from the profile; 400 on an unknown id. Mutually exclusive
+   *  with setting those six fields yourself — the CLI (`agetor add
+   *  --profile`) enforces that client-side before this ever reaches the
+   *  wire. */
+  agentProfileId?: string;
+}
+
+/** Body shared by `POST /agent-profiles` and `PATCH /agent-profiles/:id`
+ *  (partial there). Mirrors {@link AgentProfile} minus its server-assigned
+ *  `id`/`createdAt`/`updatedAt`. */
+export interface AgentProfileInput {
+  name: string;
+  harness: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  fast: boolean;
+  maxMode: boolean;
+  instructions: string;
+  skills: string[];
 }
 
 /** Server-side allow-list for PATCH /tasks/:id. */

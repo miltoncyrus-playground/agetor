@@ -297,23 +297,46 @@ test("050 is registered right after 049", () => {
   expect(prev?.sql).toContain("gemini-3.1-pro-preview");
 });
 
-test("token-efficiency migrations 058/059 are registered last, in order, right after the pipeline branch's 057", () => {
+test("051-053 (upstream's fx_recovery/agent_profiles/task_agent_profile) are registered right after 050", () => {
+  const idx051 = migrations.findIndex((m) => m.id === "051_fx_recovery");
+  expect(idx051).toBeGreaterThan(0);
+  expect(migrations[idx051 - 1]?.id).toBe("050_sent_files");
+  const idx052 = migrations.findIndex((m) => m.id === "052_agent_profiles");
+  expect(idx052).toBe(idx051 + 1);
+  expect(migrations[idx052]?.sql).toContain("CREATE TABLE agent_profiles");
+  const idx053 = migrations.findIndex((m) => m.id === "053_task_agent_profile");
+  expect(idx053).toBe(idx052 + 1);
+  expect(migrations[idx053]?.sql).toContain("ADD COLUMN agent_profile_id TEXT");
+  expect(migrations[idx053]?.sql).toContain("ADD COLUMN agent_profile TEXT");
+});
+
+test("the fork's pipeline/token-efficiency migrations (060-068) are registered last, in order, right after upstream's 053", () => {
   const ids = migrations.map((m) => m.id);
-  expect(ids.slice(-4)).toEqual([
-    "056_account_usage",
-    "057_satisfied_subtasks",
-    "058_run_usage",
-    "059_pipeline_stage_state",
+  expect(ids.slice(-9)).toEqual([
+    "060_pipeline_tasks",
+    "061_prebuilder_children",
+    "062_block_reason",
+    "063_sdd_pipeline_stages",
+    "064_pipeline_bounce_fingerprint",
+    "065_account_usage",
+    "066_satisfied_subtasks",
+    "067_run_usage",
+    "068_pipeline_stage_state",
   ]);
-  const m057 = migrations.find((m) => m.id === "057_satisfied_subtasks");
-  expect(m057?.sql).toContain("ADD COLUMN satisfied_subtasks TEXT");
-  // Both were authored as 043/044 on the pre-upstream-sync lineage and
-  // renumbered on port; the old ids stay as aliases so a DB that applied
-  // them under the old numbering is not re-migrated.
-  const m058 = migrations.find((m) => m.id === "058_run_usage");
-  expect(m058?.aliases).toEqual(["043_run_usage"]);
-  expect(m058?.sql).toContain("CREATE TABLE run_usage (");
-  const m059 = migrations.find((m) => m.id === "059_pipeline_stage_state");
-  expect(m059?.aliases).toEqual(["044_pipeline_stage_state"]);
-  expect(m059?.sql).toContain("CREATE TABLE IF NOT EXISTS pipeline_stage_state");
+  const idx060 = migrations.findIndex((m) => m.id === "060_pipeline_tasks");
+  expect(migrations[idx060 - 1]?.id).toBe("053_task_agent_profile");
+  const m066 = migrations.find((m) => m.id === "066_satisfied_subtasks");
+  expect(m066?.sql).toContain("ADD COLUMN satisfied_subtasks TEXT");
+  // 060-066 were authored as 035-040/042 on the pre-upstream-sync pipeline
+  // lineage, renumbered to 051-057 on the original port, then renumbered
+  // again to 060-066 on this sync (upstream had independently claimed
+  // 051-053 in the meantime) — both prior ids stay as aliases so a DB that
+  // applied them under either older numbering is not re-migrated.
+  expect(m066?.aliases).toEqual(["042_satisfied_subtasks", "057_satisfied_subtasks"]);
+  const m067 = migrations.find((m) => m.id === "067_run_usage");
+  expect(m067?.aliases).toEqual(["043_run_usage", "058_run_usage"]);
+  expect(m067?.sql).toContain("CREATE TABLE run_usage (");
+  const m068 = migrations.find((m) => m.id === "068_pipeline_stage_state");
+  expect(m068?.aliases).toEqual(["044_pipeline_stage_state", "059_pipeline_stage_state"]);
+  expect(m068?.sql).toContain("CREATE TABLE IF NOT EXISTS pipeline_stage_state");
 });

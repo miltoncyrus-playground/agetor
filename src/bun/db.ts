@@ -3,9 +3,11 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, SentFileEntry, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus, RunUsage, RunUsageSample } from "../shared/types.ts";
+import { AGENT_OPTIONS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Harness, type HarnessQuota, type HarnessUsage, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Subagent, type SubagentStatus, type RunUsage, type RunUsageSample } from "../shared/types.ts";
 import { isAwaitingHandBack, isGateParked } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
+import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
+import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -95,6 +97,22 @@ type TaskRow = {
   // generic `insert`/`update` paths below — see the comment on the `update`
   // SET clause for why.
   sent_files: string | null;
+  // fx's paused-recovery state + auto-resume schedule (migration 051),
+  // `TaskFxRecovery` JSON — written exclusively by `tasks.setFxRecovery`'s
+  // targeted UPDATE, never by the generic `insert`/`update` paths below
+  // (same rationale as `sent_files` above: an unrelated PATCH must not
+  // clobber a live auto-resume timer). NULL for every task that isn't
+  // currently paused.
+  fx_recovery: string | null;
+  // The agent profile this task was launched from (migration 053), if any —
+  // a soft reference to `agent_profiles.id` plus a point-in-time JSON
+  // snapshot (`AgentProfileSnapshot`). Written exclusively by `tasks.insert`
+  // (at create time) and `tasks.setAgentProfile`'s targeted UPDATE, never by
+  // the generic `insert`/`update` SET clause below — same rationale as
+  // `sent_files`/`fx_recovery` above: an unrelated PATCH landing mid-first-run
+  // must not clobber the snapshot. Both NULL means "no agent".
+  agent_profile_id: string | null;
+  agent_profile: string | null;
   // Unread-indicator watermark pair (migration 045). Not spread into `Task`
   // directly — only the derived `unread` boolean is (see `toTask`). Written
   // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
@@ -344,6 +362,99 @@ const parseSentFiles = (raw: unknown): SentFileEntry[] | null => {
   return out;
 };
 
+/** Every {@link AgentKind} value a stored `harnessKind` may legitimately
+ *  carry — derived from {@link AGENT_OPTIONS}'s own keys rather than
+ *  hardcoded, so a sixth agent kind can't silently null every existing
+ *  snapshot (`AGENT_OPTIONS` is the single source of truth `AgentKind`
+ *  itself is keyed against in `shared/types.ts`). A snapshot whose
+ *  `harnessKind` isn't one of these is treated as corrupt (see
+ *  {@link parseAgentProfileSnapshot}) rather than cast blindly, since it
+ *  drives `AgentIcon`/`defaultModeFor`-style lookups on the client. */
+const AGENT_KINDS = new Set<string>(Object.keys(AGENT_OPTIONS));
+
+/**
+ * Normalize a raw `skills` value (from a JSON blob — either an
+ * {@link AgentProfile} row or a task's {@link AgentProfileSnapshot}) into the
+ * same shape `agentProfiles.insert`/`update` enforce: each entry run through
+ * {@link normalizeSkillName} (dropping anything that normalizes to `""`),
+ * deduplicated (first occurrence wins), and capped at
+ * `AGENT_PROFILE_LIMITS.skills`. A non-array input yields `[]`.
+ */
+const sanitizeSkillsList = (raw: unknown): string[] => {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const name = normalizeSkillName(entry);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+    if (out.length >= AGENT_PROFILE_LIMITS.skills) break;
+  }
+  return out;
+};
+
+/**
+ * Parse a task's stored `agent_profile` JSON column into an
+ * {@link AgentProfileSnapshot}, tolerating NULL (no agent bound), malformed
+ * JSON, and unexpected shapes — all collapse to `null`, same treatment as
+ * `parseSentFiles`/`parseTaskFxRecovery`. Every field is validated
+ * defensively since the snapshot drives display (chip, transcript preamble)
+ * without any further lookup: `id`/`name`/`harness`/`model` must be strings,
+ * `harnessKind` must be a known {@link AgentKind}, `harnessLabel` is a
+ * cosmetic display string that must not be load-bearing — a missing or
+ * non-string value falls back to the (already-validated) `harness` id rather
+ * than nulling the whole snapshot, `effort`/`mode` a string or `null`,
+ * `fast`/`maxMode` coerced to booleans, `instructions` a string (default
+ * `""`), `skills` sanitized via {@link sanitizeSkillsList}, and `capturedAt`
+ * a number (default `0`).
+ */
+const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | null => {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const rec = parsed as Record<string, unknown>;
+
+  const id = rec.id;
+  const name = rec.name;
+  const harness = rec.harness;
+  const model = rec.model;
+  const harnessKind = rec.harnessKind;
+  if (typeof id !== "string" || !id) return null;
+  if (typeof name !== "string" || !name) return null;
+  if (typeof harness !== "string" || !harness) return null;
+  if (typeof model !== "string" || !model) return null;
+  if (typeof harnessKind !== "string" || !AGENT_KINDS.has(harnessKind)) return null;
+
+  const harnessLabel = typeof rec.harnessLabel === "string" && rec.harnessLabel ? rec.harnessLabel : harness;
+  const effort = rec.effort;
+  const mode = rec.mode;
+  const instructions = rec.instructions;
+  const capturedAt = rec.capturedAt;
+
+  return {
+    id,
+    name,
+    harness,
+    harnessKind: harnessKind as AgentKind,
+    harnessLabel,
+    model,
+    effort: typeof effort === "string" ? effort : null,
+    mode: typeof mode === "string" ? mode : null,
+    fast: rec.fast === true,
+    maxMode: rec.maxMode === true,
+    instructions: typeof instructions === "string" ? instructions : "",
+    skills: sanitizeSkillsList(rec.skills),
+    capturedAt: typeof capturedAt === "number" ? capturedAt : 0,
+  };
+};
+
 /** Optional pre-computed grouped counts, threaded in by `tasks.list()` so a
  *  multi-row query does one pass over each in-memory registry instead of a
  *  per-row `countPendingForTask`/`countTerminals` scan (289 tasks × 2 linear
@@ -388,6 +499,9 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   openTerminalCount: counts?.terminals ? (counts.terminals.get(r.id) ?? 0) : countTerminals(r.id),
   todoProgress: parseTodoProgress(r.todo_progress),
   sentFiles: parseSentFiles(r.sent_files),
+  fxRecovery: parseTaskFxRecovery(r.fx_recovery),
+  agentProfileId: r.agent_profile_id ?? null,
+  agentProfile: parseAgentProfileSnapshot(r.agent_profile),
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
   // construction (see migration 045's doc comment). NULL
   // `last_assistant_event_id` (no assistant event ever observed) always
@@ -472,11 +586,12 @@ export const tasks = {
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, issue_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
+          agent_profile_id, agent_profile,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at,
           pipeline_stage, plan_approved, implementation_approved, revision_count, pipeline_feedback, pipeline_bounce_fingerprint, paused_at,
           block_reason, parent_task_id, plan_subtask_id, child_merge_status, satisfied_subtasks)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -486,6 +601,8 @@ export const tasks = {
         t.draft ? JSON.stringify(t.draft) : null,
         JSON.stringify(t.plans ?? []),
         t.todoProgress ? JSON.stringify(t.todoProgress) : null,
+        t.agentProfileId ?? null,
+        t.agentProfile ? JSON.stringify(t.agentProfile) : null,
         // A brand-new task has never had an assistant event or a mark-seen
         // — both start NULL, which `toTask` reads as `unread: false`.
         null, null,
@@ -499,7 +616,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -518,6 +635,21 @@ export const tasks = {
     // PATCH must not clobber a concurrent `SendUserFile` delivery, and (like
     // the watermarks) the write must not bump `updated_at` either, or the
     // board would re-render every task on every 2s poll.
+    // `fx_recovery` (migration 051) joins the same skip list for the same
+    // reason again: it's written only by `tasks.setFxRecovery` below via its
+    // own targeted UPDATE, and a generic PATCH (title, column, mode, …)
+    // landing mid-pause must never silently cancel a live auto-resume
+    // schedule or wipe the paused badge — that write also never bumps
+    // `updated_at`.
+    // `agent_profile_id`/`agent_profile` (migration 053) join the same skip
+    // list too: they're written only by `tasks.insert` (create time) and
+    // `tasks.setAgentProfile` below via its own targeted UPDATE. A generic
+    // PATCH must never clobber the point-in-time snapshot — most pointedly,
+    // the copy-down of the profile's own fields (agent/model/effort/mode/
+    // fast/maxMode) that `startTask` performs right before a task's first
+    // run must not race a concurrent unrelated edit into silently detaching
+    // the profile — and, like the watermarks/`sent_files`/`fx_recovery`,
+    // this write never bumps `updated_at` either.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -656,6 +788,68 @@ export const tasks = {
       [JSON.stringify(merged), taskId],
     );
     return this.get(taskId);
+  },
+  /**
+   * Overwrite a task's persisted fx pause + auto-resume state in one
+   * targeted `UPDATE` — same pattern as `mergeSentFiles` above: no
+   * `updated_at` bump (server-managed state, not a task mutation — bumping
+   * it would re-render every task on every 2s poll) and it bypasses the
+   * generic `update`'s SET clause entirely so a concurrent unrelated PATCH
+   * can't race it. Called by the orchestrator at every point in the fx
+   * pause lifecycle (§3 of `docs/plans/fx-recovery-follow-ups.md`):
+   * recording a fresh pause, updating the `autoResume` schedule/counter as
+   * the auto-resume engine schedules/fires/cancels a timer, and clearing
+   * the row (`value: null`) once the pause chain ends. Doesn't check
+   * whether the task exists first — an `UPDATE ... WHERE id = ?` against a
+   * missing id simply matches zero rows, same as every other targeted
+   * UPDATE in this file.
+   */
+  setFxRecovery(taskId: string, value: TaskFxRecovery | null): void {
+    db.run(
+      `UPDATE tasks SET fx_recovery = ? WHERE id = ?`,
+      [value ? JSON.stringify(value) : null, taskId],
+    );
+  },
+  /**
+   * Bind (or detach, when both arguments are `null`) a task's agent profile
+   * in one targeted `UPDATE` — same pattern as `setFxRecovery` above: no
+   * `updated_at` bump (server-managed state, not a task mutation) and it
+   * bypasses the generic `update`'s SET clause entirely so a concurrent
+   * unrelated PATCH can't race it. Callers: `createTask` (initial bind),
+   * `startTask` (freshening the snapshot from the live profile right before
+   * a task's first run — see `docs/plans/agent-profiles.md` D2), and the
+   * detach route (`profileId`/`snapshot` both `null`). Doesn't check whether
+   * the task exists first — an `UPDATE ... WHERE id = ?` against a missing
+   * id simply matches zero rows, same as every other targeted UPDATE here.
+   */
+  setAgentProfile(taskId: string, profileId: string | null, snapshot: AgentProfileSnapshot | null): Task | null {
+    db.run(
+      `UPDATE tasks SET agent_profile_id = ?, agent_profile = ? WHERE id = ?`,
+      [profileId, snapshot ? JSON.stringify(snapshot) : null, taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Every non-archived task currently carrying a persisted fx pause whose
+   * `autoResume` schedule is non-null — the boot-time re-arm input
+   * (`rearmFxAutoResumes` in the orchestrator re-schedules a timer for each
+   * one, since in-memory timers don't survive a process restart). A paused
+   * task with `autoResume: null` (auto-resume off, exhausted, or cancelled)
+   * is deliberately excluded — there is nothing to re-arm for it. Archived
+   * tasks are excluded too: archiving cancels any pending auto-resume (see
+   * the orchestrator's archive path), so a lingering row there would be
+   * stale by construction.
+   */
+  listFxAutoResumePending(): Array<{ id: string; fxRecovery: TaskFxRecovery }> {
+    const rows = db.query<{ id: string; fx_recovery: string | null }, []>(
+      `SELECT id, fx_recovery FROM tasks WHERE fx_recovery IS NOT NULL AND archived_at IS NULL`,
+    ).all();
+    const out: Array<{ id: string; fxRecovery: TaskFxRecovery }> = [];
+    for (const row of rows) {
+      const fxRecovery = parseTaskFxRecovery(row.fx_recovery);
+      if (fxRecovery && fxRecovery.autoResume) out.push({ id: row.id, fxRecovery });
+    }
+    return out;
   },
 };
 
@@ -893,9 +1087,17 @@ const toHarness = (r: HarnessRow): Harness => {
 
 export class HarnessInUseError extends Error {
   taskIds: string[];
-  constructor(taskIds: string[]) {
-    super(`harness in use by ${taskIds.length} task(s)`);
+  /** Ids of the {@link AgentProfile} rows referencing this harness — a
+   *  profile delete never populates this list (deleting a profile always
+   *  succeeds; only deleting the harness it points at can be refused). */
+  profileIds: string[];
+  constructor(taskIds: string[], profileIds: string[] = []) {
+    const parts: string[] = [];
+    if (taskIds.length > 0) parts.push(`${taskIds.length} task(s)`);
+    if (profileIds.length > 0) parts.push(`${profileIds.length} agent(s)`);
+    super(`harness in use by ${parts.length > 0 ? parts.join(" and ") : "0 task(s)"}`);
     this.taskIds = taskIds;
+    this.profileIds = profileIds;
     this.name = "HarnessInUseError";
   }
 }
@@ -1037,8 +1239,13 @@ export const harnesses = {
         `SELECT id FROM tasks WHERE agent = ?`,
       )
       .all(id);
-    if (inUse.length > 0) {
-      throw new HarnessInUseError(inUse.map((r) => r.id));
+    const inUseByProfiles = db
+      .query<{ id: string }, [string]>(
+        `SELECT id FROM agent_profiles WHERE harness_id = ?`,
+      )
+      .all(id);
+    if (inUse.length > 0 || inUseByProfiles.length > 0) {
+      throw new HarnessInUseError(inUse.map((r) => r.id), inUseByProfiles.map((r) => r.id));
     }
     db.run(`DELETE FROM harnesses WHERE id = ?`, [id]);
     // Drop any cached usage snapshot so a deleted alias doesn't leave an
@@ -1205,6 +1412,243 @@ export const savedPrompts = {
   },
 };
 
+/** Thrown by `agentProfiles.insert`/`update` when the (trimmed,
+ *  case-insensitive) name collides with an existing profile — the `409` the
+ *  server maps this to, and what makes `agetor add --profile <name>`
+ *  unambiguous (`matchAgentProfileRef` in `shared/agent-profile.ts`). */
+export class AgentProfileNameError extends Error {
+  constructor(name: string) {
+    super(`agent name "${name}" is already in use`);
+    this.name = "AgentProfileNameError";
+  }
+}
+
+/** True for a bun:sqlite `UNIQUE` constraint violation — the backstop that
+ *  catches a name-key clash from a concurrent write that slipped past the
+ *  `findByName` pre-check below (there is no cross-process locking here, so
+ *  the pre-check alone can't be relied on to be race-free). */
+const isUniqueConstraintError = (e: unknown): boolean =>
+  e instanceof Error && "code" in e && (e as { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE";
+
+type AgentProfileRow = {
+  id: string;
+  name: string;
+  name_key: string;
+  harness_id: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  fast: number;
+  max_mode: number;
+  instructions: string;
+  skills_json: string;
+  created_at: number;
+  updated_at: number;
+};
+
+/** Parse the stored `skills_json` column through the same sanitizer
+ *  {@link parseAgentProfileSnapshot} uses, tolerating malformed JSON or a
+ *  non-array top level (both collapse to `[]` rather than throwing) — a
+ *  profile row is our own write, but defensive parsing here costs nothing
+ *  and matches every other JSON column in this file. */
+const parseSkillsJson = (raw: string): string[] => {
+  try {
+    return sanitizeSkillsList(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+};
+
+const toAgentProfile = (r: AgentProfileRow): AgentProfile => ({
+  id: r.id,
+  name: r.name,
+  harness: r.harness_id,
+  model: r.model,
+  effort: r.effort,
+  mode: r.mode,
+  fast: r.fast === 1,
+  maxMode: r.max_mode === 1,
+  instructions: r.instructions,
+  skills: parseSkillsJson(r.skills_json),
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
+
+export interface AgentProfileInsertInput {
+  name: string;
+  harness: string;
+  model: string;
+  effort?: string | null;
+  mode?: string | null;
+  fast?: boolean;
+  maxMode?: boolean;
+  instructions?: string;
+  skills?: string[];
+}
+
+export interface AgentProfilePatch {
+  name?: string;
+  harness?: string;
+  model?: string;
+  effort?: string | null;
+  mode?: string | null;
+  fast?: boolean;
+  maxMode?: boolean;
+  instructions?: string;
+  skills?: string[];
+}
+
+/** Validate + normalize the name/instructions fields shared by `insert` and
+ *  `update`: trims the name, rejects empty or over `AGENT_PROFILE_LIMITS.name`
+ *  with a plain `Error` (mirrors `harnesses.insert`'s id-format check —
+ *  these are caller/validation errors, not name-clash errors, so they're
+ *  never `AgentProfileNameError`), and rejects instructions over
+ *  `AGENT_PROFILE_LIMITS.instructions`. Returns the trimmed name and its
+ *  lower-cased `name_key`. */
+const validateAgentProfileNameAndInstructions = (name: string, instructions: string): { name: string; nameKey: string } => {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("agent name is required");
+  if (trimmed.length > AGENT_PROFILE_LIMITS.name) {
+    throw new Error(`agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer`);
+  }
+  if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+    throw new Error(`agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer`);
+  }
+  return { name: trimmed, nameKey: trimmed.toLowerCase() };
+};
+
+/**
+ * Reusable, named launch presets (`AgentProfile`, `shared/types.ts`) —
+ * see `docs/plans/agent-profiles.md` for the full design. `harness_id` is a
+ * soft reference: this module never validates that the harness exists (the
+ * server does, via `harnesses.getByIdOrKind`, before calling `insert`) — a
+ * profile pointing at a since-deleted harness id is expected once
+ * `harnesses.delete`'s guard is bypassed by hand-editing the DB, and the
+ * webview/CLI render it gracefully via the task-side snapshot's own
+ * `harnessKind`/`harnessLabel` copy.
+ */
+export const agentProfiles = {
+  list(): AgentProfile[] {
+    return db
+      .query<AgentProfileRow, []>(
+        `SELECT * FROM agent_profiles ORDER BY name_key ASC, id ASC`,
+      )
+      .all()
+      .map(toAgentProfile);
+  },
+  get(id: string): AgentProfile | null {
+    const row = db
+      .query<AgentProfileRow, [string]>(`SELECT * FROM agent_profiles WHERE id = ?`)
+      .get(id);
+    return row ? toAgentProfile(row) : null;
+  },
+  /** Case-insensitive, trimmed name lookup — the backing query for the
+   *  unique-name check in `insert`/`update` and for `matchAgentProfileRef`'s
+   *  CLI `<id|name>` resolution. */
+  findByName(name: string): AgentProfile | null {
+    const row = db
+      .query<AgentProfileRow, [string]>(`SELECT * FROM agent_profiles WHERE name_key = ?`)
+      .get(name.trim().toLowerCase());
+    return row ? toAgentProfile(row) : null;
+  },
+  insert(input: AgentProfileInsertInput): AgentProfile {
+    const instructions = input.instructions ?? "";
+    const { name, nameKey } = validateAgentProfileNameAndInstructions(input.name, instructions);
+    if (this.findByName(name)) throw new AgentProfileNameError(name);
+
+    const skills = sanitizeSkillsList(input.skills ?? []);
+    const id = randomUUID();
+    const now = Date.now();
+    try {
+      db.run(
+        `INSERT INTO agent_profiles
+           (id, name, name_key, harness_id, model, effort, mode, fast, max_mode, instructions, skills_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id, name, nameKey, input.harness, input.model,
+          input.effort ?? null, input.mode ?? null,
+          input.fast ? 1 : 0, input.maxMode ? 1 : 0,
+          instructions, JSON.stringify(skills), now, now,
+        ],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new AgentProfileNameError(name);
+      throw e;
+    }
+    return this.get(id) as AgentProfile;
+  },
+  update(id: string, patch: AgentProfilePatch): AgentProfile | null {
+    const current = this.get(id);
+    if (!current) return null;
+
+    const nextNameRaw = patch.name !== undefined ? patch.name : current.name;
+    const nextInstructions = patch.instructions !== undefined ? patch.instructions : current.instructions;
+    const { name, nameKey } = validateAgentProfileNameAndInstructions(nextNameRaw, nextInstructions);
+    if (patch.name !== undefined) {
+      const clash = this.findByName(name);
+      if (clash && clash.id !== id) throw new AgentProfileNameError(name);
+    }
+
+    const next = {
+      harness: patch.harness ?? current.harness,
+      model: patch.model ?? current.model,
+      effort: patch.effort !== undefined ? patch.effort : current.effort,
+      mode: patch.mode !== undefined ? patch.mode : current.mode,
+      fast: patch.fast ?? current.fast,
+      maxMode: patch.maxMode ?? current.maxMode,
+      skills: patch.skills !== undefined ? sanitizeSkillsList(patch.skills) : current.skills,
+    };
+
+    try {
+      db.run(
+        `UPDATE agent_profiles SET
+           name = ?, name_key = ?, harness_id = ?, model = ?, effort = ?, mode = ?, fast = ?, max_mode = ?, instructions = ?, skills_json = ?, updated_at = ?
+         WHERE id = ?`,
+        [
+          name, nameKey, next.harness, next.model, next.effort, next.mode,
+          next.fast ? 1 : 0, next.maxMode ? 1 : 0, nextInstructions, JSON.stringify(next.skills),
+          Date.now(), id,
+        ],
+      );
+    } catch (e) {
+      if (isUniqueConstraintError(e)) throw new AgentProfileNameError(name);
+      throw e;
+    }
+    return this.get(id);
+  },
+  /** Deleting a profile always succeeds — a task that was launched from it
+   *  keeps its own frozen snapshot (D7 in the plan), so there is nothing to
+   *  guard against here the way `harnesses.delete` must guard against
+   *  in-use tasks/profiles. */
+  delete(id: string): boolean {
+    const current = this.get(id);
+    if (!current) return false;
+    db.run(`DELETE FROM agent_profiles WHERE id = ?`, [id]);
+    return true;
+  },
+  /** profileId -> count of tasks currently bound to it (`agent_profile_id =
+   *  profileId`, every column including archived). One grouped query, the
+   *  batch form the `GET /agent-profiles` list route uses so listing N
+   *  profiles never issues N count queries. Detaching a task
+   *  (`tasks.setAgentProfile(id, null, null)`) or deleting it lowers the
+   *  count automatically since both clear/remove `agent_profile_id`. */
+  taskCounts(): Map<string, number> {
+    const rows = db.query<{ agent_profile_id: string; n: number }, []>(
+      `SELECT agent_profile_id, COUNT(*) AS n FROM tasks WHERE agent_profile_id IS NOT NULL GROUP BY agent_profile_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.agent_profile_id, r.n]));
+  },
+  /** Single-profile count of tasks currently bound to it — for a
+   *  single-resource response (GET/POST/PATCH `/agent-profiles/:id`) where a
+   *  full grouped scan would be wasteful. */
+  taskCount(id: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM tasks WHERE agent_profile_id = ?`,
+    ).get(id);
+    return row?.n ?? 0;
+  },
+};
+
 type RunRow = {
   id: string; task_id: string; agent: string; status: string;
   started_at: number; ended_at: number | null; exit_code: number | null;
@@ -1216,6 +1660,83 @@ type RunRow = {
   fx_session_id: string | null;
   origin: string | null;
 };
+
+/**
+ * Given rows in DESC (newest-first) id order — each carrying its `data`
+ * column's `LENGTH()` as `len` — finds the id of the oldest row to keep
+ * under a byte budget, walking newest → oldest and accumulating `len`.
+ * Always keeps at least `minEvents` rows before the budget can cut anything
+ * off (the `MIN_REPLAY_EVENTS` floor — see
+ * `docs/plans/task-details-blank-while-session-restores.md` §3.3), and
+ * always keeps at least ONE row regardless of `minEvents`, so a caller can
+ * never get back an empty window from a non-empty input. `len` is the
+ * UTF-8 byte length of each event's `data` — `eventsForTask` selects
+ * `LENGTH(CAST(data AS BLOB))` (bytes; plain `LENGTH()` on TEXT would count
+ * characters) and the rebuild route uses `Buffer.byteLength`, so the
+ * budgets count what actually goes over the wire. Returns `null` only when
+ * `rowsDesc` is empty. Pure and
+ * DB-free so it's unit-testable on its own.
+ */
+export function clampWindowByBytes(
+  rowsDesc: Array<{ id: number; len: number }>,
+  maxBytes: number,
+  minEvents: number,
+): number | null {
+  if (rowsDesc.length === 0) return null;
+  let accumulated = 0;
+  let count = 0;
+  for (const row of rowsDesc) {
+    if (count >= minEvents && accumulated + row.len > maxBytes) break;
+    accumulated += row.len;
+    count++;
+  }
+  if (count === 0) count = 1;
+  return rowsDesc[count - 1]!.id;
+}
+
+/**
+ * Decides whether a first-load window should be extended back to an anchor
+ * event (the newest main-stream `user` event) — see
+ * `docs/plans/first-load-reaches-last-user-message.md` §3. The extension is
+ * ALL-OR-NOTHING: either the whole span `[anchorId, beforeId)` fits under
+ * both ceilings and `anchorId` becomes the new floor, or the caller's
+ * existing `minId` (the default count/byte-budgeted window) stands unchanged
+ * — there is no partial extension.
+ *
+ * - `anchorId == null` (no user event at all, e.g. a task with only status
+ *   breadcrumbs) → `minId` unchanged.
+ * - `anchorId >= minId` — the anchor already sits inside (or exactly at the
+ *   edge of) the default window → `minId` unchanged; nothing to extend.
+ * - Otherwise `spanRowsDesc` — the DESC (newest-first) `{id, len}` rows of
+ *   the span `id >= anchorId` (and `id < beforeId` when the caller has one),
+ *   capped by the CALLER at `maxEvents + 1` rows — decides it:
+ *   - `spanRowsDesc.length > maxEvents` → the span holds MORE than
+ *     `maxEvents` events (the `+1` the caller fetched proves it, without
+ *     this function ever seeing an unbounded row set) → `minId` unchanged.
+ *   - else sum every row's `len`; `> maxBytes` → `minId` unchanged;
+ *     otherwise → `anchorId` (the window now starts at the anchor).
+ *
+ * Both callers (the SSE replay route via `eventsForTask`'s `opts.anchor`,
+ * and the `?limit=` rebuild-snapshot route directly, over its in-memory
+ * mapped events with `id` = array index) share this one rule and its unit
+ * tests, so "does the span fit" can't drift between the two surfaces. Pure
+ * and DB-free, like `clampWindowByBytes`.
+ */
+export function resolveAnchoredMinId(args: {
+  minId: number;
+  anchorId: number | null;
+  spanRowsDesc: Array<{ id: number; len: number }>;
+  maxEvents: number;
+  maxBytes: number;
+}): number {
+  const { minId, anchorId, spanRowsDesc, maxEvents, maxBytes } = args;
+  if (anchorId == null || anchorId >= minId) return minId;
+  if (spanRowsDesc.length > maxEvents) return minId;
+  let total = 0;
+  for (const row of spanRowsDesc) total += row.len;
+  if (total > maxBytes) return minId;
+  return anchorId;
+}
 
 const toRun = (r: RunRow): Run => ({
   id: r.id,
@@ -1243,6 +1764,20 @@ export const runs = {
     return db.query<RunRow, [string]>(
       `SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC`,
     ).all(taskId).map((row) => ({ ...toRun(row), usage: usageByRun.get(row.id) ?? null }));
+  },
+  /**
+   * Total run count for a task, across every status — the "has this task
+   * ever run" test `effectiveAgentProfile` (docs/plans/agent-profiles.md D2)
+   * uses to decide whether a bound agent profile is still "live" (follows
+   * edits) or frozen to its captured snapshot. A plain `COUNT(*)` rather
+   * than `listForTask(...).length` so the caller isn't paying to materialize
+   * every run row just to check the count.
+   */
+  countForTask(taskId: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM runs WHERE task_id = ?`,
+    ).get(taskId);
+    return row?.n ?? 0;
   },
   get(id: string): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
@@ -1428,10 +1963,52 @@ export const runs = {
    *  same task with an id inside `[minId, taskMax]` but still `>= beforeId`
    *  — would wrongly re-enter the page. `id >= minId` alone only bounds the
    *  page from below; `beforeId` is what bounds it from above, exactly as it
-   *  did in the one-query version. */
+   *  did in the one-query version.
+   *
+   *  `opts.maxBytes` layers a BYTE budget on top of `opts.limit`'s event-count
+   *  cap (see `EVENTS_REPLAY_MAX_BYTES` / `EVENTS_PAGE_MAX_BYTES` in
+   *  `shared/types.ts`): step 1 additionally selects each row's
+   *  `LENGTH(data)`, then `clampWindowByBytes` walks the DESC id rows
+   *  newest → oldest accumulating that length and raises `minId` to stop
+   *  once the budget would be exceeded — never below `opts.minEvents`
+   *  (`MIN_REPLAY_EVENTS`) rows, so a task whose newest event alone exceeds
+   *  the budget still returns something. Step 2 is otherwise unchanged: it
+   *  just ends up scanning a narrower `[minId, taskMax]` range. When
+   *  `opts.maxBytes` is omitted the byte walk never runs — this path is
+   *  byte-identical to before it existed.
+   *
+   *  `opts.anchor` (additive, only meaningful together with `opts.limit`)
+   *  extends the window's floor back to the newest main-stream `user` event
+   *  when that fits under `anchor.maxEvents`/`anchor.maxBytes` — see
+   *  `docs/plans/first-load-reaches-last-user-message.md` §3 and
+   *  `resolveAnchoredMinId` above, which makes the actual fit/no-fit call.
+   *  After the byte walk settles `minId`: look up the anchor id via
+   *  `lastUserEventId(taskId, opts.beforeId)` (same cursor the rest of this
+   *  call already respects); if it exists and sits BEFORE `minId` (i.e. the
+   *  default window doesn't already reach it), assemble the DESC `{id, len}`
+   *  rows of the whole span `[anchorId, beforeId)` — anchor to newest, since
+   *  the ceilings must cover the entire resulting window, not just the part
+   *  below the old floor — from step 1's own rows (`[minId, beforeId)`, already
+   *  in memory) plus one bounded read of `[anchorId, minId)`, capped so the
+   *  total never exceeds `anchor.maxEvents + 1` rows, and hand them to
+   *  `resolveAnchoredMinId`. Its return either leaves `minId` alone (span
+   *  too large in count or bytes) or lowers it to `anchorId`.
+   *  Step 2's `LIMIT` becomes `max(opts.limit, opts.anchor.maxEvents)` in
+   *  that case: the `[minId, beforeId)` range fetched by step 2 is already
+   *  exact once `minId` is anchored, so `LIMIT` is only a defensive cap —
+   *  leaving it at the plain `opts.limit` would truncate the NEWEST rows of
+   *  a window that just grew past that count. Without `opts.anchor` this
+   *  function is byte-identical to before the option existed, including
+   *  step 2's `LIMIT opts.limit`. */
   eventsForTask(
     taskId: string,
-    opts?: { beforeId?: number; limit?: number },
+    opts?: {
+      beforeId?: number;
+      limit?: number;
+      maxBytes?: number;
+      minEvents?: number;
+      anchor?: { maxEvents: number; maxBytes: number };
+    },
   ): Array<{ id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null }> {
     type Row = { id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null };
     if (opts?.limit) {
@@ -1442,8 +2019,8 @@ export const runs = {
         idParams.push(opts.beforeId);
       }
       idParams.push(opts.limit);
-      const idRows = db.query<{ id: number }, Array<string | number>>(
-        `SELECT run_events.id as id
+      const idRows = db.query<{ id: number; len: number }, Array<string | number>>(
+        `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
          FROM run_events
          JOIN runs ON runs.id = run_events.run_id
          WHERE ${idConditions.join(" AND ")}
@@ -1452,7 +2029,49 @@ export const runs = {
       ).all(...idParams);
       if (idRows.length === 0) return [];
       // DESC order — the last row is the smallest id in the page.
-      const minId = idRows[idRows.length - 1]!.id;
+      let minId = idRows[idRows.length - 1]!.id;
+      if (opts.maxBytes != null) {
+        const clampedId = clampWindowByBytes(idRows, opts.maxBytes, opts.minEvents ?? 1);
+        if (clampedId != null) minId = clampedId;
+      }
+
+      if (opts.anchor) {
+        const anchorId = runs.lastUserEventId(taskId, opts.beforeId);
+        if (anchorId != null && anchorId < minId) {
+          // The span `resolveAnchoredMinId` judges is `[anchorId, beforeId)`
+          // — anchor to newest — but its upper part, `[minId, beforeId)`, is
+          // exactly the default window step 1 already fetched (with `len`),
+          // so only the part BELOW the current floor, `[anchorId, minId)`, is
+          // read from the DB. Its LIMIT is the remaining room under the count
+          // ceiling (+1, so a span that overflows it is detectable by length
+          // alone) — the returned row count is bounded by that, though the
+          // ORDER BY still sorts every task row in the range through a temp
+          // b-tree (same plan shape as step 1, over a strict subset of its
+          // rows). No room left means the window alone already exceeds the
+          // ceiling: skip the read, `resolveAnchoredMinId` rejects on count.
+          const windowRowsDesc = idRows.filter((r) => r.id >= minId);
+          const room = opts.anchor.maxEvents + 1 - windowRowsDesc.length;
+          let spanRowsDesc = windowRowsDesc;
+          if (room > 0) {
+            const belowRowsDesc = db.query<{ id: number; len: number }, Array<string | number>>(
+              `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+               FROM run_events
+               JOIN runs ON runs.id = run_events.run_id
+               WHERE runs.task_id = ? AND run_events.id >= ? AND run_events.id < ?
+               ORDER BY run_events.id DESC
+               LIMIT ?`,
+            ).all(taskId, anchorId, minId, room);
+            spanRowsDesc = windowRowsDesc.concat(belowRowsDesc);
+          }
+          minId = resolveAnchoredMinId({
+            minId,
+            anchorId,
+            spanRowsDesc,
+            maxEvents: opts.anchor.maxEvents,
+            maxBytes: opts.anchor.maxBytes,
+          });
+        }
+      }
 
       const rowConditions = ["runs.task_id = ?", "run_events.id >= ?"];
       const rowParams: Array<string | number> = [taskId, minId];
@@ -1460,7 +2079,11 @@ export const runs = {
         rowConditions.push("run_events.id < ?");
         rowParams.push(opts.beforeId);
       }
-      rowParams.push(opts.limit);
+      // Once `opts.anchor` may have lowered `minId` past `opts.limit` events
+      // back, the exact `[minId, beforeId)` range must not be truncated by a
+      // `LIMIT` still pinned at the pre-anchor count — see the doc comment
+      // above `eventsForTask`.
+      rowParams.push(opts.anchor ? Math.max(opts.limit, opts.anchor.maxEvents) : opts.limit);
       return db.query<Row, Array<string | number>>(
         `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
          FROM run_events
@@ -1563,6 +2186,45 @@ export const runs = {
        LIMIT 1`,
     ).get(taskId, beforeId);
     return row !== null;
+  },
+  /**
+   * The id of the newest MAIN-stream `user` event for a task — the "last
+   * user sent message" anchor for the first-load window extension (see
+   * `resolveAnchoredMinId` above and
+   * `docs/plans/first-load-reaches-last-user-message.md`), or `null` when
+   * the task has no such event (e.g. only status breadcrumbs so far).
+   * `subagent_id IS NULL` (main-stream only) matches `lastEventData`'s
+   * rationale — a background subagent's own `user` turns are its own
+   * conversation, not the primary task's. `beforeId`, when given, excludes
+   * events at or after that id, mirroring every other paging cursor in this
+   * file. SQLite serves this from migration 039's partial index
+   * `idx_run_events_user_history (stream, id DESC) WHERE subagent_id IS NULL`
+   * (verified with EXPLAIN QUERY PLAN): it walks main-stream `user` rows
+   * newest-first ACROSS EVERY TASK, probing `runs` by primary key on each
+   * until one belongs to this task — the index carries no run/task column,
+   * so the cost is bounded by how many user messages landed anywhere since
+   * this task's last one, NOT by this task's own history length. User rows
+   * are sparse (a few thousand across a multi-hundred-thousand-event DB) and
+   * every started task has at least its prompt echo, so this is a few ms in
+   * practice; a partial index on `(run_id, stream, id DESC)` would make it
+   * terminate inside the task's own runs if that ever changes.
+   */
+  lastUserEventId(taskId: string, beforeId?: number): number | null {
+    const conditions = ["runs.task_id = ?", "run_events.stream = 'user'", "run_events.subagent_id IS NULL"];
+    const params: Array<string | number> = [taskId];
+    if (beforeId != null) {
+      conditions.push("run_events.id < ?");
+      params.push(beforeId);
+    }
+    const row = db.query<{ id: number }, Array<string | number>>(
+      `SELECT run_events.id as id
+       FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY run_events.id DESC
+       LIMIT 1`,
+    ).get(...params);
+    return row ? row.id : null;
   },
   /**
    * Returns the inserted row's `id`, or `null` when nothing was actually

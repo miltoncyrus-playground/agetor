@@ -20,17 +20,21 @@ import {
   HarnessBuiltinError,
   HarnessInUseError,
   savedPrompts,
+  agentProfiles,
+  AgentProfileNameError,
   dataDir,
+  clampWindowByBytes,
+  resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus, handBackChild, pausePipelineTask, resumePipelineTask, overridePipelineGate, satisfyPipelineSubtask } from "./orchestrator.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus, handBackChild, pausePipelineTask, resumePipelineTask, overridePipelineGate, satisfyPipelineSubtask } from "./orchestrator.ts";
 import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import { buildEli5Prompt, cloneRepo, defaultCloneDest, eli5TaskTitle, parseGitHubRepo } from "./clone.ts";
-import { stalledSince } from "./stall-registry.ts";
 import { buildBarrierState } from "./build-scheduler.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { stalledSince } from "./stall-registry.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -172,7 +176,12 @@ import {
 } from "./interactions.ts";
 import {
   DEFAULT_BRANCH_CONFIG,
+  EVENTS_PAGE_MAX_BYTES,
+  EVENTS_REPLAY_ANCHOR_MAX_BYTES,
+  EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
   EVENTS_REPLAY_LIMIT,
+  EVENTS_REPLAY_MAX_BYTES,
+  MIN_REPLAY_EVENTS,
   TASK_EVENTS_REPLAY_META_EVENT,
   TASK_TYPES,
   supportedEfforts,
@@ -180,6 +189,7 @@ import {
 } from "../shared/types.ts";
 import type {
   AgentKind,
+  AgentProfile,
   AppEvent,
   BranchNamingConfig,
   GitHubItemKind,
@@ -198,6 +208,8 @@ import type {
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
+import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
+import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -394,7 +406,17 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
   return ((req: Request) => (isAuthorized(req) ? fn(req) : unauthorized(req))) as F;
 }
 
-/** Fields callers may patch on a task. Everything else is server-managed. */
+/**
+ * Fields callers may patch on a task. Everything else is server-managed —
+ * including, additively, `agentProfileId`/`agentProfile` (docs/plans/
+ * agent-profiles.md D1): they're create-only (via `POST /tasks`'s
+ * `agentProfileId`) or targeted-UPDATE-only (`tasks.setAgentProfile`, called
+ * from `startTask`'s live-profile refresh and the detach route below),
+ * never through this generic PATCH. See the bound-agent 409 guard in
+ * `PATCH /tasks/:id` for the other half of that lock: even a listed field
+ * here (`agent`/`mode`/`model`/`effort`/`fast`/`maxMode`) is refused once a
+ * task is bound to a profile, until it's detached.
+ */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
   "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "maxMode", "taskType",
 ]);
@@ -516,6 +538,55 @@ function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { er
   const v = validateBranchConfig(config);
   if (!v.ok) return { error: v.reason };
   return { config };
+}
+
+/**
+ * Validate + normalize an agent profile's `skills` field for the
+ * `POST`/`PATCH /agent-profiles` routes (docs/plans/agent-profiles.md). Unlike
+ * `sanitizeSkillsList` in db.ts (a defensive parse-path normalizer that
+ * silently drops/truncates malformed input from the DB), this is the wire
+ * validator — it must be HONEST about what it does: a non-array, or an array
+ * containing anything that isn't a string, 400s rather than silently
+ * filtering; the array is normalized via `normalizeSkillName` (trim,
+ * strip-leading-slash, collapse whitespace, drop-if-empty) and deduplicated
+ * (first occurrence wins) BEFORE the length is checked against
+ * `AGENT_PROFILE_LIMITS.skills`, so a caller that sends 60 raw entries which
+ * normalize/dedupe down to 40 unique names is accepted, while one that still
+ * has 51 after normalization is rejected instead of silently truncated.
+ */
+function parseSkillsBody(raw: unknown): { skills: string[] } | { error: string } {
+  if (!Array.isArray(raw) || raw.some((s) => typeof s !== "string")) {
+    return { error: "skills must be an array of strings" };
+  }
+  const seen = new Set<string>();
+  const skills: string[] = [];
+  for (const entry of raw as string[]) {
+    const name = normalizeSkillName(entry);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    skills.push(name);
+  }
+  if (skills.length > AGENT_PROFILE_LIMITS.skills) {
+    return { error: `at most ${AGENT_PROFILE_LIMITS.skills} skills` };
+  }
+  return { skills };
+}
+
+/**
+ * Stamp an {@link AgentProfile}'s server-derived `taskCount` (docs/plans/
+ * agent-profiles.md — "used by N tasks"). `withTaskCount` does a single
+ * targeted `agentProfiles.taskCount` query, for the single-resource
+ * GET/POST/PATCH `/agent-profiles/:id` responses; `withTaskCounts` uses one
+ * grouped `agentProfiles.taskCounts()` map so the `GET /agent-profiles` list
+ * route never issues N queries for N profiles. A profile with no bound tasks
+ * simply isn't a key in the map, hence the `?? 0` default.
+ */
+function withTaskCount(p: AgentProfile): AgentProfile {
+  return { ...p, taskCount: agentProfiles.taskCount(p.id) };
+}
+function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
+  const counts = agentProfiles.taskCounts();
+  return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
 }
 
 /**
@@ -1086,6 +1157,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               ...corsHeaders(req),
               "content-type": result.contentType,
               "x-content-type-options": "nosniff",
+              // Same CSP posture as /files/preview — see that route's comment.
+              "content-security-policy": "sandbox; default-src 'none'",
               "cache-control": "private, max-age=0, must-revalidate",
               etag,
             },
@@ -3214,7 +3287,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           } catch (e) {
             if (e instanceof HarnessInUseError) {
               return json(
-                { error: e.message, taskIds: e.taskIds },
+                { error: e.message, taskIds: e.taskIds, profileIds: e.profileIds },
                 { status: 409, headers: corsHeaders(req) },
               );
             }
@@ -3292,6 +3365,194 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             { accounts: discoverClaudeAccounts(registeredHomes) },
             { headers: corsHeaders(req) },
           );
+        }),
+      },
+
+      // Reusable, named launch presets (docs/plans/agent-profiles.md) — the
+      // "Agents" the New Task picker and `agetor profile`/`agetor add --profile`
+      // work against. Validation style mirrors /saved-prompts above: a
+      // non-object body 400s, strings are trimmed, and the harness reference
+      // is resolved via `harnesses.getByIdOrKind` exactly like every other
+      // route that accepts one. `effort`/`mode` are string-or-null
+      // passthrough — same null-clear-only philosophy as the task PATCH route
+      // (see its own comment on the subject) — and are never validated
+      // against a model's supported-effort catalog here. `skills` is
+      // validated HONESTLY by `parseSkillsBody` below (400 on a non-string
+      // entry, 400 past the cap) rather than silently filtering/truncating —
+      // `agentProfiles.insert`/`update` (`sanitizeSkillsList` in db.ts) keeps
+      // its own defensive normalize+cap for the parse path (direct DB writes,
+      // migrations), but the HTTP route now rejects instead of mangling.
+      "/agent-profiles": {
+        GET: authed((req) => json(withTaskCounts(agentProfiles.list()), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          const name = typeof body.name === "string" ? body.name.trim() : "";
+          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+          if (name.length > AGENT_PROFILE_LIMITS.name) {
+            return json(
+              { error: `agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+          if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
+          const harness = harnesses.getByIdOrKind(harnessRef);
+          if (!harness) {
+            return json({ error: `unknown harness "${harnessRef}"` }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          const model = typeof body.model === "string" ? body.model.trim() : "";
+          if (!model) return json({ error: "model required" }, { status: 400, headers: corsHeaders(req) });
+
+          if (body.effort !== undefined && body.effort !== null && typeof body.effort !== "string") {
+            return json({ error: "effort must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.mode !== undefined && body.mode !== null && typeof body.mode !== "string") {
+            return json({ error: "mode must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          const instructions = typeof body.instructions === "string" ? body.instructions : "";
+          if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+            return json(
+              { error: `agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          let skills: string[] = [];
+          if (body.skills !== undefined) {
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) {
+              return json({ error: parsedSkills.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            skills = parsedSkills.skills;
+          }
+
+          try {
+            const created = agentProfiles.insert({
+              name,
+              harness: harness.id,
+              model,
+              effort: (body.effort as string | null | undefined) ?? null,
+              mode: (body.mode as string | null | undefined) ?? null,
+              fast: body.fast === true,
+              maxMode: body.maxMode === true,
+              instructions,
+              skills,
+            });
+            return json(withTaskCount(created), { headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      "/agent-profiles/:id": {
+        GET: authed((req) => {
+          const p = agentProfiles.get(req.params.id);
+          return p
+            ? json(withTaskCount(p), { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = agentProfiles.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+          const patch: AgentProfilePatch = {};
+
+          if ("name" in body) {
+            const name = typeof body.name === "string" ? body.name.trim() : "";
+            if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+            if (name.length > AGENT_PROFILE_LIMITS.name) {
+              return json(
+                { error: `agent name must be ${AGENT_PROFILE_LIMITS.name} characters or fewer` },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            patch.name = name;
+          }
+          if ("harness" in body) {
+            const harnessRef = typeof body.harness === "string" ? body.harness.trim() : "";
+            if (!harnessRef) return json({ error: "harness required" }, { status: 400, headers: corsHeaders(req) });
+            const harness = harnesses.getByIdOrKind(harnessRef);
+            if (!harness) {
+              return json({ error: `unknown harness "${harnessRef}"` }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.harness = harness.id;
+          }
+          if ("model" in body) {
+            const model = typeof body.model === "string" ? body.model.trim() : "";
+            if (!model) return json({ error: "model required" }, { status: 400, headers: corsHeaders(req) });
+            patch.model = model;
+          }
+          if ("effort" in body) {
+            if (body.effort !== null && typeof body.effort !== "string") {
+              return json({ error: "effort must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.effort = body.effort;
+          }
+          if ("mode" in body) {
+            if (body.mode !== null && typeof body.mode !== "string") {
+              return json({ error: "mode must be a string or null" }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.mode = body.mode;
+          }
+          if ("fast" in body) patch.fast = body.fast === true;
+          if ("maxMode" in body) patch.maxMode = body.maxMode === true;
+          if ("instructions" in body) {
+            const instructions = typeof body.instructions === "string" ? body.instructions : "";
+            if (instructions.length > AGENT_PROFILE_LIMITS.instructions) {
+              return json(
+                { error: `agent instructions must be ${AGENT_PROFILE_LIMITS.instructions} characters or fewer` },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            patch.instructions = instructions;
+          }
+          if ("skills" in body) {
+            const parsedSkills = parseSkillsBody(body.skills);
+            if ("error" in parsedSkills) {
+              return json({ error: parsedSkills.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.skills = parsedSkills.skills;
+          }
+
+          try {
+            const updated = agentProfiles.update(req.params.id, patch);
+            return updated
+              ? json(withTaskCount(updated), { headers: corsHeaders(req) })
+              : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof AgentProfileNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          // Deleting a profile always succeeds — a task already launched from
+          // it keeps its own frozen snapshot (D7), so there's nothing to
+          // guard against the way `/harnesses/:id` DELETE must guard against
+          // in-use tasks/profiles.
+          const removed = agentProfiles.delete(req.params.id);
+          return removed
+            ? json({ ok: true }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
       },
 
@@ -3518,13 +3779,33 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const agentParam = url.searchParams.get("agent");
           const workdir = url.searchParams.get("workdir");
-          const branch = url.searchParams.get("branch");
+          const branch = url.searchParams.get("branch")?.trim() || null;
           if (!agentParam) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }
           const harness = harnesses.getByIdOrKind(agentParam);
           if (!harness) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // `workdir` is caller-controlled, and in ref mode it becomes a
+          // `cwd` a git process actually spawns in (`resolveProjectTree` ->
+          // `loadRefProjectTree`) — defense-in-depth mirroring
+          // `project-files.ts`'s `validateScope`. Deliberately NOT a 4xx:
+          // this route silently backs the `/`/`@` picker with no error
+          // surface in the UI, so a stale/deleted-worktree `workdir` should
+          // degrade to "no capabilities" rather than surface an error the
+          // caller can't show. `workdir === null` (no workdir picked yet)
+          // keeps today's user-level-only behavior untouched.
+          if (workdir != null) {
+            let workdirOk: boolean;
+            try {
+              workdirOk = path.isAbsolute(workdir) && statSync(workdir).isDirectory();
+            } catch {
+              workdirOk = false;
+            }
+            if (!workdirOk) {
+              return json({ commands: [], extensions: [] }, { headers: corsHeaders(req) });
+            }
           }
           return json(
             await listAgentCapabilities({
@@ -3565,6 +3846,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           if (body.issueUrl !== undefined && typeof body.issueUrl !== "string") {
             return json({ error: "issueUrl must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Additive agent-profile binding (docs/plans/agent-profiles.md):
+          // `createTask` resolves it and overrides agent/model/effort/mode/
+          // fast/maxMode from the profile — this route only checks the
+          // wire shape, same division of labor as every other field here.
+          // `null` is accepted as "no profile", matching createTask's own
+          // `input.agentProfileId?.trim()` handling.
+          if (
+            body.agentProfileId !== undefined &&
+            body.agentProfileId !== null &&
+            typeof body.agentProfileId !== "string"
+          ) {
+            return json({ error: "agentProfileId must be a string" }, { status: 400, headers: corsHeaders(req) });
           }
           if (body.issueSnapshot !== undefined) {
             if (typeof body.issueSnapshot !== "string") {
@@ -3638,6 +3932,28 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           const patch = filterPatch(await req.json());
+          // A task bound to an agent profile (docs/plans/agent-profiles.md
+          // D5) has its agent/mode/model/effort/fast/maxMode locked — the
+          // profile owns those six fields, and the only sanctioned way to
+          // change them is to detach first (`DELETE /tasks/:id/agent-profile`)
+          // or edit the profile itself. Refuse the whole PATCH with 409 if it
+          // touches any of the six with a value that actually differs from
+          // what's already on the row — a same-value resend (e.g. a stale
+          // form re-submitting unchanged fields) is allowed through rather
+          // than punishing a no-op.
+          if (before.agentProfileId) {
+            const boundFields = ["agent", "mode", "model", "effort", "fast", "maxMode"] as const;
+            const touchesBoundField = boundFields.some(
+              (field) => field in patch && patch[field] !== before[field],
+            );
+            if (touchesBoundField) {
+              const profileName = before.agentProfile?.name ?? before.agentProfileId;
+              return json(
+                { error: `task is bound to agent "${profileName}" — detach it first` },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+          }
           // Prevent workdir from being swapped after a worktree has been
           // materialized. The worktree is registered against the original repo;
           // changing workdir would make removeWorktree run git ops against the
@@ -3980,6 +4296,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               ...corsHeaders(req),
               "content-type": blobContentType(relPath, kind),
               "x-content-type-options": "nosniff",
+              // Same CSP posture as /files/preview — see that route's comment.
+              "content-security-policy": "sandbox; default-src 'none'",
               // Neither side is content-addressed by URL: "new" is the
               // working tree (can change under the user's feet), and "old"
               // is pinned to `task.baseRef` which itself isn't stable — an
@@ -4597,7 +4915,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               // carry <script>) on the origin whose URL carries the API
               // token; nosniff + img-only consumption keeps active-content
               // risk down.
+              // The CSP header below makes that img-only mitigation
+              // self-enforcing: a browser ignores CSP on an <img> fetch, but
+              // if this token-bearing URL were ever navigated to or framed
+              // instead, `sandbox` + `default-src 'none'` block script
+              // execution in an SVG. Agent-authored markdown can now point
+              // this route anywhere (plan
+              // docs/plans/markdown-image-rendering.md D9).
               "x-content-type-options": "nosniff",
+              "content-security-policy": "sandbox; default-src 'none'",
               // Content at a given path can change (a screenshot re-saved in
               // place), so don't let the browser serve stale bytes without
               // asking; the ETag makes the revalidation cheap (304, no body).
@@ -4909,6 +5235,31 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Detach a task from its bound agent profile (docs/plans/
+      // agent-profiles.md D5): clears both `agentProfileId` and the frozen
+      // `agentProfile` snapshot via `tasks.setAgentProfile`, which unlocks
+      // the agent/mode/model/effort/fast/maxMode dropdowns (the values
+      // themselves are left exactly as they were — "detach" keeps state,
+      // it doesn't revert it) and lifts the PATCH route's bound-agent 409
+      // guard above. Archived-gated (409, not 400 — unlike `backlogGuard`'s
+      // 400 for the same condition) since detaching is a task mutation the
+      // archived freeze already covers everywhere else.
+      "/tasks/:id/agent-profile": {
+        DELETE: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (task.archivedAt != null) {
+            return json({ error: "task is archived" }, { status: 409, headers: corsHeaders(req) });
+          }
+          const updated = tasks.setAgentProfile(req.params.id, null, null);
+          return updated
+            ? json(withRunningSubagents(updated), { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
       // Unread-messages indicator: mark a task's watermark caught up (POST)
       // or re-flag it as unread (DELETE — "Mark as unread" in the board's
       // task context menu). Intentionally NOT gated by `backlogGuard`/an
@@ -5145,6 +5496,45 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Resume a PAUSED fx model response (Vercel AI Gateway rate-limit
+      // recovery — see `resumeFxRecovery`'s doc in orchestrator.ts and plan
+      // `docs/plans/fix-fx-harness-rate-limit.md` §2/§3.5,
+      // `docs/plans/fx-recovery-follow-ups.md` §3). The synchronous per-task
+      // double-resume claim used to live here (`fxResumesInFlight`) — it now
+      // lives inside `resumeFxRecovery` itself (`resumingTaskIds`), so the
+      // auto-resume engine's own timer and every HTTP caller share ONE
+      // guard. This route just calls it (with no `opts` — always a manual
+      // resume) and maps the result onto HTTP.
+      "/tasks/:id/fx-resume": {
+        POST: authed(async (req) => {
+          const result = await resumeFxRecovery(req.params.id);
+          return result.ok
+            ? json(result, { headers: corsHeaders(req) })
+            : json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Cancel a pending fx auto-resume schedule (plan
+      // `docs/plans/fx-recovery-follow-ups.md` §3 T2 item 11) — the paused
+      // notice's Cancel button, the board card's context-menu
+      // "Cancel auto-resume" entry, and `agetor resume <id> --cancel`. All
+      // the real logic (clearing the timer, persisting the row, the status
+      // line, the `fx-auto-resume` event) lives in `cancelFxAutoResume`
+      // itself; this route just maps its boolean onto HTTP.
+      "/tasks/:id/fx-auto-resume": {
+        DELETE: authed((req) => {
+          const taskId = req.params.id;
+          if (!tasks.get(taskId)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const cancelled = cancelFxAutoResume(taskId, "cancelled");
+          if (!cancelled) {
+            return json({ error: "no auto-resume pending" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // Composer draft — the single unsent text+refs currently sitting in the
       // task details modal, autosaved by the webview so closing the modal (or
       // restarting agetor) doesn't lose it. Unlike the backlog routes above,
@@ -5221,11 +5611,21 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/runs/:id/rebuild-events": { GET: authed((req) => {
         try {
           // Optional `?limit=` caps the response to the most recent N mapped
-          // events (ascending) plus `hasMore`, so the RunPanel's auto-rebuild
-          // on opening a finished claude task doesn't defeat the SSE replay
-          // window by pulling unbounded full JSONL history. Absent `limit`,
-          // the response keeps its pre-existing shape (bare `events` array,
-          // no `hasMore`) for any other caller — additive-only change.
+          // events (ascending) — an event-count cut AND a byte budget
+          // (`clampWindowByBytes`/`EVENTS_REPLAY_MAX_BYTES`/`MIN_REPLAY_EVENTS`,
+          // below) — so the RunPanel's auto-rebuild on opening a finished
+          // claude task doesn't defeat the SSE replay window by pulling
+          // unbounded full JSONL history; `hasMore` reports either cut. One
+          // deliberate exception to "caps at N": the last-user-message anchor
+          // (further down) may extend the window PAST `limit`, up to
+          // `EVENTS_REPLAY_ANCHOR_MAX_EVENTS` events / `_MAX_BYTES`, when the
+          // newest `user` line sits before the cut — same rule as the SSE
+          // replay route, so a caller passing a small `limit` can still get
+          // up to that ceiling back. Absent
+          // `limit` (the panel's manual "Rebuild from session JSONL" button
+          // and the CLI) the response is the COMPLETE history in its
+          // pre-existing shape (bare `events`/`source`, never `hasMore`) —
+          // see the comment on that branch for why it must stay unbounded.
           const url = new URL(req.url);
           const limitParam = url.searchParams.get("limit");
           const hasLimit = limitParam !== null;
@@ -5279,10 +5679,78 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           };
           rebuildEventsFromJsonl(readFileSync(jsonlPath, "utf8"), onChunk);
           if (hasLimit) {
-            const hasMore = events.length > limit;
-            const windowed = hasMore ? events.slice(events.length - limit) : events;
+            // Two cuts, both from the END (newest events), same as the SSE
+            // replay / page routes above: first the event-count cap
+            // (`limit`), then a byte budget (`EVENTS_REPLAY_MAX_BYTES`,
+            // floor `MIN_REPLAY_EVENTS`) on top of it — a rebuilt JSONL
+            // transcript can weigh just as much as the persisted one, and
+            // this route feeds the RunPanel's auto-rebuild on opening a
+            // finished claude task, so it needs the same protection. `hasMore`
+            // is true whenever EITHER cut actually removed events; the
+            // no-`limit` response shape below is unchanged (additive-only
+            // contract, per the route's own comment above).
+            const hasCountCut = events.length > limit;
+            const countWindowed = hasCountCut ? events.slice(events.length - limit) : events;
+            const rowsDesc = countWindowed
+              .map((ev, idx) => ({ id: idx, len: Buffer.byteLength(ev.data, "utf8") }))
+              .reverse();
+            const cutIdx = clampWindowByBytes(rowsDesc, EVENTS_REPLAY_MAX_BYTES, MIN_REPLAY_EVENTS) ?? 0;
+            // Index into the FULL `events` array (mapped JSONL, oldest to
+            // newest) where the count+byte window above currently starts.
+            let start = events.length - countWindowed.length + cutIdx;
+            // Anchor extension: same first-load rule as the SSE replay route
+            // (docs/plans/first-load-reaches-last-user-message.md §3),
+            // applied here over the in-memory mapped events (`id` = array
+            // index) via the shared `resolveAnchoredMinId`, instead of a
+            // second, route-local copy of the fit/no-fit decision. Find the
+            // newest main-stream `user` event in the WHOLE mapped transcript
+            // (scanning from the end — the newest occurrence), and — only
+            // when it sits before the window's current start — extend back
+            // to it as long as the span `[userIdx, events.length)` fits
+            // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES. All-or-nothing: either
+            // `start` becomes `userIdx`, or it's left exactly as computed
+            // above.
+            // (`idx`, not `i`: the outer `i` is the live counter `onChunk`
+            // closes over for its synthetic `ts`, and must not be shadowed.)
+            let userIdx = -1;
+            for (let idx = events.length - 1; idx >= 0; idx--) {
+              if (events[idx]!.stream === "user") {
+                userIdx = idx;
+                break;
+              }
+            }
+            if (userIdx >= 0 && userIdx < start) {
+              // DESC (newest-first) span rows, capped at
+              // `EVENTS_REPLAY_ANCHOR_MAX_EVENTS + 1` — enough for
+              // `resolveAnchoredMinId` to tell "fits" from "exceeds the
+              // count ceiling" without ever walking the whole transcript.
+              const spanRowsDesc: Array<{ id: number; len: number }> = [];
+              for (let idx = events.length - 1; idx >= userIdx; idx--) {
+                spanRowsDesc.push({ id: idx, len: Buffer.byteLength(events[idx]!.data, "utf8") });
+                if (spanRowsDesc.length >= EVENTS_REPLAY_ANCHOR_MAX_EVENTS + 1) break;
+              }
+              start = resolveAnchoredMinId({
+                minId: start,
+                anchorId: userIdx,
+                spanRowsDesc,
+                maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
+                maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES,
+              });
+            }
+            const windowed = events.slice(start);
+            const hasMore = start > 0;
             return json({ events: windowed, hasMore, source: jsonlPath }, { headers: corsHeaders(req) });
           }
+          // No `?limit=`: the panel's manual "Rebuild from session JSONL"
+          // button and the CLI call the route this way, and both are
+          // deliberate, one-off user actions taken precisely when the
+          // persisted `run_events` may be wrong or incomplete — so this path
+          // returns the COMPLETE mapped history, unbounded. The byte budget
+          // lives on the `?limit=` branch above only (the auto-rebuild that
+          // fires on every panel open): capping here would drop the oldest
+          // JSONL-only events with no way to page them back, since "Load
+          // earlier" reads the persisted rows, not the JSONL (review finding
+          // on PR #230). Response shape unchanged: `{ events, source }`.
           return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
         } catch (e) {
           const msg = (e as Error).message ?? String(e);
@@ -5589,6 +6057,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // required — this is a backward-paging cursor, not a general listing
       // endpoint. Ascending order, same event shape as the SSE frames (plus
       // `id`, which is handy for chaining the next `beforeId`).
+      //
+      // Byte-budgeted like the SSE replay window below (`EVENTS_PAGE_MAX_BYTES`,
+      // smaller than the replay budget since this is a foreground click the
+      // user is waiting on, not a background connect) — `eventsForTask`'s
+      // `maxBytes` walk may raise the effective `beforeId`-to-`earliestId`
+      // floor above what `limit` alone would have returned, in which case
+      // `hasMore` (derived from the returned window's own `earliestId`, same
+      // as always) correctly reports more history to page through even
+      // though the `limit`-worth of rows technically existed.
       "/tasks/:id/events/page": {
         GET: authed((req) => {
           const taskId = req.params.id;
@@ -5608,7 +6085,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
             : EVENTS_REPLAY_LIMIT;
-          const rows = runs.eventsForTask(taskId, { beforeId: beforeIdRaw, limit });
+          const rows = runs.eventsForTask(taskId, {
+            beforeId: beforeIdRaw,
+            limit,
+            maxBytes: EVENTS_PAGE_MAX_BYTES,
+            minEvents: MIN_REPLAY_EVENTS,
+          });
           const events = rows.map((ev) => ({
             id: ev.id,
             runId: ev.runId,
@@ -5661,6 +6143,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/events": authed((req) => {
         const taskId = req.params.id;
+        // `?anchor=0` opts the replay window out of the last-user-message
+        // extension below. The webview and `agetor logs` want it (they render
+        // everything replayed); the TUI dashboard does not — it keeps only its
+        // newest 500 lines (`MAX_LINES` in `useCoalescedStream`), so an
+        // anchored window of up to 3000 events / 16 MB would be paid for and
+        // immediately discarded there. Anything but the literal `0` keeps the
+        // default (anchored) behaviour, so older clients are unaffected.
+        const anchorReplay = new URL(req.url).searchParams.get("anchor") !== "0";
         const stream = new ReadableStream({
           start(controller) {
             attachedClients++;
@@ -5701,7 +6191,32 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             // of the task's full history — a task with thousands of events
             // used to replay every one of them on every SSE (re)connect.
             // Older history is fetched on demand via /tasks/:id/events/page.
-            const window = runs.eventsForTask(taskId, { limit: EVENTS_REPLAY_LIMIT });
+            // Also cap it in BYTES (EVENTS_REPLAY_MAX_BYTES): the event-count
+            // cap alone still let a replay window weigh tens of MB on large
+            // transcripts (measured 61 MB — see
+            // docs/plans/task-details-blank-while-session-restores.md §2/§3.3),
+            // which is what made opening a task with a big transcript stall.
+            // `eventsForTask` may raise the window's floor above what `limit`
+            // alone would keep, never below MIN_REPLAY_EVENTS; `hasMore` below
+            // still derives from the returned window's own earliest id, so it
+            // correctly flips true whenever the byte cut (not just the count
+            // cap) dropped older events.
+            // `anchor` extends that floor BACK DOWN to the newest main-stream
+            // `user` event when the span to it fits under
+            // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES, so opening a task shows
+            // at least the user's last message without a "Load earlier" click
+            // — see docs/plans/first-load-reaches-last-user-message.md. All
+            // or nothing: over either ceiling, the plain count/byte window
+            // above stands unchanged. Skipped entirely on `?anchor=0` (see
+            // `anchorReplay` above).
+            const window = runs.eventsForTask(taskId, {
+              limit: EVENTS_REPLAY_LIMIT,
+              maxBytes: EVENTS_REPLAY_MAX_BYTES,
+              minEvents: MIN_REPLAY_EVENTS,
+              ...(anchorReplay
+                ? { anchor: { maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS, maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES } }
+                : {}),
+            });
             const earliestId = window.length > 0 ? window[0]!.id : null;
             const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
             sendNamed(TASK_EVENTS_REPLAY_META_EVENT, { earliestId, hasMore } satisfies TaskEventsReplayMeta);

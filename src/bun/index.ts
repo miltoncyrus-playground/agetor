@@ -4,7 +4,8 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans, resumeInFlightBuilds, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
+import { reconcileOrphans, resumeInFlightBuilds, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
@@ -130,11 +131,29 @@ rehydratePath();
 // blocking this whole script until it returned. An unhandled rejection here
 // fails boot loudly, matching that old synchronous-throw behavior — no
 // swallow.
+//
+// Must run before reconcileOrphans(): reconciliation issues `has-session`
+// probes against agetor's tmux socket, and the first tmux command to touch
+// a socket auto-starts its server — un-disclaimed, if this didn't run
+// first — leaving every session that server ever hosts un-disclaimed too.
+await ensureDisclaimedServer();
 await reconcileOrphans();
 
 // Boot-time companion to reconcileOrphans: resume any pipeline parent stuck
 // mid-build (fresh-entry/DAG mode) with no run row of its own to reattach.
 resumeInFlightBuilds();
+
+// Re-arm in-memory auto-resume timers for every fx task still carrying a
+// pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — an
+// in-memory `setTimeout` handle never survives a process restart, so without
+// this a pause recorded in a prior process would sit forever with a
+// persisted `autoResume.at` nothing will ever fire. Awaited, and placed right
+// after `reconcileOrphans` so reattach/orphan resolution — which can itself
+// flip a run's status — settles first.
+const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
+if (rearmedFxAutoResumeCount > 0) {
+  console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
+}
 
 // Heal any archive/delete teardown (tmux kill, terminal shells, worktree
 // detach) that was deferred to the in-memory teardown queue but never ran
@@ -433,6 +452,22 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
   });
   event.response = { allow: false };
 });
+
+// Stop the fx auto-resume engine's in-memory timers on the way out (Phase 8
+// review #7) — mirrors fx-acp.ts's own `process.on("exit", reapLiveFxProcs)`
+// (see that file's doc for why `"exit"` is the right event here: it covers
+// both a normal process exit AND the `Utils.quit()` path this app's own
+// `before-quit` handler above ultimately allows through, unlike SIGINT/
+// SIGTERM which fx-acp's handlers already own separately). Unlike
+// `headless.ts`'s `shutdown()`, this app has no single synchronous teardown
+// function to hook into — the confirm-on-quit flow above just flips
+// `event.response.allow` and lets Electrobun's own quit sequence run — so a
+// bare `process.on("exit", ...)` registration is the only reliable hook.
+// `fxAutoResumeTimers` entries are `.unref()`'d already (never what keeps the
+// process alive), so this is about not racing a timer mid-teardown, not
+// about letting the process exit at all; it touches no persisted
+// `fxRecovery` row — `rearmFxAutoResumes()` re-arms from the DB on next boot.
+process.on("exit", stopFxAutoResumeTimers);
 
 // Background self-update check on launch + every 6h. Emits global events
 // that the UI subscribes to via SSE to render the "update ready" banner.

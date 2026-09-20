@@ -73,14 +73,14 @@ function assistantEvent(id: string, u: { input?: number; cw?: number; cr?: numbe
   };
 }
 
-test("migration 058 creates run_usage and run_usage_seen on a fresh DB", () => {
+test("migration 067 creates run_usage and run_usage_seen on a fresh DB", () => {
   const names = db
     .query<{ name: string }, []>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('run_usage', 'run_usage_seen') ORDER BY name`)
     .all()
     .map((r) => r.name);
   expect(names).toEqual(["run_usage", "run_usage_seen"]);
-  const applied = db.query<{ id: string }, []>(`SELECT id FROM _migrations WHERE id = '058_run_usage'`).get();
-  expect(applied?.id).toBe("058_run_usage");
+  const applied = db.query<{ id: string }, []>(`SELECT id FROM _migrations WHERE id = '067_run_usage'`).get();
+  expect(applied?.id).toBe("067_run_usage");
 });
 
 test("record sums per message, is idempotent on message id, and fixes bootstrap once", async () => {

@@ -4,15 +4,23 @@ import {
   CATALOG_SCOPED_KINDS,
   CODE_PLAN_MODE,
   CURSOR_MODEL_SPECS,
+  DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  EFFORT_OPTIONS,
+  FX_AUTO_RESUME_MAX,
   FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   MODEL_EFFORT_SUPPORT,
   PERMISSION_MODE_STATUS_PREFIX,
+  defaultModeFor,
   isInternalStatusSentinel,
+  retainableEfforts,
+  supportedEfforts,
   supportedModes,
   type AgentKind,
+  type GlobalEvent,
 } from "./types.ts";
 
 /* ── isInternalStatusSentinel ────────────────────────────────────────────── */
@@ -31,6 +39,14 @@ test("isInternalStatusSentinel: true for an fx-provider status chunk", () => {
 
 test("isInternalStatusSentinel: true for an fx-title status chunk", () => {
   expect(isInternalStatusSentinel(`${FX_SESSION_TITLE_STATUS_PREFIX}x`)).toBe(true);
+});
+
+test("isInternalStatusSentinel: true for an fx-recovery status chunk", () => {
+  expect(isInternalStatusSentinel(`${FX_RECOVERY_STATUS_PREFIX}{}`)).toBe(true);
+});
+
+test("isInternalStatusSentinel: false for the plain 'fx turn ended: refused' status line — it's transcript-visible prose, not the sentinel channel", () => {
+  expect(isInternalStatusSentinel("fx turn ended: refused")).toBe(false);
 });
 
 test("isInternalStatusSentinel: false for text that merely looks like the fx-title prefix without its trailing space", () => {
@@ -138,10 +154,100 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
   expect(effortKeys.size).toBe(catalogIds.size);
 });
 
-test("MODEL_EFFORT_SUPPORT.fx reports no supported efforts for any model — fx has no per-invocation effort/reasoning flag", () => {
-  for (const supported of Object.values(MODEL_EFFORT_SUPPORT.fx)) {
-    expect(supported).toEqual([]);
+/* ── fx effort (docs/plans/fx-0.0.10-compat.md §3 shared spec / T1) ──────── */
+
+// The 16 effort-advertising ids, live-probed on fx 0.0.10 (spike
+// fx-0010-efforts, 2026-09-14) — copied verbatim from the plan's shared-spec
+// table (§3). Every row ends in "auto" (fx's own default, off-scale).
+const FX_EFFORT_MODELS: Record<string, string[]> = {
+  "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
+  "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "none", "auto"],
+  "openai/gpt-5.1-codex-max": ["xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "none", "auto"],
+  "deepseek/deepseek-v4-flash": ["xhigh", "high", "auto"],
+  "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "auto"],
+  "anthropic/claude-sonnet-5": ["xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "none", "auto"],
+  "google/gemini-3.1-pro-preview": ["high", "medium", "low", "auto"],
+  "google/gemini-3.8-flash": ["high", "medium", "low", "auto"],
+  "moonshotai/kimi-k3": ["max", "high", "low", "auto"],
+  "anthropic/claude-fable-5.1": ["xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
+  "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+  "zai/glm-5.3": ["max", "high", "low", "auto"],
+  "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
+};
+
+// The 12 no-effort ids — their Gateway catalog entry carries no
+// reasoning_options at all, same treatment as every gemini model.
+const FX_NO_EFFORT_MODELS = [
+  "zai/glm-5v-turbo",
+  "zai/glm-4.7",
+  "spacexai/grok-4.6",
+  "spacexai/grok-build-0.1",
+  "moonshotai/kimi-k2.7-code",
+  "minimax/minimax-m3",
+  "alibaba/qwen3.8-flash",
+  "alibaba/qwen3-coder-plus",
+  "mistral/devstral-2",
+  "google/gemini-2.5-flash",
+  "anthropic/claude-3-haiku",
+  "anthropic/claude-haiku-4.5",
+];
+
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the live-probed 0.0.10 table (plan §3 shared spec) — 16 effort models each end in auto, 12 named models are empty", () => {
+  for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
+    expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
+    expect(expected[expected.length - 1]).toBe("auto");
   }
+  for (const id of FX_NO_EFFORT_MODELS) {
+    expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
+  }
+  // The two lists above are exactly the 28 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(16);
+  expect(FX_NO_EFFORT_MODELS.length).toBe(12);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(28);
+});
+
+test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
+  expect(DEFAULT_EFFORT.fx).toBe("auto");
+});
+
+test("EFFORT_OPTIONS: ultra is first, auto ('Model default') is last", () => {
+  expect(EFFORT_OPTIONS[0]?.id).toBe("ultra");
+  const last = EFFORT_OPTIONS[EFFORT_OPTIONS.length - 1];
+  expect(last?.id).toBe("auto");
+  expect(last?.label).toBe("Model default");
+});
+
+test("no non-fx kind's MODEL_EFFORT_SUPPORT table lists 'auto' — it is fx-only", () => {
+  for (const kind of KINDS) {
+    if (kind === "fx") continue;
+    for (const ids of Object.values(MODEL_EFFORT_SUPPORT[kind])) {
+      expect(ids).not.toContain("auto");
+    }
+  }
+});
+
+test("supportedEfforts('fx', 'zai/glm-5.3-flash') returns exactly [max, high, low, auto] in canonical order", () => {
+  const ids = supportedEfforts("fx", "zai/glm-5.3-flash").map((o) => o.id);
+  expect(ids).toEqual(["max", "high", "low", "auto"]);
+});
+
+test("supportedEfforts('fx', 'zai/glm-4.7') is empty (no-effort model)", () => {
+  expect(supportedEfforts("fx", "zai/glm-4.7")).toEqual([]);
+});
+
+test("supportedEfforts('fx', <unknown id>) falls back to DEFAULT_MODEL.fx's set (zai/glm-5.3-flash's)", () => {
+  const fallback = supportedEfforts("fx", "vendor/unknown-model").map((o) => o.id);
+  const curated = supportedEfforts("fx", DEFAULT_MODEL.fx).map((o) => o.id);
+  expect(fallback).toEqual(curated);
+  expect(fallback).toEqual(["max", "high", "low", "auto"]);
+});
+
+test("retainableEfforts('fx', 'zai/glm-5.3-flash') contains 'auto'", () => {
+  const retained = retainableEfforts("fx", "zai/glm-5.3-flash");
+  expect(retained.has("auto")).toBe(true);
 });
 
 test("none of the seven previously-curated fx ids survives as an unconditional row — each is either absent or catalogOnly — and the nonexistent google/gemini-3-pro id is gone entirely", () => {
@@ -222,6 +328,15 @@ test("AGENT_OPTIONS.fx.modes' yolo row is labelled 'Full access' with id 'yolo',
   expect(offeredIds).toContain("auto");
   expect(offeredIds).toContain("yolo");
   expect(offeredIds).toContain("ask");
+});
+
+test("AGENT_OPTIONS.fx.modes is ordered yolo, auto, ask — yolo ('Full access') first is fx's actual hands-off default (docs/plans/fix-fx-harness-rate-limit.md §3.7)", () => {
+  expect(AGENT_OPTIONS.fx.modes.map((m) => m.id)).toEqual(["yolo", "auto", "ask"]);
+  expect(AGENT_OPTIONS.fx.modes[0]?.label).toBe("Full access");
+});
+
+test("CODE_PLAN_MODE.fx pins Code to yolo (Full access) and Plan to ask, matching the reordered modes[0]", () => {
+  expect(CODE_PLAN_MODE.fx).toEqual({ code: "yolo", plan: "ask" });
 });
 
 test("AGENT_OPTIONS.fx.models has unique ids, unique labels, and every id matches provider/model shape", () => {
@@ -306,4 +421,86 @@ test("cursor picker lists Gemini Flash newest-first: 3.8 before 3.7 before 3.6",
     expect(spec?.fastId).toBeUndefined();
     expect(spec?.supportsMaxMode).toBeUndefined();
   }
+});
+
+/* ── defaultModeFor (docs/plans/fx-recovery-follow-ups.md §3.6) ─────────── */
+
+test("defaultModeFor: auto for every AgentKind except fx, which is yolo (Full access)", () => {
+  for (const kind of KINDS) {
+    expect(defaultModeFor(kind)).toBe(kind === "fx" ? "yolo" : "auto");
+  }
+  // Explicit, non-loop pins so a future kind added to the union can't
+  // silently change fx's own expectation without this test noticing.
+  expect(defaultModeFor("claude-code")).toBe("auto");
+  expect(defaultModeFor("codex")).toBe("auto");
+  expect(defaultModeFor("cursor")).toBe("auto");
+  expect(defaultModeFor("gemini")).toBe("auto");
+  expect(defaultModeFor("fx")).toBe("yolo");
+});
+
+test("defaultModeFor: always equals AGENT_OPTIONS[kind].modes[0].id — the single source of truth it's defined against", () => {
+  for (const kind of KINDS) {
+    const modesFirstId = AGENT_OPTIONS[kind].modes[0]?.id;
+    expect(modesFirstId).toBeDefined();
+    expect(defaultModeFor(kind)).toBe(modesFirstId as string);
+  }
+});
+
+/* ── GlobalEvent discriminated union — "fx-auto-resume" kind ────────────── */
+
+// Compile-time exhaustiveness guard: if a new GlobalEvent.kind is ever added
+// without a case here, `bun run typecheck` fails at the `default` branch
+// below (assertNever's `never` parameter rejects anything still assignable).
+// This is what proves the new "fx-auto-resume" kind — and every existing one
+// — type-checks cleanly in a discriminated switch, not just that an object
+// literal happens to satisfy the union.
+function assertNever(x: never): never {
+  throw new Error(`unhandled GlobalEvent kind: ${JSON.stringify(x)}`);
+}
+
+function describeGlobalEvent(event: GlobalEvent): string {
+  switch (event.kind) {
+    case "run-status":
+      return `run-status:${event.status}`;
+    case "column":
+      return `column:${event.column}`;
+    case "update":
+      return `update:${event.status}`;
+    case "interaction":
+      return `interaction:${event.state}`;
+    case "files-sent":
+      return `files-sent:${event.count}`;
+    case "fx-auto-resume":
+      return `fx-auto-resume:${event.state}`;
+    default:
+      return assertNever(event);
+  }
+}
+
+test("GlobalEvent: the \"fx-auto-resume\" kind type-checks in a discriminated switch alongside every other kind", () => {
+  const scheduled: GlobalEvent = {
+    kind: "fx-auto-resume",
+    taskId: "t1",
+    state: "scheduled",
+    at: Date.now() + 120_000,
+    attempt: 1,
+    max: FX_AUTO_RESUME_MAX,
+    ts: Date.now(),
+  };
+  expect(describeGlobalEvent(scheduled)).toBe("fx-auto-resume:scheduled");
+
+  // Every documented state value round-trips through the same switch with no
+  // cast required — `at` is intentionally omitted here (it's only present
+  // for `state: "scheduled"`), matching the field's own doc comment.
+  for (const state of ["scheduled", "fired", "cancelled", "exhausted", "disabled"] as const) {
+    const event: GlobalEvent = { kind: "fx-auto-resume", taskId: "t1", state, attempt: 1, max: FX_AUTO_RESUME_MAX, ts: 0 };
+    expect(describeGlobalEvent(event)).toBe(`fx-auto-resume:${state}`);
+  }
+
+  // Sanity: a couple of the pre-existing kinds still route through the same
+  // switch correctly, proving the new case was added without disturbing it.
+  expect(describeGlobalEvent({ kind: "run-status", taskId: "t1", runId: "r1", status: "succeeded", ts: 0 }))
+    .toBe("run-status:succeeded");
+  expect(describeGlobalEvent({ kind: "files-sent", taskId: "t1", runId: "r1", count: 2, caption: null, proactive: false, ts: 0 }))
+    .toBe("files-sent:2");
 });

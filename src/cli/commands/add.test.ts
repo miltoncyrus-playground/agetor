@@ -1,9 +1,15 @@
-import { test, expect, mock, afterAll } from "bun:test";
+import { test, expect, mock, afterAll, describe } from "bun:test";
 import path from "node:path";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import type { Flags } from "../context.ts";
-import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem, Task } from "../../shared/types.ts";
-import { DEFAULT_MODEL } from "../../shared/types.ts";
+import type {
+  AgentProfile,
+  GitHubComment,
+  GitHubIssueThreadResult,
+  GitHubListItem,
+  Task,
+} from "../../shared/types.ts";
+import { AGENT_OPTIONS, DEFAULT_MODEL, supportedEfforts } from "../../shared/types.ts";
 import type { DiscoveredModel } from "../../shared/model-options.ts";
 import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from "../../shared/issue-task.ts";
 
@@ -56,7 +62,9 @@ afterAll(() => {
   mock.module("../output.ts", () => realOutputSnapshot);
 });
 
-const { parseAdd, cmdAdd, chooseAddPath, resolveInitialModel } = await import("./add.ts");
+const { parseAdd, cmdAdd, chooseAddPath, resolveInitialModel, defaultNonInteractiveMode } = await import(
+  "./add.ts"
+);
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -131,6 +139,62 @@ function makeClient(thread: GitHubIssueThreadResult) {
     },
   } as unknown as AgetorClient;
   return { client, getIssueThreadCalls, createTaskCalls, startTaskCalls, setNextTaskId: (id: string) => (nextTaskId = id) };
+}
+
+/** A minimal fake `AgetorClient` for the plain (no `--issue`) non-interactive
+ *  `cmdAdd` path — just `createTask`, with a call recorder, matching
+ *  `makeClient`'s `createTask` stub exactly but without the issue-thread
+ *  machinery those tests don't need. */
+function makePlainClient() {
+  const createTaskCalls: CreateTaskInput[] = [];
+  const client = {
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "plain-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return { client, createTaskCalls };
+}
+
+function makeAgentProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
+  return {
+    id: "profile-1",
+    name: "Reviewer",
+    harness: "codex",
+    model: "gpt-6-astra",
+    effort: "high",
+    mode: "auto",
+    fast: false,
+    maxMode: false,
+    instructions: "Be thorough.",
+    skills: ["code-review"],
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+/** A fake `AgetorClient` for the `--profile` non-interactive `cmdAdd` path —
+ *  `listAgentProfiles` (for `matchAgentProfileRef` resolution) plus
+ *  `createTask`, both with call recorders. */
+function makeProfileClient(profiles: AgentProfile[]) {
+  const createTaskCalls: CreateTaskInput[] = [];
+  let listAgentProfilesCalls = 0;
+  const client = {
+    listAgentProfiles: async () => {
+      listAgentProfilesCalls++;
+      return profiles;
+    },
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "profile-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return {
+    client,
+    createTaskCalls,
+    getListAgentProfilesCalls: () => listAgentProfilesCalls,
+  };
 }
 
 function flags(overrides: Partial<Flags> = {}): Flags {
@@ -498,4 +562,338 @@ test("resolveInitialModel: a logged-out harness's discovered catalog is not cons
   expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, true)).toBe("google/gemini-3.7-flash");
   expect(resolveInitialModel("fx", "google/gemini-3.7-flash", discovered, null)).toBe("google/gemini-3.7-flash");
   expect(resolveInitialModel("fx", "zai/glm-5v-turbo", discovered, false)).toBe("zai/glm-5v-turbo"); // curated row — kept even when logged out
+});
+
+// ── defaultNonInteractiveMode (pure) + cmdAdd mode seeding (Phase 8 F4,
+// docs/plans/fix-fx-harness-rate-limit.md §3 review finding #9) ────────────
+//
+// Before this fix, `baseInput` forwarded `o.mode` verbatim, so a scripted
+// (non-interactive) `agetor add` with no `--mode` stored a `null` mode and
+// the task spawned on whatever bare launch-time fallback the driver picks —
+// `auto` for fx specifically, its interactive-review mode that stalls
+// without a Gateway reviewer on most accounts — instead of the picker's own
+// default (`AGENT_OPTIONS[kind].modes[0]`, `yolo`/"Full access" for fx since
+// the wave-2 reorder). `defaultNonInteractiveMode` seeds the gap; an
+// explicit `--mode` is always preserved untouched.
+
+test("defaultNonInteractiveMode: fx → yolo (AGENT_OPTIONS.fx.modes[0])", () => {
+  expect(defaultNonInteractiveMode("fx")).toBe("yolo");
+  expect(AGENT_OPTIONS.fx.modes[0]?.id).toBe("yolo");
+});
+
+test("defaultNonInteractiveMode: codex/cursor/gemini/claude-code → auto (unchanged default)", () => {
+  expect(defaultNonInteractiveMode("codex")).toBe("auto");
+  expect(defaultNonInteractiveMode("cursor")).toBe("auto");
+  expect(defaultNonInteractiveMode("gemini")).toBe("auto");
+  expect(defaultNonInteractiveMode("claude-code")).toBe("auto");
+});
+
+test("defaultNonInteractiveMode: an omitted or unrecognized --agent falls back to claude-code's modes, like the wizard's own harness-not-found fallback", () => {
+  expect(defaultNonInteractiveMode(undefined)).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+  expect(defaultNonInteractiveMode("")).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+  // A custom additional-account harness id (not a built-in AgentKind) isn't
+  // resolvable without an async harness lookup here — falls back the same
+  // way, same as an unrecognized value.
+  expect(defaultNonInteractiveMode("fx-2")).toBe(AGENT_OPTIONS["claude-code"].modes[0]?.id);
+});
+
+test("cmdAdd: a scripted fx add with no --mode stores mode 'yolo' (Full access), not left unset", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("fx");
+  expect(createTaskCalls[0]!.mode).toBe("yolo");
+});
+
+// docs/plans/fx-0.0.10-compat.md §5 TT4 — a scripted (non-interactive, no
+// --effort) fx add leaves `effort` unset on the createTask payload: the
+// scripted path (`baseInput` in add.ts) only ever forwards `o.effort`, which
+// is `undefined` unless `--effort` was passed — the server (createTask's own
+// `input.effort ?? …` default, see orchestrator-fx.test.ts) is what resolves
+// the null case to DEFAULT_EFFORT.fx ("auto"), not the CLI. This mirrors the
+// scripted-mode test above: baseInput leaves the field to the server default
+// rather than pre-resolving it client-side.
+test("cmdAdd: a scripted fx add with no --effort leaves effort undefined on the createTask payload (the daemon's createTask resolves the default, not the CLI)", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("fx");
+  expect(createTaskCalls[0]!.effort).toBeUndefined();
+});
+
+test("cmdAdd: a scripted fx add with an explicit --effort forwards it verbatim on the createTask payload", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--effort", "high"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.effort).toBe("high");
+});
+
+// The interactive wizard's Effort step (add.ts's `wizard()`, ~line 508-512)
+// seeds its `pickOption("Effort", efforts, …)` call from exactly this
+// `supportedEfforts(kind, model, …)` expression. This suite's other tests
+// can't drive `@clack/prompts` end to end (see the chooseAddPath comment
+// block above — cmdAdd always runs with the mocked `isTTY: false`), so this
+// pins the data the picker would render for fx's default model instead of
+// driving the wizard itself.
+test("the interactive picker's effort data for zai/glm-5.3-flash (fx's DEFAULT_MODEL) is exactly Max / High / Low / Model default, in that order", () => {
+  const efforts = supportedEfforts("fx", "zai/glm-5.3-flash");
+  expect(efforts.map((o) => o.id)).toEqual(["max", "high", "low", "auto"]);
+  expect(efforts.map((o) => o.label)).toEqual(["Max thinking", "High", "Low", "Model default"]);
+});
+
+test("cmdAdd: a scripted codex add with no --mode stores mode 'auto', matching the picker default", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "codex"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBe("codex");
+  expect(createTaskCalls[0]!.mode).toBe("auto");
+});
+
+test("cmdAdd: an explicit --mode is preserved verbatim, never overridden by the default seed", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "fx", "--mode", "ask"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.mode).toBe("ask");
+});
+
+test("cmdAdd: an add with no --agent at all defaults its mode via claude-code's modes[0] ('auto'), same as the wizard's fallback", async () => {
+  reset();
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+
+  await cmdAdd(["--title", "T", "--prompt", "P"], flags());
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.agent).toBeUndefined();
+  expect(createTaskCalls[0]!.mode).toBe("auto");
+});
+
+// ── --profile (docs/plans/agent-profiles.md §3 D13, TT6) ────────────────
+//
+// `--profile <id|name>` launches a task from a saved AgentProfile instead of
+// picking harness/model/mode/effort by hand. `assertProfileFlagCombo` (not
+// exported — checked through `cmdAdd`'s thrown usage error) rejects
+// combining it with any of the six manual fields; `baseInput` (not exported
+// either) sends only `agentProfileId` and omits agent/model/mode/effort/
+// fast/maxMode entirely when a profile id is present; ref resolution goes
+// through the already-unit-tested `matchAgentProfileRef`.
+
+describe("--profile", () => {
+  // ── parseAdd ───────────────────────────────────────────────────────────
+
+  test("parseAdd: --profile <ref> sets profile", () => {
+    const o = parseAdd(["--profile", "Reviewer"]);
+    expect(o.profile).toBe("Reviewer");
+  });
+
+  test("parseAdd: no --profile leaves profile undefined", () => {
+    const o = parseAdd(["--title", "T", "--prompt", "P"]);
+    expect(o.profile).toBeUndefined();
+  });
+
+  // ── assertProfileFlagCombo, exercised through cmdAdd's thrown usage error ──
+  //
+  // The guard fires before `getClient` is ever called (it's the first thing
+  // `cmdAdd` does after `parseAdd`), so no fake client / --title / --prompt
+  // is needed to observe it — the promise rejects synchronously-caused
+  // before any await that would need one.
+
+  test("cmdAdd: --profile combined with --agent throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--agent", "codex"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined with --agent\/--model\/--mode\/--effort\/--fast\/--max-mode/);
+  });
+
+  test("cmdAdd: --profile combined with --model throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--model", "gpt-6-astra"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --mode throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--mode", "auto"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --effort throws the usage error", async () => {
+    reset();
+    await expect(
+      cmdAdd(["--profile", "Reviewer", "--effort", "high"], flags()),
+    ).rejects.toThrow(/--profile cannot be combined/);
+  });
+
+  test("cmdAdd: --profile combined with --fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--fast"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --no-fast throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--no-fast"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--max-mode"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile combined with --no-max-mode throws the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--no-max-mode"], flags())).rejects.toThrow(
+      /--profile cannot be combined/,
+    );
+  });
+
+  test("cmdAdd: --profile alone (no conflicting flags) passes the combo guard and proceeds to resolve it", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile()]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags());
+
+    // Reaching createTask at all proves the combo guard didn't throw.
+    expect(createTaskCalls.length).toBe(1);
+  });
+
+  // ── ref resolution (matchAgentProfileRef, already unit-tested elsewhere —
+  // one integration-style assertion each for id and name is enough here) ──
+
+  test("cmdAdd: --profile resolves by exact id", async () => {
+    reset();
+    const profile = makeAgentProfile({ id: "abc-123", name: "Reviewer" });
+    const { client, createTaskCalls } = makeProfileClient([profile]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "abc-123"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.agentProfileId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --profile resolves by case-insensitive, trimmed name", async () => {
+    reset();
+    const profile = makeAgentProfile({ id: "abc-123", name: "Reviewer" });
+    const { client, createTaskCalls } = makeProfileClient([profile]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "  REVIEWER  "], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.agentProfileId).toBe("abc-123");
+  });
+
+  test("cmdAdd: --profile with an unknown ref throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ name: "Reviewer" })]);
+    currentClient = client;
+
+    // `matchAgentProfileRef` itself says "agent" (shared, non-CLI vocabulary)
+    // — `cmdAdd` must rewrite it to "profile" via `asProfileError` before it
+    // reaches the user, same as `agetor profile`'s CLI boundary.
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--profile", "does-not-exist"], flags()),
+    ).rejects.toThrow(/unknown profile "does-not-exist"/);
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  test("cmdAdd: --profile with an ambiguous name throws, never calling createTask", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([
+      makeAgentProfile({ id: "a", name: "Reviewer" }),
+      makeAgentProfile({ id: "b", name: "Reviewer" }),
+    ]);
+    currentClient = client;
+
+    await expect(
+      cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags()),
+    ).rejects.toThrow(/ambiguous profile "Reviewer"/);
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  // ── baseInput's profile branch: agentProfileId replaces the whole manual
+  // agent/model/mode/effort/fast/maxMode block ────────────────────────────
+
+  test("cmdAdd: a --profile task carries agentProfileId and omits agent/model/mode/effort/fast/maxMode entirely", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ id: "abc-123", name: "Reviewer" })]);
+    currentClient = client;
+
+    await cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer"], flags());
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.agentProfileId).toBe("abc-123");
+    expect(input.agent).toBeUndefined();
+    expect(input.model).toBeUndefined();
+    expect(input.effort).toBeUndefined();
+    expect(input.fast).toBeUndefined();
+    expect(input.maxMode).toBeUndefined();
+    // Also proves `defaultNonInteractiveMode`'s fill-the-gap fallback is
+    // skipped for a profile add (`if (!o.mode && !o.profile) …`) — a manual
+    // add with no --agent stores mode "auto" (see the test above), but a
+    // profile add must leave mode alone entirely, letting the profile supply
+    // it server-side.
+    expect(input.mode).toBeUndefined();
+  });
+
+  test("cmdAdd: --profile still carries workdir/isolation/baseRef/taskType/references through baseInput normally", async () => {
+    reset();
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile({ id: "abc-123", name: "Reviewer" })]);
+    currentClient = client;
+
+    await cmdAdd(
+      [
+        "--title",
+        "T",
+        "--prompt",
+        "P",
+        "--profile",
+        "Reviewer",
+        "--workdir",
+        "/tmp/acme-widgets",
+        "--isolation",
+        "none",
+        "--type",
+        "bug",
+      ],
+      flags(),
+    );
+
+    expect(createTaskCalls.length).toBe(1);
+    const input = createTaskCalls[0]!;
+    expect(input.agentProfileId).toBe("abc-123");
+    expect(input.workdir).toBe("/tmp/acme-widgets");
+    expect(input.isolation).toBe("none");
+    expect(input.taskType).toBe("bug");
+  });
 });

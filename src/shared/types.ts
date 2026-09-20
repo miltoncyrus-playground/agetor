@@ -138,23 +138,100 @@ export const FX_PROVIDER_STATUS_PREFIX = "fx-provider: ";
 export const FX_SESSION_TITLE_STATUS_PREFIX = "fx-title: ";
 
 /**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits per ACP
+ * `session_info_update` notification carrying `_meta.fx.modelResponseRecovery`
+ * — fx's retry-progress channel for a model call that hit a transient
+ * failure (rate limit, dropped connection, provider timeout, …), live since
+ * fx 0.0.7. One update is emitted per Gateway retry attempt, one more for the
+ * terminal paused state if fx exhausts its retry budget, one for a recovered
+ * state if a retry succeeds, and a final one when fx clears the checkpoint
+ * (`modelResponseRecovery: null`). Payload is JSON: `FxRecoveryPayload`.
+ * Suppressed from transcripts via `isInternalStatusSentinel`; RunPanel
+ * derives a live progress notice plus a Resume affordance from it, CLI
+ * `agetor logs` prints the active-state progress lines, and the TUI
+ * dashboard shows the latest one.
+ */
+export const FX_RECOVERY_STATUS_PREFIX = "fx-recovery: ";
+
+/** The lifecycle states fx reports on its recovery channel — see
+ *  {@link FxRecoveryPayload}. `"cleared"` is agetor's own label for a wire
+ *  `modelResponseRecovery: null` (fx has dropped the checkpoint), not a
+ *  state fx itself names. */
+export type FxRecoveryState = "active" | "paused" | "recovered" | "cleared";
+
+/**
+ * JSON body carried after `FX_RECOVERY_STATUS_PREFIX`. Mirrors fx's own
+ * `_meta.fx.modelResponseRecovery` wire shape (see `FX_RECOVERY_STATUS_PREFIX`
+ * for when it's emitted); every field beyond `state` is optional so a
+ * terse or forward-compat update still parses.
+ */
+export interface FxRecoveryPayload {
+  /** `"active"` while fx is mid-retry, `"paused"` once fx gives up and the
+   *  checkpoint is resumable, `"recovered"` once a retry succeeds, or
+   *  `"cleared"` for the wire's `modelResponseRecovery: null` (checkpoint
+   *  dropped — e.g. consumed by a normal follow-up prompt). */
+  state: FxRecoveryState;
+  /** Verbatim fx enum tags (forward-compat: unknown values pass through and
+   *  render as-is). `kind` distinguishes e.g. `auto_retry` from
+   *  `terminal_provider_error` from `auto_recovered`. */
+  kind?: string;
+  /** Why this attempt is happening, e.g. `rate_limited`, `network_interrupted`,
+   *  `response_interrupted`, `provider_stream_timeout`, `provider_unavailable`,
+   *  `system_resumed`, `authentication`, `request_limit_reached`. */
+  cause?: string;
+  /** What fx is doing about it, e.g. `retrying_request`, `continuing_response`,
+   *  `regenerating_tool`, `continuing_after_tool`, `reconciling_tool`,
+   *  `waiting_for_connectivity`, `paused`. */
+  action?: string;
+  /** Set only on a `paused` update: what the caller needs to do next, e.g.
+   *  `continue_later` (Resume applies), `inspect_uncertain_tool`,
+   *  `change_request`. */
+  requiredAction?: string;
+  /** 1-based retry attempt number and the configured cap for this recovery
+   *  episode (fx's `10/10` in "recovery paused after 10/10 attempts"). */
+  attempt?: number;
+  attemptLimit?: number;
+  /** Backoff delay in seconds before the next retry, when fx reports one. */
+  delaySeconds?: number;
+  /** Whether this checkpoint survives an `fx acp` process restart (true for
+   *  every update observed live) — informational only, agetor doesn't branch
+   *  on it. */
+  durable?: boolean;
+  /** fx's own human-readable label, verbatim, e.g. "⚠ Rate limited · HTTP
+   *  429 · rate_limit_exceeded: … · retrying request in 8s · attempt 5/10". */
+  message?: string;
+  /** Stamped by fx-acp.ts (never by fx — it is not a wire field) on every
+   *  sentinel emitted while `session/resume` was replaying the prior turn's
+   *  history onto the NEW run. Progress renderers (RunPanel's live notice,
+   *  `agetor logs`, the TUI) skip replayed entries so a stale "attempt 10/10"
+   *  never reads as live; `latestFxRecoveryByRun`/`isFxRecoveryResumable`
+   *  deliberately still honor a replayed `paused` (a resume run that died
+   *  before continuing leaves fx's checkpoint intact, so Resume stays
+   *  offered). Absent on live sentinels and on every pre-existing row. */
+  replayed?: boolean;
+}
+
+/**
  * True for `status`-stream chunks that are UI-internal sentinel channels, not
  * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
  * now suppressed-only), `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
- * chip), `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip), and
- * `FX_SESSION_TITLE_STATUS_PREFIX` (feeds the run-row session-title chip) —
- * three fx sentinels in all. Every renderer of raw status events —
- * RunPanel's status dividers, the CLI's `agetor logs` formatter, and the TUI
- * dashboard — must consult this ONE predicate instead of maintaining its own
- * prefix list, so a new sentinel can't silently leak verbatim into one
- * surface while another suppresses it.
+ * chip), `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip),
+ * `FX_SESSION_TITLE_STATUS_PREFIX` (feeds the run-row session-title chip),
+ * and `FX_RECOVERY_STATUS_PREFIX` (feeds the live recovery notice, the
+ * paused/Resume affordance, and CLI/TUI progress lines) — four fx sentinels
+ * in all. Every renderer of raw status events — RunPanel's status dividers,
+ * the CLI's `agetor logs` formatter, and the TUI dashboard — must consult
+ * this ONE predicate instead of maintaining its own prefix list, so a new
+ * sentinel can't silently leak verbatim into one surface while another
+ * suppresses it.
  */
 export function isInternalStatusSentinel(data: string): boolean {
   return (
     data.startsWith(PERMISSION_MODE_STATUS_PREFIX) ||
     data.startsWith(FX_USAGE_STATUS_PREFIX) ||
     data.startsWith(FX_PROVIDER_STATUS_PREFIX) ||
-    data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)
+    data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX) ||
+    data.startsWith(FX_RECOVERY_STATUS_PREFIX)
   );
 }
 
@@ -328,8 +405,9 @@ export interface Harness {
    *    real `HOME` at all.
    *  - fx: emitted as a plain HOME=<home> override — fx has no dedicated
    *    config-dir env var (verified against fx v0.0.4 and v0.0.6, re-verified
-   *    0.0.8 (2026-09-08) — no FX_HOME or FX_CONFIG_DIR in its strings), and
-   *    its state lives hardcoded at
+   *    0.0.8 (2026-09-08) and 0.0.9/0.0.10 (2026-09-14) — no FX_HOME or
+   *    FX_CONFIG_DIR among all 60 FX_* env vars, identical across
+   *    0.0.8/0.0.9/0.0.10), and its state lives hardcoded at
    *    `~/.fx/*`, so isolating an additional account's login/config means
    *    re-homing the whole process, same approach as cursor.
    *  NULL means "inherit the agetor process env". */
@@ -357,6 +435,65 @@ export interface SavedPrompt {
   content: string;
   createdAt: number;
   updatedAt: number;
+}
+
+/**
+ * A reusable, named bundle of harness + model + effort + mode + fast/maxMode
+ * + free-text instructions + skills, picked on task launch instead of
+ * choosing each field by hand. Persisted in the `agent_profiles` table
+ * (`src/bun/db.ts`'s `agentProfiles` module); names are unique
+ * case-insensitively (trimmed). A task created from a profile copies these
+ * fields onto its own row and keeps a point-in-time {@link AgentProfileSnapshot}
+ * — see `Task.agentProfileId` / `Task.agentProfile` below and
+ * `docs/plans/agent-profiles.md` for the full freeze-at-first-run design.
+ */
+export interface AgentProfile {
+  id: string; // uuid
+  name: string; // unique, trimmed, case-insensitive
+  harness: string; // harness id (Task.agent semantics)
+  model: string;
+  effort: string | null;
+  mode: string | null; // null ⇒ defaultModeFor(kind) at spawn
+  fast: boolean; // cursor only
+  maxMode: boolean; // cursor only
+  instructions: string; // may be ""
+  skills: string[]; // bare skill names, no leading "/", deduped, max 50, each ≤ 100 chars
+  createdAt: number;
+  updatedAt: number;
+  /**
+   * Number of tasks currently BOUND to this profile — `tasks.agent_profile_id
+   * = this.id`, every column including archived. Server-derived on every
+   * `/agent-profiles*` HTTP response (`src/bun/server.ts`'s `withTaskCount`/
+   * `withTaskCounts`, backed by `agentProfiles.taskCount`/`taskCounts` in
+   * `src/bun/db.ts`); optional at the type level only because raw db-layer
+   * callers (`agentProfiles.list`/`get`/`insert`/`update` themselves) don't
+   * populate it. Detaching a task (`DELETE /tasks/:id/agent-profile`) or
+   * deleting the task lowers this automatically — a task that only keeps a
+   * frozen `agentProfile` snapshot after detaching is not counted.
+   */
+  taskCount?: number;
+}
+
+/**
+ * What a task keeps: the {@link AgentProfile} as it was when captured, plus
+ * the resolved harness identity (`harnessKind`/`harnessLabel`) so a task
+ * whose profile — or whose profile's harness — has since been deleted can
+ * still render its chip and re-inject its preamble without any lookups.
+ */
+export interface AgentProfileSnapshot {
+  id: string;
+  name: string;
+  harness: string;
+  harnessKind: AgentKind;
+  harnessLabel: string;
+  model: string;
+  effort: string | null;
+  mode: string | null;
+  fast: boolean;
+  maxMode: boolean;
+  instructions: string;
+  skills: string[];
+  capturedAt: number;
 }
 
 export interface HarnessUsage {
@@ -486,7 +623,9 @@ export interface HarnessStatus {
    * (`auth_expired === true && auth_refreshable === false`); `true` for any
    * other reported value — including fx 0.0.8's `auth: "host managed"`
    * (`FX_AUTH_MODE=host-managed`), which the same fail-open fallthrough
-   * tolerates as logged-in rather than gaining a dedicated branch; `null`
+   * tolerates as logged-in rather than gaining a dedicated branch; the
+   * `status --json` field set and this `auth` vocabulary are unchanged
+   * through 0.0.9 and 0.0.10 (re-verified 2026-09-14); `null`
    * when the kind has no login probe, the probe failed, or its output
    * wasn't parseable — `null` must never block a run.
    */
@@ -1066,6 +1205,37 @@ export interface Task {
    */
   issueUrl?: string | null;
   /**
+   * Id of the {@link AgentProfile} this task was launched from, or null.
+   * Set only at create time by `createTask` from `POST /tasks`'s
+   * `agentProfileId` (400 on an unknown id); never patchable (kept out of
+   * `ALLOWED_PATCH_FIELDS` — `PATCH /tasks/:id` instead 409s when it would
+   * touch agent/mode/model/effort/fast/maxMode while this is set). Refreshed
+   * — together with `agentProfile` and the six copied fields — by
+   * `startTask`, but only before the task's first run (the "live-until-
+   * first-run" rule: a not-yet-started task tracks live profile edits,
+   * including a harness change; once a run exists the task is frozen to its
+   * snapshot). Cleared (set to null, alongside `agentProfile`) by
+   * `DELETE /tasks/:id/agent-profile` (archived-guarded). Both this field and
+   * `agentProfile` are written only by `tasks.setAgentProfile` — a targeted
+   * `UPDATE` that never bumps `updated_at` — and are skipped by the generic
+   * `tasks.update` SET clause, same treatment as `sentFiles`/`fxRecovery`.
+   * Optional at the type level only for fixture compatibility (same reason
+   * as `issueUrl`) — `toTask` always sets it.
+   */
+  agentProfileId?: string | null;
+  /**
+   * Point-in-time capture of the profile named by `agentProfileId`, taken
+   * the moment it was bound to this task (see {@link AgentProfileSnapshot}).
+   * This is what the task actually launches with once it has run at least
+   * once — edits or deletion of the live profile afterward have no effect.
+   * Kept in lockstep with `agentProfileId` by the same `tasks.setAgentProfile`
+   * targeted UPDATE (never patchable, excluded from the generic `tasks.update`
+   * SET clause). Null whenever `agentProfileId` is null. Optional at the type
+   * level only for fixture compatibility (same reason as `issueUrl`) —
+   * `toTask` always sets it.
+   */
+  agentProfile?: AgentProfileSnapshot | null;
+  /**
    * Friendly mode id ("auto", "ask", "acceptEdits", "plan", …). Maps to
    * agent-specific CLI flags in `src/bun/agents.ts`. NULL means "use the
    * agent's hands-off default" (back-compat: --dangerously-skip-permissions
@@ -1205,6 +1375,28 @@ export interface Task {
    * as `null`.
    */
   sentFiles?: SentFileEntry[] | null;
+  /**
+   * fx's model-response-recovery state for this task, when it is currently
+   * paused on a resumable Gateway checkpoint — see {@link TaskFxRecovery}
+   * and `docs/plans/fx-recovery-follow-ups.md`. Set at settlement of a
+   * failed fx run whose last recovery sentinel (`FX_RECOVERY_STATUS_PREFIX`)
+   * is resumable, via `tasks.setFxRecovery` (a targeted `UPDATE`, no
+   * `updated_at` bump — same pattern as `sentFiles`/the unread watermarks
+   * above), and cleared back to `null` once the pause chain ends (a normal
+   * turn starts, the run recovers, or the row is torn down on
+   * archive/delete/agent-switch). Server-managed: not in
+   * `ALLOWED_PATCH_FIELDS`, and excluded from the generic `tasks.update` SET
+   * clause for the same "an unrelated PATCH must not clobber a live
+   * auto-resume schedule" reason `sent_files` is excluded. `null` for every
+   * task that isn't currently paused — including every task that has never
+   * paused at all.
+   *
+   * Optional (rather than required) for the same fixture-compatibility
+   * reason as `sentFiles`: the many hand-built `Task` fixtures across
+   * `src/bun/*.test.ts` predate this field — `db.ts` always populates it on
+   * read, so runtime code can treat a missing key the same as `null`.
+   */
+  fxRecovery?: TaskFxRecovery | null;
   /**
    * Whether this task has assistant messages the user hasn't seen yet —
    * `last_assistant_event_id > last_seen_event_id` (both watermarks live on
@@ -1446,11 +1638,13 @@ export interface Task {
    * Transient (in-memory on the server, decorated onto API responses — never
    * persisted): `Date.now()` when the turn-stall watchdog flagged this
    * task's in-flight turn as possibly stuck (see
-   * {@link TURN_STALLED_STATUS_PREFIX}). Cleared when transcript activity
-   * resumes, the turn settles, or the run is cancelled. Null/absent means
-   * not stalled. Resets on server restart by design — the watchdog re-fires
-   * within one threshold window if the session is still wedged after a
-   * reattach.
+   * {@link TURN_STALLED_STATUS_PREFIX}). Cleared only when the driver itself
+   * emits the companion "resumed" sentinel (transcript activity picked back
+   * up) — a settled or cancelled turn is not explicitly cleared here; the
+   * mark is transient in-memory state that a server restart also resets by
+   * design, and the watchdog re-fires within one threshold window if the
+   * session is still wedged after a reattach. Null/absent means not
+   * stalled.
    */
   stalledSince?: number | null;
 }
@@ -1818,6 +2012,97 @@ export interface SentFileEntry {
   runId: string;
 }
 
+/**
+ * Persisted shape of `task.fxRecovery` (`tasks.fx_recovery` JSON column,
+ * migration 051) — fx's model-response-recovery state for one task, plus the
+ * orchestrator's own auto-resume schedule/counter layered on top. `"paused"`
+ * is the only state ever stored: the row is `null` (not an object with some
+ * other `state`) whenever the task isn't currently paused, so a consumer
+ * only ever needs to null-check, never switch on `state`. See
+ * `docs/plans/fx-recovery-follow-ups.md` §3 for the full design and
+ * `src/shared/fx-recovery.ts`'s `parseTaskFxRecovery` for the tolerant
+ * parser. Written only by `tasks.setFxRecovery` — see {@link Task.fxRecovery}
+ * for the write-path rules (targeted UPDATE, no `updated_at` bump, not
+ * patchable).
+ */
+export interface TaskFxRecovery {
+  /** The only value ever stored — a non-paused task has a `null` row
+   *  instead of an object with a different `state`. */
+  state: "paused";
+  /** The failed run whose last `FX_RECOVERY_STATUS_PREFIX` sentinel paused
+   *  (the run `resumeFxRecovery` acts on). */
+  runId: string;
+  /** Unix ms timestamp when this pause was recorded. */
+  pausedAt: number;
+  /** Copied verbatim from that sentinel's `FxRecoveryPayload` — see
+   *  {@link FxRecoveryPayload} for what each means. Omitted when the
+   *  sentinel didn't carry them. */
+  cause?: string;
+  attempt?: number;
+  attemptLimit?: number;
+  message?: string;
+  /** The orchestrator's pending auto-resume timer for this pause, or `null`
+   *  when none is scheduled (auto-resume off, the cap was hit, the user
+   *  cancelled it, or a continue-recovery run is currently in flight — see
+   *  `autoResumeStopped`). `at` is the fire time (ms epoch); `attempt` is
+   *  the 1-based auto-resume attempt this timer will fire as; `max` is
+   *  `FX_AUTO_RESUME_MAX` at schedule time; `delaySec` is the preference
+   *  value used to compute `at`, kept alongside it so a countdown can be
+   *  rendered without re-reading preferences. */
+  autoResume: { at: number; attempt: number; max: number; delaySec: number } | null;
+  /** Automatic resumes already fired in this pause chain (a chain is a
+   *  pause → auto-resume → pause → … run that hasn't yet recovered or been
+   *  cleared). Reset to 0 only when the row itself is cleared — a manual
+   *  Resume that re-pauses continues the same chain's count. */
+  autoResumeCount: number;
+  /** Why no auto-resume timer is currently pending — omitted (not present)
+   *  while one IS pending. `"exhausted"`: the chain hit `FX_AUTO_RESUME_MAX`.
+   *  `"cancelled"`: the user (or an implicit cancel — new message, manual
+   *  Resume, Stop, archive, delete, agent switch) cancelled it.
+   *  `"disabled"`: the `fxAutoResume` preference was off at schedule time.
+   *  `"failed"`: a timer DID fire, but the resume it tried to start
+   *  couldn't (`resumeFxRecovery`'s gate rejected it, or the spawn itself
+   *  threw) — surfaced as the persisted `auto-resume could not start: …`
+   *  status line. Distinct from `"cancelled"`, which is reserved for an
+   *  explicit user/Stop cancel via `cancelFxAutoResume`: a `"failed"` row
+   *  was never cancelled, it tried and couldn't start. */
+  autoResumeStopped?: "exhausted" | "cancelled" | "disabled" | "failed";
+}
+
+/**
+ * Preference key gating fx's automatic-resume engine
+ * (`docs/plans/fx-recovery-follow-ups.md`): value `"on"` (or missing — on by
+ * default) enables it, `"off"` disables it. Read via `parseFxAutoResumePrefs`
+ * in `src/shared/fx-recovery.ts`. Round-tripped by `agetor config` and the
+ * Settings → General switch (`settings-fx-auto-resume`).
+ */
+export const FX_AUTO_RESUME_PREF = "fxAutoResume";
+
+/**
+ * Preference key for the auto-resume delay, in whole seconds, clamped to
+ * `[FX_AUTO_RESUME_MIN_DELAY_SEC, FX_AUTO_RESUME_MAX_DELAY_SEC]`; missing or
+ * unparsable falls back to `FX_AUTO_RESUME_DEFAULT_DELAY_SEC`. Read via
+ * `parseFxAutoResumePrefs`; edited via the Settings → General number input
+ * (`settings-fx-auto-resume-delay`) or `agetor config`.
+ */
+export const FX_AUTO_RESUME_DELAY_PREF = "fxAutoResumeDelaySec";
+
+/** Default `fxAutoResumeDelaySec` when the preference is unset or
+ *  unparsable — chosen from a live smoke where a resume still absorbed
+ *  several more 429s before recovering (see the plan's §2 "Live facts"). */
+export const FX_AUTO_RESUME_DEFAULT_DELAY_SEC = 120;
+
+/** Lower clamp bound for `fxAutoResumeDelaySec`. */
+export const FX_AUTO_RESUME_MIN_DELAY_SEC = 10;
+
+/** Upper clamp bound for `fxAutoResumeDelaySec`. */
+export const FX_AUTO_RESUME_MAX_DELAY_SEC = 3600;
+
+/** Maximum automatic resumes fired per pause chain before the orchestrator
+ *  gives up and leaves `autoResumeStopped: "exhausted"` for the user to
+ *  resume manually. */
+export const FX_AUTO_RESUME_MAX = 3;
+
 export interface AgentOption {
   /** Stored on the task and passed to `buildCommand`. */
   id: string;
@@ -1833,8 +2118,10 @@ export interface AgentOption {
    * account can't run: the Gateway catalog is account-scoped — 230 ids
    * unauthenticated vs 158 on a standard plan, measured 2026-08-27 on fx
    * 0.0.6. 2026-09-08: unauth catalog reads 244 on both 0.0.7 and 0.0.8
-   * (Gateway-side growth, not a binary property); all curated ids present;
-   * signed-in view still unverifiable (token expired).
+   * (Gateway-side growth, not a binary property); all curated ids present.
+   * Latest: 2026-09-14, unauth catalog reads 247 on 0.0.8, 0.0.9 and 0.0.10
+   * alike (Gateway-side, not client-version-dependent); all 28 curated ids
+   * still present; signed-in view still unverifiable (token expired).
    */
   catalogOnly?: boolean;
 }
@@ -1916,6 +2203,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // signed-in 158-id account could not be re-checked this pass (expired
   // login token). Re-verified 2026-09-08 and 0.0.8 (`builtins/gateway.zig
   // default_model`): compiled default still moonshotai/kimi-k3, unchanged.
+  // Latest: 2026-09-14 on 0.0.9 and 0.0.10 — compiled default still
+  // moonshotai/kimi-k3, unauth catalog grown to 247 ids, zai/glm-5.3-flash
+  // still present; signed-in 158-id account still unverifiable.
   "fx": "zai/glm-5.3-flash",
 };
 
@@ -1947,11 +2237,16 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // concurrent tasks). MODEL_EFFORT_SUPPORT.gemini is empty for every model
   // so the picker collapses; this default is unused but kept for symmetry.
   "gemini": "high",
-  // fx has no per-invocation effort/reasoning flag (its models are routed
-  // through the Vercel AI Gateway verbatim, with no CLI-level effort knob).
-  // MODEL_EFFORT_SUPPORT.fx is empty for every model so the picker collapses;
-  // this default is unused but kept for symmetry.
-  "fx": "high",
+  // fx's own default reasoning level (owner decision D1,
+  // docs/plans/fx-0.0.10-compat.md §8): a new fx task runs exactly as fx
+  // itself would — `auto` is what every effort-advertising fx model reports
+  // as `currentValue` on `session/new`, and the driver only sends
+  // `set_config_option effort=auto` when a resumed session's persisted
+  // value has drifted from it. `high`/`max`/… stay one explicit click away
+  // in the picker; this is deliberately not the house `high` convention the
+  // other four kinds use, since that would silently change every fx run's
+  // cost/latency on the owner's rate-limited free-tier Gateway account.
+  "fx": "auto",
 };
 
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
@@ -2333,19 +2628,27 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   "gemini": { code: "auto", plan: "ask" },
   // fx has three of its own permission modes (yolo/auto/ask — see
   // AGENT_OPTIONS.fx.modes below). Like every other kind, Code resolves to
-  // modes[0] — "auto" (fx's LLM auto-review resolves most tool calls;
-  // anything unresolved surfaces as an approval card) — the
-  // hands-off-but-reviewed default, not "yolo" (permission checks disabled
-  // entirely): a Plan→Code pill round-trip must not escalate a task past
-  // what it started at. "yolo" stays reachable only as an explicit picker
-  // choice. Plan resolves to "ask" (only pre-approved rules run; everything
-  // else surfaces as an approval card).
-  "fx": { code: "auto", plan: "ask" },
+  // modes[0] — now "yolo" ("Full access"), fx's actual hands-off mode. On a
+  // standard-plan Gateway account fx's hard-wired auto-reviewer
+  // (openai/gpt-5.6-luna) answers 403, so "auto" holds every tool call
+  // instead of reviewing it and the agent replans into the free-tier rate
+  // limit chasing an approval that will never come (see
+  // docs/plans/fix-fx-harness-rate-limit.md). "auto" and "ask" stay reachable
+  // only as explicit picker choices. A `null` stored mode now ALSO spawns as
+  // "yolo" via the shared `defaultModeFor("fx")` (see that function below) —
+  // an owner-requested reversal of the earlier "no silent escalation" rule
+  // (docs/plans/fx-recovery-follow-ups.md §3.6): every fx task, including
+  // ones created before this change, now defaults to Full access unless it
+  // has an explicit stored mode. Plan still resolves to "ask" (only
+  // pre-approved rules run; everything else surfaces as an approval card).
+  "fx": { code: "yolo", plan: "ask" },
 };
 
 /**
- * Canonical effort levels exposed in the UI, ordered **highest → lowest**.
- * Not every (agent, model) combo accepts every level — see
+ * Canonical effort levels exposed in the UI, ordered **highest → lowest**,
+ * with one exception: `auto` is off-scale (it doesn't sit on the
+ * high↔low ladder — it means "let the model/gateway decide") and is always
+ * listed last. Not every (agent, model) combo accepts every level — see
  * `MODEL_EFFORT_SUPPORT` below.
  *
  * Mapping per agent (see `src/bun/agents.ts`):
@@ -2354,8 +2657,14 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  *                   low → "think"        medium → "think hard"
  *                   high → "think harder" xhigh → "think very hard"
  *                   max → "ultrathink"
+ *   fx          → `session/set_config_option {configId:"effort", value:<id>}`
+ *                   over ACP (fx ≥0.0.9); ids map to fx's own values verbatim.
  *
- * `none` is currently used only by GPT-5.6-family Codex models.
+ * `none` is currently used only by GPT-5.6-family Codex models and by
+ * effort-advertising fx models whose Gateway catalog entry lists it.
+ * `auto` is used only by fx tables (`MODEL_EFFORT_SUPPORT.fx`) — no other
+ * kind's model lists it, and `DEFAULT_EFFORT.fx` is the only default that
+ * resolves to it.
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
@@ -2366,6 +2675,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
   { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
   { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
+  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx only today (fx's `auto`, its 'default' option). fx-only by construction: curated tables and the discovered branch both keep it off every other kind." },
 ];
 
 /**
@@ -2461,38 +2771,54 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
   },
-  // Empty for every model: fx has no per-invocation effort/reasoning flag —
-  // its models route through the Vercel AI Gateway verbatim with no CLI-level
-  // knob to tune. Same treatment as gemini above.
+  // fx ≥0.0.9 exposes reasoning effort per ACP session: `session/new`,
+  // `session/resume` and `session/load` results carry a third
+  // `configOptions` entry (`{id:"effort", currentValue, options:[...]}`)
+  // whenever the active model's Gateway catalog entry advertises
+  // `reasoning_options`, and `session/set_config_option
+  // {configId:"effort", value}` sets it — driven by `src/bun/fx-acp.ts`.
+  // This table is the per-model set **live-probed on fx 0.0.10** (spike
+  // `fx-0010-efforts`, 2026-09-14) across all 28 curated ids: 16 models
+  // advertise an effort set (always ending in `auto`, fx's own default —
+  // what every effort-advertising model reports as `currentValue`), 12
+  // advertise none — their Gateway catalog entry carries no
+  // `reasoning_options` at all — and stay `[]`, same treatment as gemini
+  // above (the picker collapses). An unknown/discovered-only fx id falls
+  // back to `DEFAULT_MODEL.fx`'s set via `supportedEfforts`, and the driver
+  // validates at runtime against whatever `effort` option fx actually
+  // returns for that session — so drift between this curated table and the
+  // live Gateway catalog is only a picker-hint problem, never a failed run
+  // (an unoffered value degrades to a status breadcrumb). Ids map to fx's
+  // own values verbatim (`low|medium|high|xhigh|max|none|auto`).
   fx: {
-    "zai/glm-5.3-flash": [],
+    "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
     "zai/glm-5v-turbo": [],
     "zai/glm-4.7": [],
-    "openai/gpt-5.2": [],
-    "openai/gpt-5.1-codex-max": [],
-    "openai/gpt-5.4-mini": [],
+    "openai/gpt-5.2": ["xhigh", "high", "medium", "low", "none", "auto"],
+    "openai/gpt-5.1-codex-max": ["xhigh", "high", "medium", "low", "auto"],
+    "openai/gpt-5.4-mini": ["xhigh", "high", "medium", "low", "none", "auto"],
     "spacexai/grok-4.6": [],
     "spacexai/grok-build-0.1": [],
     "moonshotai/kimi-k2.7-code": [],
-    "deepseek/deepseek-v4-flash": [],
+    "deepseek/deepseek-v4-flash": ["xhigh", "high", "auto"],
     "minimax/minimax-m3": [],
     "alibaba/qwen3.8-flash": [],
     "alibaba/qwen3-coder-plus": [],
     "mistral/devstral-2": [],
     "google/gemini-2.5-flash": [],
     "anthropic/claude-3-haiku": [],
-    "anthropic/claude-opus-5": [],
-    "anthropic/claude-sonnet-5": [],
-    "openai/gpt-5.5": [],
-    "google/gemini-3.1-pro-preview": [],
-    "google/gemini-3.8-flash": [],
-    "moonshotai/kimi-k3": [],
-    "anthropic/claude-fable-5.1": [],
+    "anthropic/claude-opus-5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "anthropic/claude-sonnet-5": ["xhigh", "high", "medium", "low", "auto"],
+    "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "none", "auto"],
+    "google/gemini-3.1-pro-preview": ["high", "medium", "low", "auto"],
+    "google/gemini-3.8-flash": ["high", "medium", "low", "auto"],
+    "moonshotai/kimi-k3": ["max", "high", "low", "auto"],
+    "anthropic/claude-fable-5.1": ["xhigh", "high", "medium", "low", "auto"],
     "anthropic/claude-haiku-4.5": [],
-    "openai/gpt-6-astra": [],
-    "openai/gpt-5.6-sol": [],
-    "zai/glm-5.3": [],
-    "deepseek/deepseek-v4-pro": [],
+    "openai/gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "zai/glm-5.3": ["max", "high", "low", "auto"],
+    "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
   },
 };
 
@@ -2510,10 +2836,15 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * set for this exact model, when a caller has one (see `ModelOption.efforts`
  * and `discoveredEffortsFor` in `src/shared/model-options.ts`). Precedence:
  * a non-empty `discoveredEfforts` wins outright — the result is
- * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order) — unless
- * none of its ids are known to agetor, in which case we fall through to the
- * curated table below. `undefined`, `null`, or an empty array behave exactly
- * like the two-argument call (today's curated-table-only behaviour). The
+ * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order), with
+ * `auto` additionally dropped from the filter for every kind but fx (`auto`
+ * is fx-only by construction — see the `EFFORT_OPTIONS` row comment — so a
+ * non-fx harness that discovers an `auto` id, e.g. codex's `model/list
+ * supportedReasoningEfforts`, must never surface a "Model default" row) —
+ * unless that leaves none of its ids known to agetor, in which case we fall
+ * through to the curated table below. `undefined`, `null`, or an empty array
+ * behave exactly like the two-argument call (today's curated-table-only
+ * behaviour). The
  * curated table stays the fallback rather than the source of truth because
  * discovery is best-effort and account-scoped (a harness may be absent,
  * unauthenticated, or on an older CLI that can't discover at all): the
@@ -2534,7 +2865,14 @@ export function supportedEfforts(
   if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
   if (discoveredEfforts && discoveredEfforts.length > 0) {
     const discoveredAllowed = new Set(discoveredEfforts);
-    const fromDiscovery = EFFORT_OPTIONS.filter((o) => discoveredAllowed.has(o.id));
+    // `auto` is fx-only by construction (see the EFFORT_OPTIONS row comment):
+    // a non-fx harness that happens to discover an "auto" id (e.g. codex's
+    // `model/list supportedReasoningEfforts`) must not surface a "Model
+    // default" row or pass `auto` through to a flag that doesn't understand
+    // it, so it's dropped from the discovered set before filtering for every
+    // kind but fx.
+    const fromDiscovery = EFFORT_OPTIONS.filter((o) =>
+      discoveredAllowed.has(o.id) && (agent === "fx" || o.id !== "auto"));
     if (fromDiscovery.length > 0) return fromDiscovery;
   }
   const key = model ?? DEFAULT_MODEL[agent];
@@ -2614,6 +2952,30 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
     ?? [],
   );
   return AGENT_OPTIONS[agent].modes.filter((m) => !deny.has(m.id));
+}
+
+/**
+ * The single spawn-time AND picker default for a stored `null` mode — every
+ * kind's `modes[0]` is `"auto"` except fx, whose `modes[0]` is `"yolo"`
+ * ("Full access"; see `AGENT_OPTIONS.fx.modes` and the `CODE_PLAN_MODE.fx`
+ * comment). Used by every spawn branch in `src/bun/agents.ts`'s
+ * `buildCommand`/`spawnAgent`, by `reconcileTaskSession`, by `agetor add`'s
+ * non-interactive default, and by the webview's mode dropdown fallback for a
+ * `null` row (RunPanel's `nullModeFallback`) and its reset on switching a
+ * task's agent kind. `createTask` still stores `null` for an unset mode —
+ * only resolution at spawn/display time changed — so this function, not a
+ * stored value, is the one place "what does null mean" can drift.
+ *
+ * This supersedes the earlier "a stored null still spawns as auto (even for
+ * fx)" rule: the owner explicitly asked for fx's hands-off default to
+ * escalate to Full access (`docs/plans/fx-recovery-follow-ups.md` §3.6),
+ * since fx's `auto` mode blocks on an interactive permission card whenever
+ * its hard-wired reviewer is unreachable (see the fx harness section of
+ * CLAUDE.md) — `auto` is not actually hands-off for fx the way it is for
+ * every other kind.
+ */
+export function defaultModeFor(kind: AgentKind): string {
+  return AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
 }
 
 export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
@@ -2727,6 +3089,10 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // openai/gpt-6-astra, openai/gpt-5.6-sol, zai/glm-5.3, deepseek/deepseek-v4-pro),
     // bringing catalogOnly to twelve rows total — same "offered only when the
     // signed-in account's catalog includes it" treatment as the original six.
+    // Latest: 2026-09-14, unauth catalog reads 247 ids on 0.0.8, 0.0.9 and
+    // 0.0.10 alike (Gateway-side, not client-version-dependent); all 28
+    // curated ids (16 standard + 12 catalogOnly) still present; signed-in
+    // view still unverifiable (token expired).
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -2758,12 +3124,15 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
-      { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; anything unresolved surfaces as an approval card." },
-      { id: "yolo", label: "Full access", hint: "Disables fx's permission checks — what fx 0.0.8 calls --full-access / /permissions full-access; yolo is fx's surviving alias and stays agetor's stored id." },
+      { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
+      { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // No model in MODEL_EFFORT_SUPPORT.fx accepts the effort flag, so the
-    // picker collapses for every model — see EFFORT_OPTIONS list comment.
+    // 16 of the 28 curated models accept the effort flag (see
+    // MODEL_EFFORT_SUPPORT.fx — live-probed on fx 0.0.10); the other 12
+    // report an empty set and the picker collapses for those, same as any
+    // other kind's no-effort models. Every id-supported model always
+    // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
     efforts: EFFORT_OPTIONS,
   },
 };
@@ -3536,15 +3905,103 @@ export type RunEventStream =
  *  via `GET /tasks/:id/events/page`. */
 export const EVENTS_REPLAY_LIMIT = 800;
 
+/**
+ * Byte budget for the SSE replay window (`GET /tasks/:id/events`), applied
+ * ON TOP OF `EVENTS_REPLAY_LIMIT` — the two caps are ANDed, whichever binds
+ * first wins. Measured on the owner's live tasks: the 800-event count cap
+ * alone let a replay window weigh 61 MB, 4.9 MB or 4.5 MB (single events up
+ * to 1.37 MB), which is what made opening a task with a large transcript
+ * feel like it hung (`docs/plans/task-details-blank-while-session-restores.md`
+ * §2, §3.3). The budget applies to the SUM of the window's event `data`
+ * lengths, not to any individual event — no single event is ever truncated
+ * to fit. Older history stays reachable via "Load earlier"
+ * (`GET /tasks/:id/events/page`, budgeted separately by
+ * `EVENTS_PAGE_MAX_BYTES`).
+ */
+export const EVENTS_REPLAY_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Byte budget for one "Load earlier" page (`GET /tasks/:id/events/page`).
+ * Smaller than `EVENTS_REPLAY_MAX_BYTES` because a page fetch is a
+ * foreground, user-triggered wait (the click), where the initial replay is a
+ * background SSE connect the user isn't staring at a spinner for. Same
+ * whole-window-only semantics: individual events are never truncated.
+ */
+export const EVENTS_PAGE_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Floor on how many events a byte-budgeted window (replay, page, or
+ * rebuild) always keeps, regardless of `EVENTS_REPLAY_MAX_BYTES` /
+ * `EVENTS_PAGE_MAX_BYTES`. Without this floor, a task whose single newest
+ * event alone exceeds the byte budget (a large tool_result, a long pasted
+ * diff, …) would clamp its window to zero events and render nothing — the
+ * floor guarantees at least this many of the newest events always show, even
+ * if that means exceeding the byte budget for that one window.
+ */
+export const MIN_REPLAY_EVENTS = 20;
+
 /** Max number of events the run panel keeps in webview memory for one task.
  *  When live streaming pushes past this, the oldest events are trimmed and the
  *  "Load earlier" affordance re-appears. */
 export const EVENTS_WINDOW_MAX = 3000;
 
+/**
+ * Event-count ceiling on extending the first-load window (SSE replay and the
+ * `?limit=` auto-rebuild snapshot) back to the newest main-stream `user`
+ * event, so opening a task shows at least the user's most recent message
+ * without a "Load earlier" click — see
+ * `docs/plans/first-load-reaches-last-user-message.md`. Deliberately equal
+ * to `EVENTS_WINDOW_MAX`: the webview's own SSE-flush trim
+ * (`eventWindowKeepCount` in RunPanel) caps rendered history at that many
+ * events anyway, so a larger anchored window could never actually be shown —
+ * extending past it would only cost bytes on the wire for nothing. The
+ * extension is ALL-OR-NOTHING: when the span from the anchor event to the
+ * newest event exceeds this many events (or `EVENTS_REPLAY_ANCHOR_MAX_BYTES`
+ * below), the default window (`EVENTS_REPLAY_LIMIT` / `EVENTS_REPLAY_MAX_BYTES`,
+ * floor `MIN_REPLAY_EVENTS`) is returned unchanged rather than partially
+ * extended — a partial extension still leaves the user clicking, for extra
+ * complexity with no real payoff. On a task that is still RUNNING the
+ * guarantee is first-paint only: the same `EVENTS_WINDOW_MAX` trim drops the
+ * oldest event for every live event that arrives past the cap, so an anchored
+ * window that arrived at (or near) the ceiling loses its anchor as the agent
+ * keeps streaming — inherent to any bounded window, and the reason a finished
+ * task is the case this ceiling is tuned for. The route also takes
+ * `?anchor=0` to skip the extension (used by the TUI dashboard, which keeps
+ * far fewer lines than this and would only pay for bytes it discards).
+ */
+export const EVENTS_REPLAY_ANCHOR_MAX_EVENTS = EVENTS_WINDOW_MAX;
+
+/**
+ * Byte ceiling for the same first-load anchor extension described above —
+ * ANDed with `EVENTS_REPLAY_ANCHOR_MAX_EVENTS` (both must fit, or the
+ * default window stands). Four times `EVENTS_REPLAY_MAX_BYTES`: a generous
+ * worst case for the one-time cost of showing the user's last message
+ * inline, while the pathological transcript that motivated the byte budget
+ * in the first place (measured 61 MB on an 800-event window — see
+ * `EVENTS_REPLAY_MAX_BYTES` above) still falls back to today's 4 MB window
+ * rather than shipping tens of megabytes on open.
+ */
+export const EVENTS_REPLAY_ANCHOR_MAX_BYTES = 16 * 1024 * 1024;
+
 /** Named SSE event (`event: replay_meta`) sent as the FIRST frame of
  *  `GET /tasks/:id/events`, before the replayed window. Unnamed `message`
  *  listeners ignore it, so old clients are unaffected. */
 export const TASK_EVENTS_REPLAY_META_EVENT = "replay_meta";
+
+/**
+ * Bound on how long `POST /runs/:id/input` and `POST /tasks/:id/start` will
+ * hold their HTTP response waiting for the agent's spawn to settle (e.g. a
+ * claude `--resume` session boot, which can take 5–30s — see
+ * `docs/plans/task-details-blank-while-session-restores.md` §2). The run
+ * row, the `running` column flip and the initial `user` event are already
+ * persisted well before the spawn resolves, which is all the webview needs
+ * to render — so once this budget elapses the response returns immediately
+ * with `pending: true` and the spawn keeps running detached; the caller
+ * learns the outcome from the task/run's normal SSE stream instead of from
+ * the HTTP response. When the spawn settles inside the budget, the response
+ * is byte-identical to today's (no `pending` key at all).
+ */
+export const SPAWN_RESPONSE_BUDGET_MS = 1500;
 
 /** Payload of the {@link TASK_EVENTS_REPLAY_META_EVENT} frame. */
 export interface TaskEventsReplayMeta {
@@ -3716,6 +4173,52 @@ export type GlobalEvent =
       count: number;
       caption: string | null;
       proactive: boolean;
+      ts: number;
+    }
+  | {
+      /**
+       * fx auto-resume lifecycle transition for a paused task (see
+       * {@link TaskFxRecovery} and `docs/plans/fx-recovery-follow-ups.md`).
+       * Live-only — a replayed historical schedule/cancel must not
+       * re-notify — so the UI can drive a toast (`fired` → info,
+       * `exhausted` → error; `scheduled`/`cancelled`/`disabled` are silent
+       * on the toast layer, driving only the card/notice/context-menu state
+       * via the task's own `fxRecovery` field). Mirrors `files-sent`'s
+       * "live-only, never replayed" contract.
+       */
+      kind: "fx-auto-resume";
+      taskId: string;
+      /** `"scheduled"` — a timer was armed. `"fired"` — the timer fired and
+       *  a resume run was spawned. `"cancelled"` — the pending timer was
+       *  cancelled (explicitly or implicitly — new message, manual Resume,
+       *  Stop, archive, delete, agent switch). `"exhausted"` — the chain hit
+       *  `FX_AUTO_RESUME_MAX` with no further timer scheduled.
+       *  `"disabled"` — the `fxAutoResume` preference was off at schedule
+       *  time, so no timer was armed. */
+      state: "scheduled" | "fired" | "cancelled" | "exhausted" | "disabled";
+      /** Scheduled fire time (ms epoch) — present only for `state:
+       *  "scheduled"`. */
+      at?: number;
+      /**
+       * The auto-resume attempt this event concerns (1-based) — but what it
+       * COUNTS differs by `state`, so read it against the state it's
+       * attached to, not in isolation (mirrors `TaskFxRecovery.autoResume`'s
+       * `attempt`; see `recordFxPause` in `src/bun/orchestrator.ts` for the
+       * canonical statement of this convention):
+       *  - `"scheduled"` / `"fired"` — the ordinal of the attempt being
+       *    armed or fired, i.e. `autoResumeCount + 1` at the moment the
+       *    timer was set, echoed back unchanged when it fires.
+       *  - `"disabled"` — the ordinal that WOULD have been scheduled had the
+       *    `fxAutoResume` preference been on (`autoResumeCount + 1`) — there
+       *    is no real attempt to number, so this reports what was skipped.
+       *  - `"exhausted"` — always `FX_AUTO_RESUME_MAX` (the cap itself, same
+       *    value as `max`), not `autoResumeCount` — pinned to the named
+       *    constant to document "we stopped AT the cap" rather than lean on
+       *    an incidental equality between a counter and a constant.
+       */
+      attempt: number;
+      /** `FX_AUTO_RESUME_MAX` at the time this event fired. */
+      max: number;
       ts: number;
     };
 

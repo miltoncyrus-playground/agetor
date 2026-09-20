@@ -10,6 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { AgentProfilesSection } from "@/components/settings/AgentProfilesSection";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
@@ -17,6 +18,7 @@ import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/platform";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
+import { FX_AUTO_RESUME_MAX, parseFxAutoResumeDelayInput } from "@/lib/fx-auto-resume-prefs";
 import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
@@ -34,6 +36,8 @@ import {
   FONT_SIZE_DEFAULT,
   FONT_SIZE_MAX,
   FONT_SIZE_MIN,
+  FX_AUTO_RESUME_MAX_DELAY_SEC,
+  FX_AUTO_RESUME_MIN_DELAY_SEC,
   HARNESS_TEMPLATES,
   THEME_PREFERENCES,
   type AgentKind,
@@ -66,6 +70,11 @@ interface Props {
   /** Whether sent user messages pin to the top of the transcript. */
   stickyUserMessages: boolean;
   onStickyUserMessagesChange: (sticky: boolean) => void;
+  /** Current fx auto-resume preference pair (`FX_AUTO_RESUME_PREF` /
+   *  `FX_AUTO_RESUME_DELAY_PREF`, parsed via `parseFxAutoResumePrefs`) —
+   *  see `docs/plans/fx-recovery-follow-ups.md` §3. */
+  fxAutoResume: { enabled: boolean; delaySec: number };
+  onFxAutoResumeChange: (next: { enabled: boolean; delaySec: number }) => void;
   /** Refresh agents/harnesses on the parent after CRUD operations. */
   onChange?: () => void;
   /** Resolved home dir from `GET /defaults` — used to expand `~` in templates. */
@@ -180,38 +189,65 @@ function uniqueHarnessId(base: string, existing: Set<string>): string {
   return `${prefix}${n}`;
 }
 
-/** If `err` is the server's "harness in use" 409 (which carries a structured
- *  `taskIds` list), resolve those ids to titles and return a human-readable
- *  description for the failure toast. Returns null if the error isn't that
- *  shape — caller falls back to the raw `error` message. */
+/** If `err` is the server's "harness in use" 409 (which carries structured
+ *  `taskIds` and/or `profileIds` lists — a harness delete is refused when
+ *  either a task or an agent profile still references it, see
+ *  `HarnessInUseError`), resolve those ids to names and return a
+ *  human-readable description for the failure toast. Returns null if the
+ *  error isn't that shape (or carries neither list) — caller falls back to
+ *  the raw `error` message. */
 async function describeHarnessInUse(err: unknown): Promise<string | null> {
   if (!(err instanceof ApiError)) return null;
   const body = err.body;
   if (!body || typeof body !== "object") return null;
-  const taskIds = (body as { taskIds?: unknown }).taskIds;
-  if (!Array.isArray(taskIds) || taskIds.length === 0) return null;
-  const ids = taskIds.filter((x): x is string => typeof x === "string");
-  if (ids.length === 0) return null;
-  let titles: string[];
-  try {
-    const tasks = await api.listTasks();
-    const byId = new Map(tasks.map((t) => [t.id, t.title]));
-    titles = ids.map((id) => byId.get(id) ?? `${id.slice(0, 8)}…`);
-  } catch {
-    // Listing tasks failed — fall back to id prefixes so the toast still
-    // identifies *which* tasks are blocking, even if not by name.
-    titles = ids.map((id) => `${id.slice(0, 8)}…`);
+  const rawTaskIds = (body as { taskIds?: unknown }).taskIds;
+  const rawProfileIds = (body as { profileIds?: unknown }).profileIds;
+  const taskIds = Array.isArray(rawTaskIds) ? rawTaskIds.filter((x): x is string => typeof x === "string") : [];
+  const profileIds = Array.isArray(rawProfileIds)
+    ? rawProfileIds.filter((x): x is string => typeof x === "string")
+    : [];
+  if (taskIds.length === 0 && profileIds.length === 0) return null;
+
+  const segments: string[] = [];
+  if (taskIds.length > 0) {
+    let titles: string[];
+    try {
+      const tasks = await api.listTasks();
+      const byId = new Map(tasks.map((t) => [t.id, t.title]));
+      titles = taskIds.map((id) => byId.get(id) ?? `${id.slice(0, 8)}…`);
+    } catch {
+      // Listing tasks failed — fall back to id prefixes so the toast still
+      // identifies *which* tasks are blocking, even if not by name.
+      titles = taskIds.map((id) => `${id.slice(0, 8)}…`);
+    }
+    const noun = titles.length === 1 ? "task" : "tasks";
+    segments.push(`${titles.length} ${noun}: ${titles.join(", ")}`);
   }
-  const noun = titles.length === 1 ? "task" : "tasks";
-  return `In use by ${titles.length} ${noun}: ${titles.join(", ")}`;
+  if (profileIds.length > 0) {
+    let names: string[];
+    try {
+      const profiles = await api.listAgentProfiles();
+      const byId = new Map(profiles.map((p) => [p.id, p.name]));
+      names = profileIds.map((id) => byId.get(id) ?? `${id.slice(0, 8)}…`);
+    } catch {
+      names = profileIds.map((id) => `${id.slice(0, 8)}…`);
+    }
+    const noun = names.length === 1 ? "agent" : "agents";
+    segments.push(`${names.length} ${noun}: ${names.join(", ")}`);
+  }
+  return `In use by ${segments.join(" and ")}`;
 }
 
-export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, onChange, homeDir, dataDir, initialSection }: Props) {
+export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection }: Props) {
   const [version, setVersion] = useState<string>("");
   const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
   const [tmuxSource, setTmuxSource] = useState<"system" | "bundled">("system");
   const [bundledTmuxAvailable, setBundledTmuxAvailable] = useState(false);
+  // Default-on kill switch for spawning agents through the macOS "disclaim"
+  // helper — see src/bun/disclaim.ts. Only the literal stored value "false"
+  // turns it off; unset/anything-else reads as on, matching disclaimEnabled().
+  const [disclaimSpawnedAgents, setDisclaimSpawnedAgents] = useState(true);
   const [view, setView] = useState<SettingsView>(initialView());
   // Mirrors `view` for use inside async callbacks (e.g. the Editor's
   // onSubmit) so they can tell, after an await, whether the user navigated
@@ -258,6 +294,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     }
     setTmuxSource(tmux.source);
     setBundledTmuxAvailable(tmux.bundledAvailable);
+    // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
+    setDisclaimSpawnedAgents(prefs["disclaimSpawnedAgents"] !== "false");
   };
 
   const onPickTmuxSource = async (source: "system" | "bundled") => {
@@ -284,6 +322,17 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     const map = new Map(payload.statuses.map((s) => [s.harnessId, s]));
     return map;
   }, [payload.statuses]);
+
+  const onDisclaimSpawnedAgentsChange = (enabled: boolean) => {
+    setDisclaimSpawnedAgents(enabled);
+    // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
+    void api.setPreference("disclaimSpawnedAgents", String(enabled)).catch(() => {
+      // Revert only if this failed write is still the latest selection —
+      // mirrors App.tsx's onStickyUserMessagesChange guard so a subsequent
+      // click can't be stomped by an older, now-resolving request.
+      setDisclaimSpawnedAgents((current) => current === enabled ? !enabled : current);
+    });
+  };
 
   const onPickDefault = async (id: string) => {
     setDefaultHarness(id);
@@ -468,9 +517,13 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       onPickDefault={onPickDefault}
                       stickyUserMessages={stickyUserMessages}
                       onStickyUserMessagesChange={onStickyUserMessagesChange}
+                      fxAutoResume={fxAutoResume}
+                      onFxAutoResumeChange={onFxAutoResumeChange}
                       tmuxSource={tmuxSource}
                       bundledTmuxAvailable={bundledTmuxAvailable}
                       onPickTmuxSource={onPickTmuxSource}
+                      disclaimSpawnedAgents={disclaimSpawnedAgents}
+                      onDisclaimSpawnedAgentsChange={onDisclaimSpawnedAgentsChange}
                       onClose={onClose}
                     />
                   );
@@ -502,6 +555,9 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       pendingToggle={pendingToggle}
                     />
                   );
+                case "agents":
+                  // Rendered by the always-mounted div below instead.
+                  return null;
                 case "git":
                   // Rendered by the always-mounted div below instead.
                   return null;
@@ -515,6 +571,17 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 }
               }
             })()}
+
+          {/* Same treatment as GitHubTokensSection/SavedPromptsSection below
+              — kept mounted regardless of the active section so an
+              in-progress agent-profile create/edit form survives switching
+              sections instead of being destroyed on unmount. No wrapper
+              spacing classes here (unlike the GitHubTokensSection div
+              below) since AgentProfilesSection's own root already applies
+              "space-y-4 pt-3 text-sm". */}
+          <div className={cn(!(view.kind === "section" && view.section === "agents") && "hidden")}>
+            <AgentProfilesSection harnesses={payload.harnesses} />
+          </div>
 
           {/* Kept mounted regardless of the active section (unlike the
               switch above) so an unsaved host/label/token draft in
@@ -608,9 +675,13 @@ function GeneralSection({
   onPickDefault,
   stickyUserMessages,
   onStickyUserMessagesChange,
+  fxAutoResume,
+  onFxAutoResumeChange,
   tmuxSource,
   bundledTmuxAvailable,
   onPickTmuxSource,
+  disclaimSpawnedAgents,
+  onDisclaimSpawnedAgentsChange,
   onClose,
 }: {
   payload: HarnessesPayload;
@@ -618,9 +689,13 @@ function GeneralSection({
   onPickDefault: (id: string) => void;
   stickyUserMessages: boolean;
   onStickyUserMessagesChange: (sticky: boolean) => void;
+  fxAutoResume: { enabled: boolean; delaySec: number };
+  onFxAutoResumeChange: (next: { enabled: boolean; delaySec: number }) => void;
   tmuxSource: "system" | "bundled";
   bundledTmuxAvailable: boolean;
   onPickTmuxSource: (source: "system" | "bundled") => void;
+  disclaimSpawnedAgents: boolean;
+  onDisclaimSpawnedAgentsChange: (enabled: boolean) => void;
   /** Closes the Settings dialog — used by "Show getting started guide" so the
    *  onboarding checklist underneath is visible after replaying it. */
   onClose: () => void;
@@ -634,6 +709,23 @@ function GeneralSection({
   const canIncreaseFontSize = fontSizePercent < FONT_SIZE_MAX;
   const canResetFontSize = fontSizePercent !== FONT_SIZE_DEFAULT;
   const [replayingOnboarding, setReplayingOnboarding] = useState(false);
+  // Local text mirror of `fxAutoResume.delaySec` so the field can hold an
+  // in-progress keystroke (e.g. a momentarily-empty box while retyping)
+  // without that draft round-tripping through the parent/preferences store
+  // on every keystroke. Committed (clamped) on blur or Enter; resynced
+  // whenever the prop changes from outside (e.g. another Settings instance,
+  // or a revert on write failure).
+  const [fxDelayInput, setFxDelayInput] = useState(String(fxAutoResume.delaySec));
+  useEffect(() => {
+    setFxDelayInput(String(fxAutoResume.delaySec));
+  }, [fxAutoResume.delaySec]);
+  const commitFxDelay = () => {
+    const clamped = parseFxAutoResumeDelayInput(fxDelayInput);
+    setFxDelayInput(String(clamped));
+    if (clamped !== fxAutoResume.delaySec) {
+      onFxAutoResumeChange({ ...fxAutoResume, delaySec: clamped });
+    }
+  };
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-1">
@@ -755,6 +847,68 @@ function GeneralSection({
         <p className="text-[11px] text-muted-foreground">
           Keep your latest sent message visible while its response scrolls. Turn this off for a standard chat list.
         </p>
+      </section>
+
+      <section className="space-y-1">
+        <div className="flex items-center justify-between gap-4">
+          <label htmlFor="disclaim-spawned-agents" className="text-xs text-muted-foreground">
+            Isolate agent permissions from Agetor (macOS)
+          </label>
+          <Switch
+            id="disclaim-spawned-agents"
+            checked={disclaimSpawnedAgents}
+            // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
+            onCheckedChange={onDisclaimSpawnedAgentsChange}
+            aria-label="Isolate agent permissions from Agetor (macOS)"
+          />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Spawned agents ask for macOS permissions under their own name instead of Agetor's, so the "access data
+          from other apps" prompt stops naming Agetor and sticks after you Allow it once. Turn off to revert to the
+          previous behavior.
+        </p>
+      </section>
+
+      <section className="space-y-1">
+        <div className="flex items-center justify-between gap-4">
+          <label htmlFor="fx-auto-resume" className="text-xs text-muted-foreground">
+            Auto-resume fx after a rate limit
+          </label>
+          <Switch
+            id="fx-auto-resume"
+            data-testid="settings-fx-auto-resume"
+            checked={fxAutoResume.enabled}
+            onCheckedChange={(enabled) => onFxAutoResumeChange({ ...fxAutoResume, enabled })}
+            aria-label="Auto-resume fx after a rate limit"
+          />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          When fx pauses after repeated Gateway 429s, Agetor resumes the response automatically, up to {FX_AUTO_RESUME_MAX} times per pause.
+        </p>
+        <div className="flex items-center justify-between gap-4 pt-1">
+          <label htmlFor="fx-auto-resume-delay" className="text-xs text-muted-foreground">
+            Auto-resume delay (seconds)
+          </label>
+          <Input
+            id="fx-auto-resume-delay"
+            data-testid="settings-fx-auto-resume-delay"
+            type="number"
+            min={FX_AUTO_RESUME_MIN_DELAY_SEC}
+            max={FX_AUTO_RESUME_MAX_DELAY_SEC}
+            step={10}
+            className="w-24"
+            disabled={!fxAutoResume.enabled}
+            value={fxDelayInput}
+            onChange={(e) => setFxDelayInput(e.target.value)}
+            onBlur={commitFxDelay}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter") return;
+              e.preventDefault();
+              commitFxDelay();
+              e.currentTarget.blur();
+            }}
+          />
+        </div>
       </section>
 
       <section className="space-y-1">

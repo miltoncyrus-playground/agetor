@@ -30,11 +30,14 @@ import {
   CATALOG_SCOPED_KINDS,
   supportedEfforts,
   cursorModelIdCoveredByCatalog,
+  defaultModeFor,
   type AgentKind,
+  type AgentProfile,
 } from "../../shared/types.ts";
 import { mergeModelOptions, discoveredEffortsFor, type DiscoveredModel } from "../../shared/model-options.ts";
 import { buildFileEntries } from "../../shared/at-file-filter.ts";
 import { unresolvedAtTokens } from "../../shared/at-refs.ts";
+import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
 
 interface AddOpts {
   title?: string;
@@ -55,6 +58,12 @@ interface AddOpts {
   /** Seed title/prompt from a GitHub/GitLab/Bitbucket issue + its comment
    *  thread — resolved against `--workdir` (or cwd) in `cmdAdd`. */
   issue?: string;
+  /** `--profile <id|name>` — launch from a saved {@link AgentProfile} instead
+   *  of picking harness/model/mode/effort by hand. Mutually exclusive with
+   *  those four flags (plus --fast/--max-mode) — enforced by
+   *  `assertProfileFlagCombo` before either the non-interactive or wizard
+   *  path runs. Resolved to an id via `matchAgentProfileRef` in `cmdAdd`. */
+  profile?: string;
 }
 
 export function parseAdd(args: string[]): AddOpts {
@@ -81,14 +90,36 @@ export function parseAdd(args: string[]): AddOpts {
       case "--ref": o.refs.push(val()); break;
       case "--start": o.start = true; break;
       case "--issue": o.issue = val(); break;
+      case "--profile": o.profile = val(); break;
       default: break;
     }
   }
   return o;
 }
 
+/** `--profile` replaces the whole harness/model/mode/effort/fast/maxMode
+ *  block — the profile defines those — so combining it with any of the six
+ *  flags that set them by hand is a usage error, in both the non-interactive
+ *  and wizard paths (checked once, up front, before either runs). */
+function assertProfileFlagCombo(o: AddOpts): void {
+  if (!o.profile) return;
+  const conflicting =
+    o.agent !== undefined ||
+    o.model !== undefined ||
+    o.mode !== undefined ||
+    o.effort !== undefined ||
+    o.fast !== undefined ||
+    o.maxMode !== undefined;
+  if (conflicting) {
+    throw new Error(
+      "--profile cannot be combined with --agent/--model/--mode/--effort/--fast/--max-mode (the agent defines them)",
+    );
+  }
+}
+
 export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   const o = parseAdd(args);
+  assertProfileFlagCombo(o);
   let prompt = o.prompt;
   if (o.promptFile) {
     prompt = o.promptFile === "-" ? (await Bun.stdin.text()).trim() : readFileSync(o.promptFile, "utf8");
@@ -165,7 +196,18 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
         "agetor add needs --title and --prompt (or --prompt-file), or --issue <url>, when not run interactively",
       );
     }
-    input = baseInput(o, o.title, prompt);
+    // An explicit `--mode` is never touched; only fill the gap a scripted
+    // add would otherwise leave (see `defaultNonInteractiveMode`'s doc). A
+    // `--profile` add ignores mode entirely (the profile supplies it), so
+    // skip the fill rather than compute a default `baseInput` will discard.
+    if (!o.mode && !o.profile) o.mode = defaultNonInteractiveMode(o.agent);
+    let profileId: string | undefined;
+    if (o.profile) {
+      const result = matchAgentProfileRef(await client.listAgentProfiles(), o.profile);
+      if ("error" in result) throw new Error(asProfileError(result.error));
+      profileId = result.profile.id;
+    }
+    input = baseInput(o, o.title, prompt, profileId);
   } else {
     input = await wizard(client, o, prompt);
   }
@@ -307,16 +349,51 @@ export function chooseAddPath(input: {
   return input.explicit || !input.isTTY || input.json ? "non-interactive" : "wizard";
 }
 
-function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
-  return {
+/**
+ * The `mode` a non-interactive `agetor add` should store when `--mode`
+ * wasn't passed. Before this, the non-interactive path (`baseInput`)
+ * forwarded `o.mode` verbatim, so a scripted add with no `--mode` stored
+ * `null` and the task spawned on whatever bare fallback the driver picks at
+ * launch time rather than the picker's own default — for fx specifically
+ * that meant `auto` (its interactive-review mode, which stalls without a
+ * Gateway reviewer on most accounts) instead of `yolo` ("Full access"), even
+ * though `AGENT_OPTIONS.fx.modes[0]` is `yolo` and every picker (webview,
+ * the wizard below) defaults to it.
+ *
+ * Delegates to the shared `defaultModeFor(kind)` (`src/shared/types.ts`,
+ * `AGENT_OPTIONS[kind].modes[0]?.id ?? "auto"`) — the one place "what does
+ * an unset mode mean" lives, per `docs/plans/fx-recovery-follow-ups.md` §3.6
+ * (also used by `reconcileTaskSession`, the webview's `nullModeFallback` and
+ * `onAgentChange` reset, and every `buildCommand`/`spawnAgent` fallback).
+ * Mirrors the exact expression the interactive wizard's own Mode picker
+ * seeds from (see the `pickOption` call in `wizard()` below) so a scripted
+ * add matches what a human would get from pressing Enter on that step.
+ * `agent` is a harness id — the raw `--agent` flag, or `undefined` when
+ * omitted. For every BUILT-IN harness (the normal `--agent fx` / `--agent
+ * codex` / … usage) the id equals its `AgentKind` verbatim (seeded that way
+ * by migrations 032/037/046), so no async harness lookup is needed here the
+ * way the wizard needs one; an unrecognized custom-account harness id, or an
+ * omitted `--agent`, falls back to `claude-code`'s modes — the same `??
+ * "claude-code"` fallback the wizard uses when a harness can't be found by
+ * id. The declared return type stays `string | undefined` (matching the
+ * pre-`defaultModeFor` version of this function) even though the actual
+ * value is never `undefined` in practice — `defaultModeFor` itself falls
+ * back to `"auto"` for a hypothetical future kind with no modes configured,
+ * so this only ever widens, never narrows, what callers can rely on.
+ */
+export function defaultNonInteractiveMode(agent: string | undefined): string | undefined {
+  const kind: AgentKind = (agent && agent in AGENT_OPTIONS ? agent : "claude-code") as AgentKind;
+  return defaultModeFor(kind);
+}
+
+/** `profileId`, when given, replaces the whole agent/model/mode/effort/fast/
+ *  maxMode block with `agentProfileId` — the server resolves the profile and
+ *  overrides those six fields from it (plan §3 D5/routes table), so sending
+ *  them here too would be dead weight at best and misleading at worst. */
+function baseInput(o: AddOpts, title: string, prompt: string, profileId?: string): CreateTaskInput {
+  const input: CreateTaskInput = {
     title,
     prompt,
-    agent: o.agent,
-    model: o.model,
-    mode: o.mode,
-    effort: o.effort,
-    fast: o.fast,
-    maxMode: o.maxMode,
     // Resolve relative to the CLI's cwd (not the daemon's — it may be a
     // long-lived detached process with a stale/unrelated cwd) so a typed or
     // `--workdir`-flagged relative path lands on disk where the user meant,
@@ -327,6 +404,17 @@ function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
     taskType: o.type,
     references: resolveRefs(o.refs),
   };
+  if (profileId) {
+    input.agentProfileId = profileId;
+  } else {
+    input.agent = o.agent;
+    input.model = o.model;
+    input.mode = o.mode;
+    input.effort = o.effort;
+    input.fast = o.fast;
+    input.maxMode = o.maxMode;
+  }
+  return input;
 }
 
 /** Seed for the interactive model picker: the stored `lastModel:<kind>` pref
@@ -397,78 +485,120 @@ async function wizard(
     .harnessModels()
     .catch(() => ({ ready: true, byHarness: {} as Record<string, DiscoveredModel[]> }));
 
-  let agent = o.agent;
-  if (!agent) {
-    const enabled = harnesses.filter((h) => h.enabled !== false);
-    if (enabled.length > 0) {
-      const def = prefs.defaultHarness;
+  // Agent-profile step: a first "Profile" pick over saved profiles (plus a
+  // "Pick harness manually" escape hatch), shown only when at least one
+  // profile exists and `--profile` wasn't already given on the command line.
+  // Picking a profile skips the harness/model/mode/effort steps below
+  // entirely (and their pref writes) — the profile supplies all of it.
+  let profileId: string | undefined;
+  if (o.profile) {
+    const result = matchAgentProfileRef(
+      await client.listAgentProfiles().catch(() => [] as AgentProfile[]),
+      o.profile,
+    );
+    if ("error" in result) throw new Error(asProfileError(result.error));
+    profileId = result.profile.id;
+  } else {
+    const profiles = await client.listAgentProfiles().catch(() => [] as AgentProfile[]);
+    if (profiles.length > 0) {
+      const MANUAL = "__manual__";
       const pick = await p.select({
-        message: "Agent",
-        options: enabled.map((h) => ({ value: h.id, label: h.label, hint: h.kind })),
-        initialValue: enabled.some((h) => h.id === def) ? def : undefined,
+        message: "Profile",
+        options: [
+          ...profiles.map((pr) => ({
+            value: pr.id,
+            label: pr.name,
+            hint: agentProfileSummary({
+              harnessLabel: harnesses.find((h) => h.id === pr.harness)?.label ?? pr.harness,
+              model: pr.model,
+              effort: pr.effort,
+              mode: pr.mode,
+            }),
+          })),
+          { value: MANUAL, label: "Pick harness manually" },
+        ],
       });
       if (p.isCancel(pick)) return cancelled();
-      agent = pick;
+      if (pick !== MANUAL) profileId = pick;
     }
   }
 
-  const kind: AgentKind = harnesses.find((h) => h.id === agent)?.kind ?? "claude-code";
-
-  // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
-  // an additional `fx-2` account from the built-in `fx`); fall back to the
-  // kind-level map for an older daemon without `/agent-models/harnesses`.
-  // Computed once agent/kind are known so the model picker and the effort
-  // prompt below read the same discovered list.
-  // Spec'd cursor models show as one base row + effort dropdown, not N
-  // suffixed rows — same filter as the webview pickers (NewTaskForm.tsx).
-  const catalog: DiscoveredModel[] = ((agent && harnessModels.byHarness[agent]) || discovered[kind] || []).filter(
-    (m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id),
-  );
-  const loggedIn = statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null;
-
-  // Picker seed: an explicit `--model` wins verbatim (unknown ids pass
-  // through — house convention); otherwise the stored `lastModel:<kind>`
-  // pref only while it is still offerable (`resolveInitialModel`, which
-  // mirrors the webview pickers' validation and rule 7's logged-out
-  // distrust), else the kind's default.
-  const initial = o.model ?? resolveInitialModel(kind, prefs[`lastModel:${kind}`], catalog, loggedIn);
-
-  // Hoisted so both the model picker and the effort prompt below read the
-  // same merged rows — computed unconditionally (not just inside the
-  // `!model` branch) since `--model` can be passed without `--effort`, and
-  // the effort prompt still needs rule-7/8-honoring `efforts` per model.
-  const modelOptions = mergeModelOptions({
-    curated: AGENT_OPTIONS[kind].models,
-    discovered: catalog,
-    selected: initial,
-    scoped: CATALOG_SCOPED_KINDS.has(kind),
-    loggedIn,
-  });
-
+  let agent = o.agent;
   let model = o.model;
-  if (!model) {
-    const picked = await pickOption("Model", modelOptions, initial);
-    if (picked === null) return cancelled();
-    model = picked;
-  }
   let mode = o.mode;
-  if (!mode) {
-    const picked = await pickOption("Mode", AGENT_OPTIONS[kind].modes, prefs[`lastMode:${kind}`] ?? AGENT_OPTIONS[kind].modes[0]?.id);
-    if (picked === null) return cancelled();
-    mode = picked;
-  }
   let effort = o.effort;
-  if (!effort) {
-    // Efforts must come from the merged rows, never the raw discovered
-    // catalog — `modelOptions` already honours rule 7 (a logged-out
-    // harness's discovered catalog is untrusted) and rule 8 (`efforts` is
-    // computed per merged row), so reading `catalog` directly here would
-    // bypass both.
-    const efforts = supportedEfforts(kind, model ?? null, discoveredEffortsFor(modelOptions, model));
-    if (efforts.length > 0) {
-      const picked = await pickOption("Effort", efforts, prefs[`lastEffort:${kind}`] ?? DEFAULT_EFFORT[kind]);
+  let kind: AgentKind | undefined;
+
+  if (!profileId) {
+    if (!agent) {
+      const enabled = harnesses.filter((h) => h.enabled !== false);
+      if (enabled.length > 0) {
+        const def = prefs.defaultHarness;
+        const pick = await p.select({
+          message: "Agent",
+          options: enabled.map((h) => ({ value: h.id, label: h.label, hint: h.kind })),
+          initialValue: enabled.some((h) => h.id === def) ? def : undefined,
+        });
+        if (p.isCancel(pick)) return cancelled();
+        agent = pick;
+      }
+    }
+
+    kind = harnesses.find((h) => h.id === agent)?.kind ?? "claude-code";
+
+    // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
+    // an additional `fx-2` account from the built-in `fx`); fall back to the
+    // kind-level map for an older daemon without `/agent-models/harnesses`.
+    // Computed once agent/kind are known so the model picker and the effort
+    // prompt below read the same discovered list.
+    // Spec'd cursor models show as one base row + effort dropdown, not N
+    // suffixed rows — same filter as the webview pickers (NewTaskForm.tsx).
+    const catalog: DiscoveredModel[] = ((agent && harnessModels.byHarness[agent]) || discovered[kind] || []).filter(
+      (m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id),
+    );
+    const loggedIn = statuses.find((s) => s.harnessId === agent)?.loggedIn ?? null;
+
+    // Picker seed: an explicit `--model` wins verbatim (unknown ids pass
+    // through — house convention); otherwise the stored `lastModel:<kind>`
+    // pref only while it is still offerable (`resolveInitialModel`, which
+    // mirrors the webview pickers' validation and rule 7's logged-out
+    // distrust), else the kind's default.
+    const initial = o.model ?? resolveInitialModel(kind, prefs[`lastModel:${kind}`], catalog, loggedIn);
+
+    // Hoisted so both the model picker and the effort prompt below read the
+    // same merged rows — computed unconditionally (not just inside the
+    // `!model` branch) since `--model` can be passed without `--effort`, and
+    // the effort prompt still needs rule-7/8-honoring `efforts` per model.
+    const modelOptions = mergeModelOptions({
+      curated: AGENT_OPTIONS[kind].models,
+      discovered: catalog,
+      selected: initial,
+      scoped: CATALOG_SCOPED_KINDS.has(kind),
+      loggedIn,
+    });
+
+    if (!model) {
+      const picked = await pickOption("Model", modelOptions, initial);
       if (picked === null) return cancelled();
-      effort = picked;
+      model = picked;
+    }
+    if (!mode) {
+      const picked = await pickOption("Mode", AGENT_OPTIONS[kind].modes, prefs[`lastMode:${kind}`] ?? AGENT_OPTIONS[kind].modes[0]?.id);
+      if (picked === null) return cancelled();
+      mode = picked;
+    }
+    if (!effort) {
+      // Efforts must come from the merged rows, never the raw discovered
+      // catalog — `modelOptions` already honours rule 7 (a logged-out
+      // harness's discovered catalog is untrusted) and rule 8 (`efforts` is
+      // computed per merged row), so reading `catalog` directly here would
+      // bypass both.
+      const efforts = supportedEfforts(kind, model ?? null, discoveredEffortsFor(modelOptions, model));
+      if (efforts.length > 0) {
+        const picked = await pickOption("Effort", efforts, prefs[`lastEffort:${kind}`] ?? DEFAULT_EFFORT[kind]);
+        if (picked === null) return cancelled();
+        effort = picked;
+      }
     }
   }
 
@@ -499,11 +629,15 @@ async function wizard(
   if (p.isCancel(start)) return cancelled();
   o.start = start;
 
-  // Remember the picks so the next `add` defaults to them.
-  await persistPrefs(client, kind, { model, mode, effort });
+  // Remember the picks so the next `add` defaults to them — skipped entirely
+  // for a profile-launched task (D12: no "last used profile" preference,
+  // and the profile's own values shouldn't leak into the manual defaults).
+  if (!profileId && kind) {
+    await persistPrefs(client, kind, { model, mode, effort });
+  }
 
   p.outro(c.green("creating…"));
-  return baseInput({ ...o, agent, model, mode, effort, workdir }, title, prompt);
+  return baseInput({ ...o, agent, model, mode, effort, workdir }, title, prompt, profileId);
 }
 
 /** A select that returns the chosen value (or null on cancel), pre-selecting

@@ -7,6 +7,7 @@ import {
   Play, RotateCcw, Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
+import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
@@ -18,12 +19,21 @@ import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { fileScopeForTask } from "../../../shared/file-scope.ts";
 import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
 import { fxUsageChipText, fxUsageTitle, mergeFxUsage, parseFxUsage } from "@/lib/fx-usage";
+import { useCountdown } from "@/lib/fx-auto-resume";
+import { renderLinkified } from "@/lib/linkify";
+import {
+  fxRecoveryNoticeText,
+  fxRecoverySummaryLine,
+  isFxRecoveryResumable,
+  parseFxRecoveryPayload,
+} from "../../../shared/fx-recovery.ts";
 import { reconcileById } from "@/lib/reconcile";
 import { RUN_PANEL_DEFAULT_WIDTH, RUN_PANEL_MIN_WIDTH, clampPanelWidth, readPanelWidth, writePanelWidth } from "@/lib/panel-width";
 import { QuoteSelectionButton } from "./QuoteSelectionButton";
@@ -44,9 +54,12 @@ import {
   CATALOG_SCOPED_KINDS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  defaultModeFor,
   EVENTS_WINDOW_MAX,
   GATE_BEARING_STAGES,
+  FX_AUTO_RESUME_MAX,
   FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   isInternalStatusSentinel,
@@ -58,9 +71,12 @@ import {
   supportedEfforts,
   supportedModes,
   type AgentKind,
+  type AgentProfile,
   type AgentStatus,
   type Harness,
   type BacklogMessage,
+  type FxRecoveryPayload,
+  type AgentProfileSnapshot,
   type FxUsagePayload,
   type GitHubPullMergeability,
   type Run,
@@ -70,6 +86,7 @@ import {
   type Task,
   type TaskDraft,
   type TaskEventsReplayMeta,
+  type TaskFxRecovery,
   type TaskPlan,
   type TaskReference,
   type ToolResultAttachment,
@@ -84,9 +101,11 @@ import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
-import { parseUserMessage, splitReferences, parseMessageSegments, type MessageSegment } from "../../../shared/user-message.ts";
+import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
+import { AgentProfileCard } from "./AgentProfileCard";
+import { AgentProfileDetailsDialog } from "./AgentProfileDetailsDialog";
 import { AttachmentChips } from "./AttachmentChips";
 import { SentFilesCard } from "./SentFilesCard";
 import {
@@ -99,7 +118,7 @@ import { TerminalView } from "./TerminalView";
 import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
-import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink } from "./md-components";
+import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent } from "./MessageSegments";
 
 /**
@@ -162,6 +181,22 @@ interface Props {
   /** Registered harnesses — needed so the panel's agent dropdown can list
    *  every known harness (built-ins + aliases). */
   harnesses: Harness[];
+  /** Saved agent profiles — resolves the header chip (`resolveTaskProfileDisplay`)
+   *  and, in Task details, whether the agent/mode/model/effort(/fast/max)
+   *  controls are locked (`task.agentProfileId != null`). `null` means the
+   *  first `GET /agent-profiles` fetch hasn't succeeded yet (see
+   *  `useAgentProfiles`'s `loaded` flag) — `resolveTaskProfileDisplay` never
+   *  reports `deleted` in that state, so a bound task's chip can't flash
+   *  "(deleted)" while loading or after a failed fetch. */
+  profiles: AgentProfile[] | null;
+  /** Optimistically merges partial fields into this task in the parent's
+   *  `tasks` state (e.g. after detaching an agent profile) — mirrors the
+   *  `unread`-only merge App.tsx already does on mark-seen, never a
+   *  wholesale Task replace (would revert a concurrent optimistic patch). */
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
+  /** "Manage agents…" — wired to the task-details Detach hint's sibling
+   *  affordance and the header chip, mirroring `NewTaskForm`'s own prop. */
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   /** Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`
    *  on the api client. Preferred over `agentModels` for the task's own
@@ -210,6 +245,15 @@ export const EXIT_DURATION_MS = 250;
 // parked just past one threshold but within the other would see the pin
 // fire inconsistently depending on which path last updated `nearBottomRef`.
 const NEAR_BOTTOM_PX = 80;
+
+// Upper bound on how long the git-status and PR-mergeability fetches (each
+// declared further down `RunPanelBody`) wait behind the SSE subscription's
+// first `replay_meta` frame before firing anyway — see `markStreamReady`/
+// `awaitStreamReady` near `runsLoaded`. A dead task (no SSE endpoint
+// reachable at all) or an unusually slow replay must not starve those
+// fetches forever; 400ms is comfortably above a normal replay's latency
+// while still well inside "the switch burst" the deferral exists to avoid.
+const STREAM_READY_FALLBACK_MS = 400;
 
 // Computed once at module load — see `lib/platform.ts`; used by the Cmd/Ctrl+F handler below.
 const IS_MAC_PLATFORM = isMacPlatform();
@@ -264,7 +308,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -464,10 +508,13 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, agentMod
           stickyUserMessages={stickyUserMessages}
           agents={agents}
           harnesses={harnesses}
+          profiles={profiles}
+          onOpenSettingsAgents={onOpenSettingsAgents}
           agentModels={agentModels}
           harnessModels={harnessModels}
           onRefreshModels={onRefreshModels}
           homeDir={homeDir}
+          onTaskFieldsChanged={onTaskFieldsChanged}
           open={open}
           openRef={openRef}
           onClose={onClose}
@@ -492,10 +539,13 @@ function RunPanelBody({
   stickyUserMessages,
   agents,
   harnesses,
+  profiles,
+  onOpenSettingsAgents,
   agentModels,
   harnessModels,
   onRefreshModels,
   homeDir,
+  onTaskFieldsChanged,
   open,
   openRef,
   onClose,
@@ -510,10 +560,13 @@ function RunPanelBody({
   stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
+  profiles: AgentProfile[] | null;
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
   /** Whether the panel is in its "open" (not mid-close-animation, not
    *  pre-mount) state — mirrors `RunPanel`'s own `open` state. Gates the
    *  Cmd/Ctrl+F listener below so it doesn't hijack the shortcut while the
@@ -535,6 +588,29 @@ function RunPanelBody({
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
+  /** The task id this render's async handlers should be writing state for.
+   *  RunPanelBody is NOT remounted on task switch (see `RunPanel`'s call
+   *  site in App.tsx), so an async handler (`send`, `saveForLater`,
+   *  `rebuildFromJsonl`, the backlog CRUD helpers, …) that captured task A's
+   *  id before an `await` must not write its post-await result into state
+   *  once the panel has moved on to task B. Written synchronously at the top
+   *  of the `[task.id]` reset effect below — a ref, not state, so the write
+   *  is visible to an already-in-flight async closure the instant the reset
+   *  effect runs, with no render latency. Handlers capture `task.id` into a
+   *  local (e.g. `sentTaskId`) before their first `await`, then compare it
+   *  against `currentTaskIdRef.current` after every `await` before writing
+   *  shared per-task state. */
+  const currentTaskIdRef = useRef(task.id);
+  // Agent-profile header chip: `resolveTaskProfileDisplay` gives the
+  // deleted flag + summary (live profile until the task's first run — plan
+  // D2 — else the frozen snapshot); `agentProfileForCard` resolves the
+  // richer object `AgentProfileCard` itself renders from (model/effort/
+  // mode/instructions/skills), same live-or-snapshot preference.
+  const agentProfileDisplay = resolveTaskProfileDisplay(task, profiles, harnesses);
+  const agentProfileForCard: AgentProfile | AgentProfileSnapshot | null =
+    (task.agentProfileId ? (profiles?.find((p) => p.id === task.agentProfileId) ?? null) : null)
+    ?? task.agentProfile
+    ?? null;
   const [runs, setRuns] = useState<Run[]>([]);
   /** Structured event stream — one entry per claude JSONL block or per
    *  codex stdout/stderr chunk. The renderer dispatches on `stream` to
@@ -661,12 +737,69 @@ function RunPanelBody({
    *  earlier" button together with `earliestId !== null`. */
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  /** True once the FIRST `listRuns` response for the CURRENT task has
+   *  landed (see the runs-poll effect below, which sets this — guarded by
+   *  that effect's own `cancelled` flag, so a late response for a task the
+   *  user has already switched away from can never flip it). Drives the
+   *  transcript's loading skeleton: `runs.length === 0` and
+   *  `displayedEvents.length === 0` both read as "nothing here" whether the
+   *  task genuinely has no runs yet or its runs just haven't loaded — this
+   *  flag is what tells those two states apart so a freshly opened task
+   *  shows "Loading messages…" instead of a premature "no runs yet". */
+  const [runsLoaded, setRunsLoaded] = useState(false);
+  // ── Stream-first gating for non-essential fetches ─────────────────────────
+  // Git status and PR-mergeability (below, each declared later in this
+  // component) must not fire in the same burst as a task switch — they'd
+  // otherwise compete with the SSE subscription for the webview's shared
+  // per-host connection budget. Both wait on this gate instead: ready the
+  // instant the SSE subscription effect's `replay_meta` frame arrives for
+  // THIS task, or after STREAM_READY_FALLBACK_MS, whichever comes first
+  // (both signals are owned by the SSE subscription effect below). Refs,
+  // not state: `markStreamReady`/`awaitStreamReady` are called from inside
+  // async closures set up by effects declared later in the component, and a
+  // ref mutation is visible to those closures the instant it happens — no
+  // render latency — which matters because the reset effect right below and
+  // the SSE effect that marks readiness both fire within the same
+  // task-switch commit; a state-based gate could still be read stale by an
+  // effect that re-runs in that same commit before the state update lands.
+  //
+  // The gate is keyed by TASK ID, not a bare boolean: `streamReadyForRef`
+  // holds the id of the task whose stream is ready (or null), and every
+  // waiter records which task it is waiting for. This matters for children
+  // keyed on `task.id` (`TerminalsSection`): React runs a child's mount
+  // effect BEFORE the parent's effects in the same commit, so on a switch
+  // the new task's section mounts and asks the gate before the reset effect
+  // below has cleared it — a bare boolean would still read the PREVIOUS
+  // task's `true` and let the terminal list fetch into the switch burst.
+  const streamReadyForRef = useRef<string | null>(null);
+  const streamReadyWaitersRef = useRef<Array<{ taskId: string; resolve: () => void }>>([]);
+  const markStreamReady = () => {
+    const forTaskId = currentTaskIdRef.current;
+    if (streamReadyForRef.current === forTaskId) return;
+    streamReadyForRef.current = forTaskId;
+    const waiters = streamReadyWaitersRef.current;
+    streamReadyWaitersRef.current = waiters.filter((w) => w.taskId !== forTaskId);
+    for (const w of waiters) if (w.taskId === forTaskId) w.resolve();
+  };
+  /** Resolves once the stream is ready for `forTaskId` (default: the task
+   *  currently mounted in this body). Callers keyed per task (children that
+   *  remount on switch) MUST pass their own `task.id` — see the note above. */
+  const awaitStreamReady = (forTaskId: string = currentTaskIdRef.current): Promise<void> => {
+    if (streamReadyForRef.current === forTaskId) return Promise.resolve();
+    return new Promise<void>((resolve) => { streamReadyWaitersRef.current.push({ taskId: forTaskId, resolve }); });
+  };
 
-  // Reset on task switch (no remount because we no longer key on task.id).
-  // Re-arm the auto-scroll heuristic so opening a different task pins the
-  // viewport to the most recent message instead of inheriting the previous
-  // task's scrolled-up position.
+  // Reset on task switch (no remount because we no longer key on task.id —
+  // see `RunPanelBody`'s call site in `App.tsx`). Re-arm the auto-scroll
+  // heuristic so opening a different task pins the viewport to the most
+  // recent message instead of inheriting the previous task's scrolled-up
+  // position. This effect resets every piece of state in `RunPanelBody`
+  // that isn't itself keyed by task id or re-seeded from `task` via its own
+  // `useEffect` (`backlogItems`/`plans` above do that already) — the goal is
+  // that nothing task A produced (an in-flight send, a busy flag, cached
+  // git/PR status) is visible while task B's panel is still catching up.
   useEffect(() => {
+    currentTaskIdRef.current = task.id;
     setEvents([]);
     eventsRef.current = [];
     prevEventIdRef.current = -1;
@@ -683,6 +816,19 @@ function RunPanelBody({
     setSearchQuery("");
     setActiveMatchId(null);
     nearBottomRef.current = true;
+    setRuns([]);
+    setRunsLoaded(false);
+    // Resolve any waiters a still-tearing-down previous task's git-status/
+    // PR-mergeability effects left pending — each one's own `cancelled` flag
+    // (captured in its effect's cleanup) makes the resume a no-op, so this
+    // just prevents the promise from dangling forever unresolved.
+    // Only waiters for OTHER tasks are stale here: a waiter the incoming
+    // task's own keyed child already registered (its mount effect ran before
+    // this parent effect) must stay queued until this task's stream is ready.
+    const staleWaiters = streamReadyWaitersRef.current.filter((w) => w.taskId !== task.id);
+    streamReadyWaitersRef.current = streamReadyWaitersRef.current.filter((w) => w.taskId === task.id);
+    for (const w of staleWaiters) w.resolve();
+    streamReadyForRef.current = null;
     // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
     // must not survive into the new task: RunPanelBody isn't remounted on
     // task switch, so without this a stale `prStatus` from task A could sit
@@ -694,7 +840,28 @@ function RunPanelBody({
     // executed at least once.
     setPrStatus(null);
     setPrStatusError(null);
+    setPrStatusLoading(false);
+    // Invalidate any in-flight `fetchPrStatus` (including a pending self-heal
+    // retry) task A's effects left running — without this, a slow response
+    // that lands after the switch would pass its own `requestId !==
+    // prStatusSeqRef.current` staleness check (it captured the pre-bump
+    // value) and write task A's mergeability into task B's `prStatus`.
+    prStatusSeqRef.current++;
     setResolveConflictsSent(false);
+    setResolvingConflicts(false);
+    setSending(false);
+    setSendHint(null);
+    setBacklogBusy(false);
+    setRebuildBusy(false);
+    // fx-only busy flags (Resume / Cancel auto-resume buttons) — same per-task
+    // scope as `sending`: a click on task A must not leave B's button disabled.
+    setResumeBusy(false);
+    setCancelAutoBusy(false);
+    setGitStatus(null);
+    // `editingId` (the backlog tray's inline-editor state) lives inside the
+    // `BacklogTray` child component, not here — it's reset by keying that
+    // component on `task.id` at its call site below instead (a fresh mount
+    // per task), which is simpler than plumbing a reset callback down.
     if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
     prStatusRetryTimerRef.current = null;
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
@@ -707,10 +874,13 @@ function RunPanelBody({
 
   const rebuildFromJsonl = async () => {
     if (!latestRun || !latestRun.claudeSessionId || rebuildBusy) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setRebuildBusy(true);
     setRebuildNote(null);
     try {
       const res = await api.rebuildRunEvents(latestRun.id);
+      if (currentTaskIdRef.current !== sentTaskId) return;
       if (res.events.length === 0) {
         setRebuildNote(res.reason ?? "no events found in JSONL");
         return;
@@ -721,191 +891,48 @@ function RunPanelBody({
         // "Everything observed so far" — see `nextEventIdRef`.
         maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
       });
-      setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
+      // The route byte-budgets the snapshot (newest events first); when it
+      // had to cut older ones it says so, and "Load earlier" pages the rest
+      // — same handling as the auto-rebuild effect below.
+      if (res.hasMore) setHasMoreEarlier(true);
+      setRebuildNote(
+        res.hasMore
+          ? `Loaded the most recent ${res.events.length} events from session JSONL — older history is available via "Load earlier messages".`
+          : `Loaded ${res.events.length} events from session JSONL.`,
+      );
     } catch (e) {
+      if (currentTaskIdRef.current !== sentTaskId) return;
       setRebuildNote(`rebuild failed: ${(e as Error).message}`);
     } finally {
-      setRebuildBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setRebuildBusy(false);
     }
   };
-
-  // Bootstrap any interactions that fired before the panel opened (race
-  // between claude tool calls and the panel mount). The SSE subscription
-  // picks up new ones from here on.
-  useEffect(() => {
-    let cancelled = false;
-    void api.listPendingInteractions(task.id).then((list) => {
-      if (cancelled) return;
-      setInteractions(list);
-    }).catch(() => { /* ignore — empty start is fine */ });
-    return () => { cancelled = true; };
-  }, [task.id]);
-
-  // Stable identity so RunEventList's memoized block tree isn't invalidated
-  // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
-  // stable setter, so the empty dep list is correct.
-  const dismissInteraction = useCallback(
-    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
-    [],
-  );
-
-  // ── Poll gating (runs + subagents) ────────────────────────────────────────
-  // Both 2s polls below share the same "is there any reason to keep looking"
-  // condition: a run in flight, a subagent running, or an interaction waiting
-  // on the user. These booleans are read by each poll's own `evaluate()`
-  // (defined inside the effect so it can start/stop that effect's own timer)
-  // — refs, not plain closures, because `latestRun`/`subagentList`/
-  // `interactions` change on every render without re-running the poll effects
-  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
-  // so an interaction resolving doesn't reset an in-flight interval). The
-  // kick/evaluate refs let the activity-change effect and the SSE handler
-  // below reach into a poll effect that was set up earlier without needing it
-  // in their own dependency arrays.
-  const runActiveRef = useRef(false);
-  const subagentActiveRef = useRef(false);
-  const interactionPendingRef = useRef(false);
-  const runsPollKickRef = useRef<() => void>(() => {});
-  const subagentsPollKickRef = useRef<() => void>(() => {});
-  const runsPollEvaluateRef = useRef<() => void>(() => {});
-  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
-
-  useEffect(() => {
-    runActiveRef.current = latestRun?.status === "running";
-    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
-    interactionPendingRef.current = interactions.length > 0;
-    // Re-arm (or re-suspend) both polls now that the activity picture changed
-    // — e.g. the latest run just resolved (stop) or a subagent just finished
-    // while the run was already idle (also stop; the reverse case, a run/
-    // subagent starting, is normally already covered by `task.runId`/mount
-    // effects below, but this keeps both polls honest either way).
-    runsPollEvaluateRef.current();
-    subagentsPollEvaluateRef.current();
-  }, [latestRun?.status, subagentList, interactions.length]);
-
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const load = async () => {
-      try {
-        const list = await api.listRuns(task.id);
-        if (cancelled) return;
-        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
-      } catch { /* task may have been deleted */ }
-    };
-    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
-    const startTimer = () => {
-      if (timer) return;
-      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
-    };
-    // Mirrors whether the timer is currently (supposed to be) running.
-    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
-    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
-    // early return below skips the `document.hidden`/ref reads and the
-    // start/stop call entirely once the desired state already matches,
-    // rather than re-deriving and re-applying the same state on every event.
-    let armed = false;
-    // Paused while the window is hidden (nothing to repaint) or once the task
-    // has gone fully idle (terminal run, no subagent running, no pending
-    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
-    // SSE event, so a change on the server side is never missed for long.
-    const evaluate = () => {
-      const shouldRun = !document.hidden
-        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
-      if (shouldRun === armed) return;
-      armed = shouldRun;
-      if (shouldRun) startTimer(); else stopTimer();
-    };
-    const kick = () => {
-      if (!document.hidden) void load();
-      evaluate();
-    };
-    runsPollKickRef.current = kick;
-    runsPollEvaluateRef.current = evaluate;
-    void load(); // initial load on mount always happens, regardless of gating
-    evaluate();
-    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
-    const onFocus = () => kick();
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onFocus);
-    return () => {
-      cancelled = true;
-      stopTimer();
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [task.id, task.runId]);
-
-  // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
-  // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
-  // runs poll). Merge rather than replace so an in-flight SSE delta isn't
-  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
-  // runs poll above (own timer, shared activity refs).
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const load = async () => {
-      try {
-        const list = await api.listSubagents(task.id);
-        if (cancelled) return;
-        setSubagentList((cur) => {
-          // Union by id: the poll (DB) is authoritative on status, but keep any
-          // id we only know from a just-arrived SSE delta that the poll query
-          // raced. Sort by spawn order so tabs don't reshuffle.
-          const byId = new Map<string, Subagent>();
-          for (const s of cur) byId.set(s.id, s);
-          for (const s of list) byId.set(s.id, s);
-          // Identity-preserving: hand back `cur` itself when nothing changed,
-          // so this backstop poll can't re-render the whole open panel every
-          // 2s while a run merely streams (see `reconcileById`).
-          return reconcileById(
-            cur,
-            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
-            (s) => s.id,
-          );
-        });
-      } catch { /* task may have been deleted */ }
-    };
-    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
-    const startTimer = () => {
-      if (timer) return;
-      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
-    };
-    // See the runs-poll effect above for why this early-returns on a no-op
-    // state transition instead of re-deriving/re-applying on every call.
-    let armed = false;
-    const evaluate = () => {
-      const shouldRun = !document.hidden
-        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
-      if (shouldRun === armed) return;
-      armed = shouldRun;
-      if (shouldRun) startTimer(); else stopTimer();
-    };
-    const kick = () => {
-      if (!document.hidden) void load();
-      evaluate();
-    };
-    subagentsPollKickRef.current = kick;
-    subagentsPollEvaluateRef.current = evaluate;
-    void load();
-    evaluate();
-    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
-    const onFocus = () => kick();
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onFocus);
-    return () => {
-      cancelled = true;
-      stopTimer();
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, [task.id]);
 
   // One unified task-level stream: every event from every run, merged in
   // chronological order. Replaces the old per-run subscription so the
   // panel shows the whole conversation as a single scrollback.
+  //
+  // Declared BEFORE listPendingInteractions/listRuns/listSubagents (below)
+  // and every other one-shot fetch in this component — deliberately.
+  // Passive effects commit in declaration order, so on a task switch this
+  // effect's `api.subscribeTask` call (which opens the EventSource) fires
+  // before any of those `fetch()` calls are issued. The webview has a
+  // small, shared per-host connection budget (WKWebView observed at 6 at
+  // rest), and a switch used to fire ~8 one-shot requests ahead of the new
+  // task's own event stream — starving it behind whatever else was still
+  // in flight (e.g. another task's slow session restore). This effect also
+  // owns the `markStreamReady`/`awaitStreamReady` gate (declared above,
+  // near `runsLoaded`) that the git-status and PR-mergeability effects
+  // further below wait on before firing their own requests — see the
+  // `readyTimer` and the `meta` callback's `markStreamReady()` call below.
   useEffect(() => {
     setEvents([]);
     nextEventIdRef.current = 0;
+    // Fallback half of the stream-ready gate (see the comment above): if
+    // `replay_meta` (below) hasn't arrived within STREAM_READY_FALLBACK_MS,
+    // let the deferred fetches go anyway rather than waiting on a stream
+    // that may never connect (task deleted mid-switch, backend down).
+    const readyTimer = setTimeout(markStreamReady, STREAM_READY_FALLBACK_MS);
     // Collapse the dual-emit + replay duplicates the server stream carries
     // (live echo + JSONL twin per user message; full-history replay on every
     // reconnect). The deduper keeps `user` keys in a never-trimmed set so a
@@ -1120,6 +1147,12 @@ function RunPanelBody({
         buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
       },
       (meta) => {
+        // First (successful) half of the stream-ready gate: this frame is
+        // always the very first thing the server sends on (re)connect (see
+        // below), so it's the earliest reliable signal that this task's
+        // stream is actually live — clear the deferral for git-status/
+        // PR-mergeability now instead of waiting out the fallback timer.
+        markStreamReady();
         // The server sends `replay_meta` as the FIRST frame of every (re)connect
         // — including an EventSource-internal reconnect after a network blip,
         // which reuses this same subscription/effect instance rather than
@@ -1144,11 +1177,223 @@ function RunPanelBody({
       },
     );
     return () => {
+      clearTimeout(readyTimer);
       buffer.dispose();
       if (kickTimer) clearTimeout(kickTimer);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onFocus);
       unsub();
+    };
+  }, [task.id]);
+
+  // Bootstrap any interactions that fired before the panel opened (race
+  // between claude tool calls and the panel mount). The SSE subscription
+  // picks up new ones from here on.
+  useEffect(() => {
+    let cancelled = false;
+    void api.listPendingInteractions(task.id).then((list) => {
+      if (cancelled) return;
+      setInteractions(list);
+    }).catch(() => { /* ignore — empty start is fine */ });
+    return () => { cancelled = true; };
+  }, [task.id]);
+
+  // Stable identity so RunEventList's memoized block tree isn't invalidated
+  // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
+  // stable setter, so the empty dep list is correct.
+  const dismissInteraction = useCallback(
+    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
+    [],
+  );
+
+  // ── Poll gating (runs + subagents) ────────────────────────────────────────
+  // Both 2s polls below share the same "is there any reason to keep looking"
+  // condition: a run in flight, a subagent running, or an interaction waiting
+  // on the user. These booleans are read by each poll's own `evaluate()`
+  // (defined inside the effect so it can start/stop that effect's own timer)
+  // — refs, not plain closures, because `latestRun`/`subagentList`/
+  // `interactions` change on every render without re-running the poll effects
+  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
+  // so an interaction resolving doesn't reset an in-flight interval). The
+  // kick/evaluate refs let the activity-change effect and the SSE handler
+  // below reach into a poll effect that was set up earlier without needing it
+  // in their own dependency arrays.
+  const runActiveRef = useRef(false);
+  const subagentActiveRef = useRef(false);
+  const interactionPendingRef = useRef(false);
+  const runsPollKickRef = useRef<() => void>(() => {});
+  const subagentsPollKickRef = useRef<() => void>(() => {});
+  const runsPollEvaluateRef = useRef<() => void>(() => {});
+  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    runActiveRef.current = latestRun?.status === "running";
+    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
+    interactionPendingRef.current = interactions.length > 0;
+    // Re-arm (or re-suspend) both polls now that the activity picture changed
+    // — e.g. the latest run just resolved (stop) or a subagent just finished
+    // while the run was already idle (also stop; the reverse case, a run/
+    // subagent starting, is normally already covered by `task.runId`/mount
+    // effects below, but this keeps both polls honest either way).
+    runsPollEvaluateRef.current();
+    subagentsPollEvaluateRef.current();
+  }, [latestRun?.status, subagentList, interactions.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // Skips a tick while the previous `load()` for this same task is still
+    // in flight — a slow response (e.g. the server itself busy with another
+    // task's session restore) must not let ticks pile up into a burst of
+    // overlapping requests once it finally resolves. Reset on cleanup only
+    // implicitly (the effect instance, and this closure's `inFlight`, don't
+    // survive past task switch anyway).
+    let inFlight = false;
+    // A `kick()` (SSE live sign / focus / visibility) that arrives while a
+    // load is already in flight would otherwise be silently dropped — record
+    // it here and replay it once, right after the in-flight load settles, so
+    // the signal that prompted the kick isn't lost.
+    let pendingKick = false;
+    const load = async () => {
+      if (inFlight) { pendingKick = true; return; }
+      inFlight = true;
+      try {
+        const list = await api.listRuns(task.id);
+        if (cancelled) return;
+        setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        // First response for this task — flips the transcript's loading
+        // skeleton off. Safe to call on every subsequent tick too: React
+        // bails out a same-value `setState(true)` without a re-render.
+        setRunsLoaded(true);
+      } catch { /* task may have been deleted */ }
+      finally {
+        inFlight = false;
+        if (pendingKick && !cancelled) {
+          pendingKick = false;
+          void load();
+        }
+      }
+    };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // Mirrors whether the timer is currently (supposed to be) running.
+    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
+    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
+    // early return below skips the `document.hidden`/ref reads and the
+    // start/stop call entirely once the desired state already matches,
+    // rather than re-deriving and re-applying the same state on every event.
+    let armed = false;
+    // Paused while the window is hidden (nothing to repaint) or once the task
+    // has gone fully idle (terminal run, no subagent running, no pending
+    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
+    // SSE event, so a change on the server side is never missed for long.
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    runsPollKickRef.current = kick;
+    runsPollEvaluateRef.current = evaluate;
+    void load(); // initial load on mount always happens, regardless of gating
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [task.id, task.runId]);
+
+  // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
+  // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
+  // runs poll). Merge rather than replace so an in-flight SSE delta isn't
+  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
+  // runs poll above (own timer, shared activity refs).
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    // See the runs-poll effect above for why a tick is skipped while the
+    // previous `load()` is still in flight.
+    let inFlight = false;
+    // See the runs-poll effect above for why a kick that arrives mid-flight
+    // is recorded and replayed once, rather than silently dropped.
+    let pendingKick = false;
+    const load = async () => {
+      if (inFlight) { pendingKick = true; return; }
+      inFlight = true;
+      try {
+        const list = await api.listSubagents(task.id);
+        if (cancelled) return;
+        setSubagentList((cur) => {
+          // Union by id: the poll (DB) is authoritative on status, but keep any
+          // id we only know from a just-arrived SSE delta that the poll query
+          // raced. Sort by spawn order so tabs don't reshuffle.
+          const byId = new Map<string, Subagent>();
+          for (const s of cur) byId.set(s.id, s);
+          for (const s of list) byId.set(s.id, s);
+          // Identity-preserving: hand back `cur` itself when nothing changed,
+          // so this backstop poll can't re-render the whole open panel every
+          // 2s while a run merely streams (see `reconcileById`).
+          return reconcileById(
+            cur,
+            [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1)),
+            (s) => s.id,
+          );
+        });
+      } catch { /* task may have been deleted */ }
+      finally {
+        inFlight = false;
+        if (pendingKick && !cancelled) {
+          pendingKick = false;
+          void load();
+        }
+      }
+    };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // See the runs-poll effect above for why this early-returns on a no-op
+    // state transition instead of re-deriving/re-applying on every call.
+    let armed = false;
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    subagentsPollKickRef.current = kick;
+    subagentsPollEvaluateRef.current = evaluate;
+    void load();
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
     };
   }, [task.id]);
 
@@ -1170,9 +1415,15 @@ function RunPanelBody({
   const loadEarlierEvents = useCallback(() => {
     if (earliestId == null || !hasMoreEarlier || loadingEarlier) return;
     const el = logRef.current;
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow page fetch
+    // resolving after the user has moved to a different task must not
+    // prepend task A's history into task B's transcript state.
+    const sentTaskId = task.id;
     setLoadingEarlier(true);
-    void api.fetchTaskEventsPage(task.id, earliestId)
+    void api.fetchTaskEventsPage(sentTaskId, earliestId)
       .then((page) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
         // Defensive dedupe: `earliestId` can point past events this panel
         // already holds — e.g. an SSE reconnect moved it backward (see the
         // `replay_meta` handler's "never move forward" comment above), so a
@@ -1204,7 +1455,9 @@ function RunPanelBody({
         setHasMoreEarlier(page.hasMore);
       })
       .catch(() => { /* transient failure — button stays enabled to retry */ })
-      .finally(() => setLoadingEarlier(false));
+      .finally(() => {
+        if (currentTaskIdRef.current === sentTaskId) setLoadingEarlier(false);
+      });
   }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
 
   // Restores scroll position after "Load earlier" prepends older events above
@@ -1421,8 +1674,10 @@ function RunPanelBody({
    *  so it splices against these. */
   const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
 
-  /** Merged fx usage / provider / title per run, each keyed by `runId` —
-   *  feed the run-row chips in `RunsList`. Sourced from the raw
+  /** Merged fx usage / provider / title / recovery per run, each keyed by
+   *  `runId` — feed the run-row chips in `RunsList` (usage/provider/title)
+   *  and the bottom-of-transcript recovery notices below (`recoveryByRunId`
+   *  — see `liveRecoveryNotice`/`pausedRecovery`). Sourced from the raw
    *  (unfiltered) `events` state rather than `displayedEvents` so the chips
    *  stay correct regardless of which subagent tab is active or whether a
    *  JSONL rebuild snapshot has spliced the main stream. `events` arrives in
@@ -1432,22 +1687,29 @@ function RunPanelBody({
    *  per-turn half (`turn`, from the `session/prompt` result) can arrive as
    *  separate sentinel chunks on the same run, so a plain last-wins
    *  overwrite would clobber whichever half arrived first — while the
-   *  provider/title maps are plain last-wins (`fx-provider:`/`fx-title:`
-   *  sentinels are each already a complete value). All three are gated on
-   *  `kind === "fx"` — every other agent kind never emits these sentinels,
-   *  so scanning the full (possibly windowed) event list on every render
-   *  for them is pure waste — and combined into a single pass over `events`
-   *  so a streamed fx task doesn't pay for three independent full scans of
-   *  the same (up to `EVENTS_WINDOW_MAX`-sized) array on every chunk. Note
-   *  the same windowing applies here as everywhere else `events` is read:
-   *  once an older run's events slide out of the kept window
-   *  (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its chips disappear too
-   *  — intended, not a bug to chase. */
-  const { usageByRunId, providerByRunId, titleByRunId } = useMemo(() => {
+   *  provider/title/recovery maps are plain last-wins (each sentinel —
+   *  `fx-provider:`/`fx-title:`/`fx-recovery:` — is already a complete
+   *  value; for recovery specifically, the newest sentinel for a run is
+   *  exactly the state that matters, since fx emits one per retry attempt
+   *  plus a final terminal one). All four are gated on `kind === "fx"` —
+   *  every other agent kind never emits these sentinels, so scanning the
+   *  full (possibly windowed) event list on every render for them is pure
+   *  waste — and combined into a single pass over `events` so a streamed fx
+   *  task doesn't pay for four independent full scans of the same (up to
+   *  `EVENTS_WINDOW_MAX`-sized) array on every chunk. Note the same
+   *  windowing applies here as everywhere else `events` is read: once an
+   *  older run's events slide out of the kept window
+   *  (`eventWindowKeepCount`/`EVENTS_WINDOW_MAX`), its chips (and any
+   *  recovery notice derived from it) disappear too — intended, not a bug
+   *  to chase. */
+  const { usageByRunId, providerByRunId, titleByRunId, recoveryByRunId } = useMemo(() => {
     const usage = new Map<string, FxUsagePayload>();
     const provider = new Map<string, string>();
     const title = new Map<string, string>();
-    if (kind !== "fx") return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title };
+    const recovery = new Map<string, FxRecoveryPayload>();
+    if (kind !== "fx") {
+      return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
+    }
     for (const e of events) {
       if (e.stream !== "status") continue;
       if (e.data.startsWith(FX_USAGE_STATUS_PREFIX)) {
@@ -1459,9 +1721,12 @@ function RunPanelBody({
       } else if (e.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX)) {
         const value = e.data.slice(FX_SESSION_TITLE_STATUS_PREFIX.length).trim();
         if (value) title.set(e.runId, value);
+      } else if (e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)) {
+        const parsed = parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
+        if (parsed) recovery.set(e.runId, parsed);
       }
     }
-    return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title };
+    return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
   }, [events, kind]);
 
   /** Background/sub-agent events bucketed by subagent id, in arrival order. */
@@ -1516,7 +1781,9 @@ function RunPanelBody({
   // `findMatchingEventIds` (lib/event-search.ts) takes `displayedEvents`
   // straight — it derives each event's search id from its own position in
   // the array, so there's no separate pre-mapped/id-tagged array to build
-  // or memoize here.
+  // or memoize here. (It matches a `user` event against its NORMALIZED text —
+  // lead-in stripped, `<pasted_content>` unwrapped — i.e. what the bubble
+  // actually shows; see `searchableEventText`.)
   const matches = useMemo(
     () => findMatchingEventIds(displayedEvents, searchQuery),
     [displayedEvents, searchQuery],
@@ -2032,6 +2299,207 @@ function RunPanelBody({
 
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
+  // fx-only: true while a Resume click is in flight for this task's paused
+  // recovery checkpoint (`pausedRecovery` below). Disables the Resume button
+  // so a second click can't fire a second `resumeFxRecovery` call while the
+  // first is still resolving — the server also guards this with a synchronous
+  // in-flight claim, but this keeps the button honest client-side too.
+  const [resumeBusy, setResumeBusy] = useState(false);
+  // The `latestRun.id` this panel had at the moment Resume was clicked —
+  // read by the busy-clearing effect below to detect when the runs
+  // snapshot has actually caught up with the resume, rather than clearing
+  // busy the instant the server call resolves. `null` once there's nothing
+  // left to wait for (no run at click time, or the request itself failed).
+  const resumeClickedRunIdRef = useRef<string | null>(null);
+  // Resume a paused fx recovery checkpoint (see `pausedRecovery` below) —
+  // continues the SAME model turn via `_meta.fx.continueRecovery` server-side,
+  // no new user message. On success there's nothing else to do here: the runs
+  // poll + SSE pick up the new run row, `latestRun` changes, and
+  // `pausedRecovery` recomputes to `null` on its own — `runsPollKickRef` just
+  // short-circuits the up-to-2s poll delay so the notice clears immediately
+  // instead of lagging behind the click. A failure (e.g. fx's own
+  // "No paused model response to continue" `-32602`) surfaces through the
+  // same `sendHint` line every other send-path error uses, verbatim.
+  //
+  // Deliberately does NOT clear `resumeBusy` in a `.finally` on the request
+  // itself: the server accepting the resume only means a new run row now
+  // exists somewhere in the DB — it says nothing about whether THIS panel's
+  // `runs`/`latestRun` state (2s poll + SSE) has observed it yet. Clearing
+  // busy on request-success would re-enable the button for the ~1-2s window
+  // between "server accepted" and "this panel's snapshot caught up", during
+  // which `pausedRecovery` below could still be reading the OLD failed run
+  // as resumable and re-offer the very checkpoint that was just consumed —
+  // a second click would then race the first resume against fx's own
+  // "already resumed"/"no paused response" error. So busy is left `true` on
+  // success and only cleared by the effect below, once `latestRun.id` has
+  // actually moved on from what it was at click time; a request failure has
+  // nothing new to wait for, so it clears busy immediately instead.
+  const handleResumeFxRecovery = useCallback(() => {
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow `resumeFxRecovery`
+    // resolving/rejecting after the user has moved to a different task must
+    // not touch task B's `resumeBusy`/`sendHint`/click-tracking state.
+    const sentTaskId = task.id;
+    resumeClickedRunIdRef.current = latestRun?.id ?? null;
+    setResumeBusy(true);
+    api.resumeFxRecovery(sentTaskId)
+      .then(() => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        runsPollKickRef.current();
+      })
+      .catch((e) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        setSendHint(e instanceof Error ? e.message : String(e));
+        resumeClickedRunIdRef.current = null;
+        setResumeBusy(false);
+      });
+  }, [task.id, latestRun]);
+  // Clears `resumeBusy` once the runs snapshot has observed a run identity
+  // different from the one captured at click time (see the comment above) —
+  // i.e. the new resumed run has actually shown up in `runs`/`latestRun`,
+  // not merely that the resume request round-tripped. Paired with the
+  // `task.column !== "running"` guard added to `pausedRecovery` below: that
+  // guard hides the notice as soon as the column SSE event flips (usually
+  // faster than the 2s runs poll), and this effect is the backstop for the
+  // gap before either signal has caught up — without both, the button (or
+  // the whole notice, before the column fix) could stay clickable long
+  // enough for a second resume to fire against the same stale checkpoint.
+  useEffect(() => {
+    if (!resumeBusy) return;
+    if (latestRun?.id !== resumeClickedRunIdRef.current) {
+      resumeClickedRunIdRef.current = null;
+      setResumeBusy(false);
+    }
+  }, [resumeBusy, latestRun]);
+  // fx-only: true while a "Cancel" click is in flight for this task's
+  // pending auto-resume timer (`pausedRecovery.autoResume` below). Unlike
+  // `resumeBusy` above, cancelling doesn't spawn a new run to wait for — it
+  // only clears `task.fxRecovery.autoResume` server-side — so busy is
+  // simply cleared once the request settles either way (`.finally`), no
+  // run-identity bookkeeping needed. `runsPollKickRef` still short-circuits
+  // the up-to-2s task/runs poll so the countdown line disappears (or the
+  // "cancelled" reason appears) as soon as the server has actually applied
+  // it, rather than lagging behind the click.
+  const [cancelAutoBusy, setCancelAutoBusy] = useState(false);
+  const handleCancelFxAutoResume = useCallback(() => {
+    // Captured before the request — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
+    setCancelAutoBusy(true);
+    api.cancelFxAutoResume(sentTaskId)
+      .then(() => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        runsPollKickRef.current();
+      })
+      .catch((e) => {
+        if (currentTaskIdRef.current !== sentTaskId) return;
+        setSendHint(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (currentTaskIdRef.current === sentTaskId) setCancelAutoBusy(false);
+      });
+  }, [task.id]);
+  /** Live fx recovery notice for the bottom-pinned heartbeat slot — fx's own
+   *  retry-progress line (e.g. "⚠ Rate limited · HTTP 429 · … · retrying
+   *  request in 8s · attempt 5/10"), rendered directly under
+   *  `RunningIndicator` while the CURRENT run is still mid-retry. It lives in
+   *  that slot (not as a transcript row) because it's ephemeral, in-place
+   *  progress — the same reason the heartbeat itself isn't a transcript row
+   *  — and updates live as new `fx-recovery:` sentinels arrive since
+   *  `recoveryByRunId` is derived from `events`. Gated on `kind === "fx"` and
+   *  `activeStream === "main"` (a background-agent tab never carries fx's own
+   *  retry loop — only the Main stream's turn does) same as `indicatorMode`/
+   *  `holdSummary` above. `null` whenever there's nothing live: wrong kind, a
+   *  subagent tab, no run currently `running`, or the latest run's newest
+   *  recovery sentinel isn't `state: "active"` — `paused` gets the notice
+   *  below instead, and `recovered`/`cleared` have nothing left to show here
+   *  (the persisted summary line for those transitions lives in the
+   *  transcript itself, written once by the driver, not derived on every
+   *  render by this memo). Ignores a `replayed: true` payload — on
+   *  `session/resume` fx replays the PRIOR turn's recovery updates onto the
+   *  new run before it starts making progress of its own, so a naive read
+   *  would flash a stale "attempt 10/10" (or worse, a stale `paused`) as if
+   *  it were live. `payload.replayed` is fx-acp.ts's own stamp, present only
+   *  while replay is in flight, never on a genuinely live sentinel — so this
+   *  memo simply reads as `null` (no live notice) until real progress on the
+   *  resumed turn arrives. `pausedRecovery` below deliberately does NOT
+   *  apply the same guard — see its comment. */
+  const liveRecoveryNotice = useMemo(() => {
+    if (kind !== "fx" || activeStream !== "main") return null;
+    if (!latestRun || latestRun.status !== "running") return null;
+    const payload = recoveryByRunId.get(latestRun.id);
+    if (!payload || payload.state !== "active" || payload.replayed === true) return null;
+    return fxRecoveryNoticeText(payload);
+  }, [kind, activeStream, latestRun, recoveryByRunId]);
+  /** Paused fx recovery notice + Resume affordance, same bottom slot as
+   *  `liveRecoveryNotice` (mutually exclusive with it — a run is either
+   *  `running` with an active retry or `failed` with a paused one, never
+   *  both). fx gave up after exhausting its retry budget: the run already
+   *  settled `failed` and the card is back off `running`, but the model's
+   *  mid-turn checkpoint is still resumable via `POST /tasks/:id/fx-resume`
+   *  as long as fx's own `requiredAction` says so (`isFxRecoveryResumable`).
+   *  `latestRun.status === "failed"` alone is enough to know no newer run is
+   *  in flight — `runs` is newest-first, so a failed `latestRun` IS the
+   *  newest run for this task. `null` for every non-fx kind, a subagent tab,
+   *  or an archived task (no mutation affordances on a frozen task — matches
+   *  every other archived-gated action in this panel), or once the latest
+   *  sentinel for that run no longer reads as resumable (e.g. a later
+   *  `cleared` sentinel from a normal follow-up prompt consuming the
+   *  checkpoint). The text itself (`fxRecoverySummaryLine`) is the same
+   *  "…resume once the limit clears, or send a new message." line the driver
+   *  already persisted into the transcript at the pause transition — this is
+   *  purely a live, disappearing-once-acted-on affordance layered on top,
+   *  not a second source of truth for what happened.
+   *
+   *  `latestRun.status === "failed"` alone is stale for up to the 2s runs-
+   *  poll interval after a new turn actually starts (Resume itself, or an
+   *  ordinary follow-up message sent from the composer): `runs` only
+   *  refreshes on that poll, so for that window `latestRun` can still be the
+   *  OLD failed run with its (still-resumable) payload even though a new run
+   *  is already `running` server-side — the button would stay clickable and
+   *  a second click could race the in-flight turn. `task.column !== "running"`
+   *  closes that window: the `column` field flips to `"running"` promptly via
+   *  the column SSE event (independent of the runs poll), so it's the
+   *  faster-arriving of the two signals here. The `resumeBusy`/
+   *  `resumeClickedRunIdRef` bookkeeping above is the complementary backstop
+   *  for a Resume click specifically (busy stays true until `latestRun.id`
+   *  itself has moved on) — this column check additionally covers an
+   *  ordinary new message reopening the same window.
+   *
+   *  Deliberately does NOT gate on `payload.replayed` the way
+   *  `liveRecoveryNotice` above does: a `paused` sentinel replayed onto a
+   *  resume run that itself died before making progress (e.g. the resume
+   *  turn's own connection dropped) is still an accurate description of
+   *  fx's checkpoint — fx never cleared it, so Resume must stay offered.
+   *  `liveRecoveryNotice` hides replayed sentinels because it renders
+   *  in-progress retry noise that goes stale the moment real progress
+   *  resumes; `pausedRecovery` renders a terminal state that stays true
+   *  until something explicit changes it (a `cleared` sentinel, or a
+   *  genuinely new run). */
+  // `autoResume`/`stopped` (below) are read straight off `task.fxRecovery` —
+  // the server-managed schedule/counter for THIS same paused checkpoint —
+  // rather than derived from the sentinel payload; the sentinel-derived
+  // `isFxRecoveryResumable` gate above still decides whether the notice
+  // shows at all, `task.fxRecovery` only adds the auto-resume-specific
+  // detail on top once it does.
+  const pausedRecovery = useMemo(() => {
+    if (kind !== "fx" || activeStream !== "main" || archived) return null;
+    if (task.column === "running") return null;
+    if (!latestRun || latestRun.status !== "failed") return null;
+    const payload = recoveryByRunId.get(latestRun.id);
+    if (!payload || !isFxRecoveryResumable(payload)) return null;
+    return {
+      text: fxRecoverySummaryLine(payload) ?? fxRecoveryNoticeText(payload),
+      busy: resumeBusy,
+      onResume: handleResumeFxRecovery,
+      autoResume: task.fxRecovery?.autoResume,
+      stopped: task.fxRecovery?.autoResumeStopped,
+      onCancelAuto: handleCancelFxAutoResume,
+      cancelBusy: cancelAutoBusy,
+    };
+  }, [
+    kind, activeStream, archived, task.column, latestRun, recoveryByRunId, resumeBusy,
+    handleResumeFxRecovery, task.fxRecovery, handleCancelFxAutoResume, cancelAutoBusy,
+  ]);
   // Messages backlog — saved, not-yet-sent drafts for this task. Seeded from
   // the task prop and kept in sync as the 2s task poll refreshes `task.backlog`;
   // each mutation also updates this optimistically from the endpoint's returned
@@ -2132,9 +2600,19 @@ function RunPanelBody({
   // Deps are `[task.id]` ONLY — App.tsx polls /tasks every 2s and rebuilds
   // the task object each tick, so depending on `latestRun`/`task` fields
   // here would restart this effect (and its poll cadence) every 2s.
+  //
+  // The first fetch waits on `awaitStreamReady()` (declared near
+  // `runsLoaded`, above) — a non-essential request like this one must not
+  // compete with the new task's SSE connection in the switch burst; see the
+  // subscription effect's leading comment. Deferring the loop's START this
+  // way (rather than adding `streamReady` to the dependency array) keeps the
+  // 5s cadence itself untouched once the loop is running, and keeps this
+  // effect's deps exactly as they were.
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
+      await awaitStreamReady();
+      if (cancelled) return;
       while (!cancelled) {
         try {
           const res = await api.getTaskGitStatus(task.id);
@@ -2223,6 +2701,14 @@ function RunPanelBody({
   // rebuilds the task object every tick, and depending on the whole object
   // (or on `task.workdir`, read via closure below) would refetch on every
   // poll tick instead of only on an actual task/PR change.
+  //
+  // The "no PR" branch clears state immediately (there's no request to
+  // defer); the actual `fetchPrStatus` call waits on `awaitStreamReady()`
+  // (same non-essential-fetch deferral as the git-status effect above) so it
+  // doesn't compete with the new task's SSE connection in the switch burst.
+  // `cancelled` guards against a task switch (or a `task.prUrl` change)
+  // landing between the await and the fetch — `fetchPrStatus` itself would
+  // otherwise fire for a task this effect instance no longer represents.
   useEffect(() => {
     const parsed = parsePrUrl(task.prUrl);
     if (!parsed) {
@@ -2233,8 +2719,13 @@ function RunPanelBody({
       setPrStatusError(null);
       return;
     }
+    let cancelled = false;
     prStatusRetriesRef.current = 0;
-    fetchPrStatus(task.workdir, parsed.number);
+    void awaitStreamReady().then(() => {
+      if (cancelled) return;
+      fetchPrStatus(task.workdir, parsed.number);
+    });
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id, task.prUrl]);
 
@@ -2278,14 +2769,22 @@ function RunPanelBody({
     // same text) is mid-flight — otherwise a fast Enter could both send and
     // save the same message.
     if (sending || backlogBusy) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    // The panel isn't remounted on task switch, so a slow `sendRunInput` (or
+    // its follow-up `listRuns`/`getTask` refresh) resolving after the user
+    // has moved on to a different task must not write task A's response into
+    // task B's composer/transcript state.
+    const sentTaskId = task.id;
     setSending(true);
     setSendHint(null);
     const body = appendReferences(line, sendRefs);
     try {
       const res = await api.sendRunInput(resumableRunId, body);
       if (res.delivered) {
-        setInput("");
-        setSendRefs([]);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setInput("");
+          setSendRefs([]);
+        }
         // The composer is now empty — clear the persisted draft so it can't
         // resurrect on next open. Cancel any pending autosave first, then
         // bump the write generation *before* firing the clear so an
@@ -2294,31 +2793,47 @@ function RunPanelBody({
         // review finding #4). Also drop pristine: the composer was just
         // consumed, so nothing should reseed it from a stale poll that still
         // shows the pre-clear draft (finding #2's adopt effects check this).
-        cancelDraftSaveTimer();
-        draftGenRef.current++;
-        lastSavedDraftRef.current = null;
-        draftPristineRef.current = false;
-        void api.clearTaskDraft(task.id).catch(() => {});
+        // These refs track THIS panel's currently-displayed task's draft, so
+        // they must only be touched when the panel hasn't moved on.
+        if (currentTaskIdRef.current === sentTaskId) {
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+        }
+        // Task A's persisted draft is cleared regardless of whether the panel
+        // has since switched away — the message was sent, so A's stashed
+        // draft should go either way. `sentTaskId` (not the possibly-stale
+        // `task.id` closure) is what was actually sent to.
+        void api.clearTaskDraft(sentTaskId).catch(() => {});
         // Drop the frozen JSONL snapshot — the auto-rebuild effect set
         // it from the last finished run, and the live SSE stream now
         // carries the new turn's events. Without this, the display
         // stays pinned on the pre-send transcript and the user's own
         // message never appears.
-        setRebuilt(null);
-        setRebuildNote(null);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
         // Pin the view to the newest content the moment the message is
         // accepted — the user's own message lands first, followed by
         // streamed assistant chunks. The unified task-level stream picks
         // up the new turn's events automatically; no run-switching needed.
         // Flip nearBottom so the streamed chunks that follow keep auto-
         // scrolling until the user manually scrolls up again.
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the paste was withheld and the server
         // already re-stashed this exact message into the task's backlog tray
@@ -2329,22 +2844,34 @@ function RunPanelBody({
         // instead of waiting for the next 2s task poll, and toast the
         // outcome — there's no run/turn here to carry a status line the way
         // a mid-turn withhold would.
-        setInput("");
-        setSendRefs([]);
-        cancelDraftSaveTimer();
-        draftGenRef.current++;
-        lastSavedDraftRef.current = null;
-        draftPristineRef.current = false;
-        void api.clearTaskDraft(task.id).catch(() => {});
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          setInput("");
+          setSendRefs([]);
+          cancelDraftSaveTimer();
+          draftGenRef.current++;
+          lastSavedDraftRef.current = null;
+          draftPristineRef.current = false;
+        }
+        void api.clearTaskDraft(sentTaskId).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
+        // Not per-task display state — surface regardless of which task the
+        // panel is showing now, same as any other toast.
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
+      // Do not clear task B's `sending` flag from task A's `finally` — if the
+      // panel has moved on, the reset effect already cleared it for B (or B
+      // has its own send in flight that owns it).
+      if (currentTaskIdRef.current === sentTaskId) setSending(false);
     }
   };
 
@@ -2385,28 +2912,34 @@ function RunPanelBody({
   const saveForLater = async () => {
     const text = input.trim();
     if (!text && !sendRefs.length) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.addBacklogItem(task.id, { text, references: sendRefs });
-      setBacklogItems(updated.backlog);
-      setInput("");
-      setSendRefs([]);
-      // Stashed into the backlog — clear the draft slot so it doesn't also
-      // resurrect in the composer on next open. Cancel any pending autosave
-      // first, then bump the write generation before firing the clear so an
-      // in-flight autosave PUT can't win the race and resurrect the
-      // just-stashed text (code review finding #4), and drop pristine so a
-      // stale poll can't reseed it either (finding #2).
-      cancelDraftSaveTimer();
-      draftGenRef.current++;
-      lastSavedDraftRef.current = null;
-      draftPristineRef.current = false;
-      void api.clearTaskDraft(task.id).catch(() => {});
+      const updated = await api.addBacklogItem(sentTaskId, { text, references: sendRefs });
+      if (currentTaskIdRef.current === sentTaskId) {
+        setBacklogItems(updated.backlog);
+        setInput("");
+        setSendRefs([]);
+        // Stashed into the backlog — clear the draft slot so it doesn't also
+        // resurrect in the composer on next open. Cancel any pending autosave
+        // first, then bump the write generation before firing the clear so an
+        // in-flight autosave PUT can't win the race and resurrect the
+        // just-stashed text (code review finding #4), and drop pristine so a
+        // stale poll can't reseed it either (finding #2).
+        cancelDraftSaveTimer();
+        draftGenRef.current++;
+        lastSavedDraftRef.current = null;
+        draftPristineRef.current = false;
+      }
+      void api.clearTaskDraft(sentTaskId).catch(() => {});
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2417,6 +2950,8 @@ function RunPanelBody({
   // item once the send is actually accepted.
   const sendBacklogItem = async (item: BacklogMessage) => {
     if (!resumableRunId || sending || backlogBusy || modalPending) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setSending(true);
     setBacklogBusy(true);
     setSendHint(null);
@@ -2425,22 +2960,32 @@ function RunPanelBody({
       const res = await api.sendRunInput(resumableRunId, body);
       if (res.delivered) {
         try {
-          const updated = await api.deleteBacklogItem(task.id, item.id);
-          setBacklogItems(updated.backlog);
+          const updated = await api.deleteBacklogItem(sentTaskId, item.id);
+          if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
         } catch {
           // The send landed; if the consume call fails, drop it locally so the
           // user doesn't accidentally resend. The next task poll reconciles.
-          setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+          if (currentTaskIdRef.current === sentTaskId) {
+            setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+          }
         }
-        setRebuilt(null);
-        setRebuildNote(null);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
         // No optimistic git-status touch here (main's #94 dropped that): the
         // git-status polling effect keeps `gitStatus` current on its own.
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // `item` was never deleted above (delivery failed), so it's still
         // sitting in `backlogItems` — do NOT delete it here. The server's
@@ -2450,16 +2995,23 @@ function RunPanelBody({
         // already present and does NOT write a duplicate entry — no local
         // filtering needed here any more. Just refetch and adopt whatever the
         // server has.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSending(false);
+        setBacklogBusy(false);
+      }
     }
   };
 
@@ -2467,31 +3019,39 @@ function RunPanelBody({
     itemId: string,
     patch: { text?: string; references?: TaskReference[] },
   ) => {
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.updateBacklogItem(task.id, itemId, patch);
-      setBacklogItems(updated.backlog);
+      const updated = await api.updateBacklogItem(sentTaskId, itemId, patch);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
   const removeBacklogItem = async (itemId: string) => {
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setBacklogBusy(true);
     setSendHint(null);
     const prev = backlogItems;
     setBacklogItems((p) => p.filter((m) => m.id !== itemId)); // optimistic
     try {
-      const updated = await api.deleteBacklogItem(task.id, itemId);
-      setBacklogItems(updated.backlog);
+      const updated = await api.deleteBacklogItem(sentTaskId, itemId);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setBacklogItems(prev); // roll back
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setBacklogItems(prev); // roll back
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2502,6 +3062,8 @@ function RunPanelBody({
     const idx = backlogItems.findIndex((m) => m.id === itemId);
     const to = idx + dir;
     if (idx < 0 || to < 0 || to >= backlogItems.length) return;
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     const next = [...backlogItems];
     const [moved] = next.splice(idx, 1);
     next.splice(to, 0, moved!);
@@ -2509,12 +3071,14 @@ function RunPanelBody({
     setBacklogBusy(true);
     setSendHint(null);
     try {
-      const updated = await api.reorderBacklog(task.id, next.map((m) => m.id));
-      setBacklogItems(updated.backlog);
+      const updated = await api.reorderBacklog(sentTaskId, next.map((m) => m.id));
+      if (currentTaskIdRef.current === sentTaskId) setBacklogItems(updated.backlog);
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setBacklogBusy(false);
+      if (currentTaskIdRef.current === sentTaskId) setBacklogBusy(false);
     }
   };
 
@@ -2527,6 +3091,8 @@ function RunPanelBody({
     // prefix and the push hint names the real branch. Shared with the CLI's
     // `agetor commit` / dashboard `c` so every surface sends the same text.
     const message = commitPushPrompt(task);
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
     // side action that shouldn't discard text the user has typed for the
     // next turn. `send()` clears those because it consumed them.
@@ -2535,28 +3101,41 @@ function RunPanelBody({
     try {
       const res = await api.sendRunInput(resumableRunId, message);
       if (res.delivered) {
-        setRebuilt(null);
-        setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the canned commit/push message was
         // withheld and stashed into the backlog tray instead of being lost.
         // Refresh the tray right away and toast the outcome; there's no
         // run/turn here to carry a status line the way a mid-turn withhold
         // would.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
-      } else {
+      } else if (currentTaskIdRef.current === sentTaskId) {
         setSendHint(res.reason);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      if (currentTaskIdRef.current === sentTaskId) {
+        setSendHint(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setSending(false);
+      if (currentTaskIdRef.current === sentTaskId) setSending(false);
     }
   };
 
@@ -2598,31 +3177,44 @@ function RunPanelBody({
       headRef: prStatus.headRef,
       baseRef: prStatus.baseRef,
     });
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    const sentTaskId = task.id;
     setResolvingConflicts(true);
     setSendHint(null);
     try {
       const res = await api.sendRunInput(resumableRunId, prompt);
       if (res.delivered) {
-        setRebuilt(null);
-        setRebuildNote(null);
-        void api.listRuns(task.id).then((list) => setRuns((prev) => reconcileById(prev, list, (r) => r.id))).catch(() => {});
-        nearBottomRef.current = true;
-        requestAnimationFrame(() => {
-          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-        });
-        if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
-        setResolveConflictsSent(true);
-        resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+        if (currentTaskIdRef.current === sentTaskId) {
+          setRebuilt(null);
+          setRebuildNote(null);
+        }
+        void api.listRuns(sentTaskId).then((list) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setRuns((prev) => reconcileById(prev, list, (r) => r.id));
+        }).catch(() => {});
+        if (currentTaskIdRef.current === sentTaskId) {
+          nearBottomRef.current = true;
+          requestAnimationFrame(() => {
+            if (currentTaskIdRef.current !== sentTaskId) return;
+            logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+          });
+          if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+          setResolveConflictsSent(true);
+          resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+        }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the merge/resolve-conflicts prompt was
         // withheld and stashed into the backlog tray instead of being lost.
         // Refresh the tray right away; toast (not toast.error — nothing
         // failed, the message just landed somewhere other than the agent)
         // since the button can be hidden by the time this resolves.
-        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        void api.getTask(sentTaskId).then((fresh) => {
+          if (currentTaskIdRef.current !== sentTaskId) return;
+          setBacklogItems(fresh.backlog);
+        }).catch(() => {});
         toast(res.reason);
       } else {
-        setSendHint(res.reason);
+        if (currentTaskIdRef.current === sentTaskId) setSendHint(res.reason);
         // The button can be hidden by the time this resolves — archived,
         // a subagent tab (dock-level), or the mergeability re-fetch clearing
         // `prStatus` — any of which would make `sendHint` invisible, so
@@ -2631,10 +3223,10 @@ function RunPanelBody({
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      setSendHint(msg);
+      if (currentTaskIdRef.current === sentTaskId) setSendHint(msg);
       toast.error(msg);
     } finally {
-      setResolvingConflicts(false);
+      if (currentTaskIdRef.current === sentTaskId) setResolvingConflicts(false);
     }
   };
 
@@ -2659,13 +3251,25 @@ function RunPanelBody({
     setReferences: setSendRefs,
     onReport: setSendHint,
   });
+  // Which tree the `@` file popover lists/validates against — derived via
+  // the shared `fileScopeForTask` (src/shared/file-scope.ts), the single
+  // source of truth for this rule across the webview, TUI and CLI. Declared
+  // above the `capabilities` hoist below — it feeds `useAgentCapabilities`
+  // the same scope, so project-level skill/command/MCP discovery reads
+  // exactly this tree too, never a stale `task.branch`-against-the-source-repo
+  // scope.
+  const fileScope = useMemo<FileScope>(() => {
+    const scope = fileScopeForTask(task);
+    return scope.ref ? { dir: scope.dir, ref: scope.ref } : { dir: scope.dir };
+  }, [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
   // Hoisted above the composer's own internal calls (passed down via
   // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
   // switches and the archived-without-canSend swap — which unmount and
   // remount `<PromptComposer>` — don't refire the capabilities disk walk or
   // the saved-prompts fetch on every round trip. See the comment above
-  // `sendRef`.
-  const capabilities = useAgentCapabilities(task.agent, task.workdir, task.branch ?? undefined);
+  // `sendRef`. Scoped by `fileScope` (the same `{dir, ref?}` pair the `@`
+  // popover uses), not a separate workdir/branch pair — see that memo above.
+  const capabilities = useAgentCapabilities(task.agent, fileScope);
   const savedPromptsState = useSavedPrompts();
   // Stable identity for RunEventList/UserMessageBlock's display-only path
   // shortening (see the `pathRoots` prop doc) — both are memoized, so a
@@ -2674,25 +3278,6 @@ function RunPanelBody({
     () => [task.worktreePath, task.workdir],
     [task.worktreePath, task.workdir],
   );
-  // Which tree the `@` file popover lists/validates against — must match what
-  // the server will expand against at send time (`task.worktreePath ?? task.workdir`,
-  // see orchestrator `sendInput`): the live worktree once it exists; before the
-  // first run of an isolated task, the source repo at whatever ref
-  // `prepareWorkdir` (worktree.ts) will actually check the worktree out on —
-  // `task.branch` when this task is pinned to a pre-existing branch
-  // (`branchSource === "existing"`, e.g. a PR's head branch), else the
-  // pinned `baseRef` a freshly-created branch will be cut from; a plain
-  // workdir otherwise.
-  const fileScope = useMemo<FileScope>(() => (
-    task.worktreePath
-      ? { dir: task.worktreePath }
-      : task.isolation === "worktree"
-        ? {
-            dir: task.workdir,
-            ref: task.branchSource === "existing" && task.branch ? task.branch : (task.baseRef ?? "HEAD"),
-          }
-        : { dir: task.workdir }
-  ), [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
   const onSendDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes("Files")) return;
     // Always preventDefault on a file dragover so WKWebView doesn't fall back
@@ -2714,7 +3299,13 @@ function RunPanelBody({
     setSendDragging(false);
     if (!canSend) return;
     setSendHint(null);
+    // Captured before the first await — see `currentTaskIdRef`'s doc comment.
+    // `capture.handleResult` writes into this composer's `setInput`/
+    // `setSendRefs`/`setSendHint`, which belong to whichever task is
+    // currently displayed — not necessarily the one the drop happened on.
+    const sentTaskId = task.id;
     const result = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
+    if (currentTaskIdRef.current !== sentTaskId) return;
     capture.handleResult(result);
   };
 
@@ -2925,11 +3516,23 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
-        <div className="mt-0.5 truncate text-xs text-muted-foreground">
-          {task.agent} · {task.column}
-          {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
-          {task.baseRef && (
-            <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+        <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+          <span className="truncate">
+            {task.agent} · {task.column}
+            {task.branch && <> · <span className="font-mono">{task.branch}</span></>}
+            {task.baseRef && (
+              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+            )}
+          </span>
+          {agentProfileDisplay && agentProfileForCard && (
+            <span data-testid="task-agent-profile-chip" title={agentProfileDisplay.summary} className="shrink-0">
+              <AgentProfileCard
+                profile={agentProfileForCard}
+                harnesses={harnesses}
+                variant="chip"
+                deleted={agentProfileDisplay.deleted}
+              />
+            </span>
           )}
         </div>
       </header>
@@ -3001,16 +3604,57 @@ function RunPanelBody({
         task={task}
         agents={agents}
         harnesses={harnesses}
+        agentProfileDisplay={agentProfileDisplay}
+        agentProfileForCard={agentProfileForCard}
+        onOpenSettingsAgents={onOpenSettingsAgents}
         agentModels={agentModels}
         harnessModels={harnessModels}
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
+        onTaskFieldsChanged={onTaskFieldsChanged}
         tmuxSession={latestRun?.tmuxSession ?? null}
+        // "Has this task ever run" for the Agent-details dialog's status
+        // line — the union of every signal in scope, since each is
+        // individually incomplete: `runs` (this component's own polled
+        // `GET /tasks/:id/runs` history) is the most truthful match for the
+        // orchestrator's own freeze gate (`runs.countForTask(task.id) === 0`,
+        // CLAUDE.md item 15) because it counts a run regardless of outcome,
+        // but reads empty for one brief tick after a task remount before its
+        // first poll lands; `task.hasOpenableRun` is available immediately
+        // from the task row itself (no fetch race) but excludes
+        // failed/cancelled runs, so a task whose only run failed would read
+        // as "never run" even though the profile is already frozen;
+        // `task.runId` only reflects a currently in-flight run and reverts
+        // to null once it settles. ORing all three means any one of them
+        // proving a run happened is enough.
+        hasRun={runs.length > 0 || task.hasOpenableRun || task.runId != null}
       />
 
       <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} titleByRun={titleByRunId} />
 
-      <TerminalsSection task={task} />
+      {/* Keyed on task id: RunPanelBody itself isn't remounted on a task
+          switch (see the `[task.id]` reset effect above), so without this key
+          `TerminalsSection` — and the `TerminalView` it mounts — would keep
+          the previous task's open/closed state and sockets. Keying forces a
+          fresh mount per task, which both re-seeds the open/closed toggle
+          from the new task's `openTerminalCount` and, via `TerminalView`'s
+          own unmount, closes the previous task's terminal sockets instead of
+          leaking them across the switch.
+
+          The key is NAMESPACED (`terminals-…`), never a bare `task.id`:
+          `BacklogTray` below is a sibling in this same children list and is
+          keyed per task too. Sibling keys share one namespace, and React's
+          keyed reconciliation keeps a single old fiber per key — with two
+          `key={task.id}` siblings the tray's fiber shadowed this one, so
+          every re-render on the reconciler's map-based slow path while the
+          tray was mounted — in practice all of them, since the normally
+          `false` `{searchOpen && …}` child above breaks the fast path —
+          mounted a NEW section and never deleted the old one (a growing
+          stack of TERMINAL rows, each holding a live `TerminalView`). The
+          rule for this fragment: every keyed child carries its component's
+          name in the key (`PlanDialog` below is the third one). See
+          docs/plans/terminal-section-duplication.md. */}
+      <TerminalsSection key={`terminals-${task.id}`} task={task} awaitReady={awaitStreamReady} />
 
       {showSubagentTabs && (
         <SubagentTabs
@@ -3110,6 +3754,7 @@ function RunPanelBody({
         // rest of the panel's life — this property, together with
         // converting path 1 to a layout effect (see the pin-paths comment
         // above), is what closes that hole.
+        data-testid="transcript-log"
         className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed [overflow-anchor:none]"
       >
         <div ref={logContentRef}>
@@ -3135,9 +3780,17 @@ function RunPanelBody({
               </Button>
             </div>
           )}
-          {runs.length === 0 ? (
+          {!runsLoaded && displayedEvents.length === 0 ? (
+            // Gated on BOTH `runsLoaded` and `displayedEvents.length` — the SSE
+            // subscription is now issued before `listRuns` (see the stream-first
+            // task-switch work), so a replay can land its events before the
+            // slower `listRuns` response arrives. Showing the skeleton on
+            // `!runsLoaded` alone would hide those already-rendered events
+            // behind "Loading messages…" until `listRuns` finally resolves.
+            <div className="text-muted-foreground" data-testid="transcript-loading">Loading messages…</div>
+          ) : runsLoaded && runs.length === 0 ? (
             <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
-          ) : displayedEvents.length === 0 ? (
+          ) : runsLoaded && displayedEvents.length === 0 ? (
             <div className="text-muted-foreground">Waiting for the first event…</div>
           ) : (
             <>
@@ -3169,6 +3822,8 @@ function RunPanelBody({
                 runStatus={activeRunStatus}
                 indicatorMode={indicatorMode}
                 holdSummary={holdSummary}
+                recoveryNotice={liveRecoveryNotice}
+                pausedRecovery={pausedRecovery}
                 taskId={task.id}
                 pathRoots={pathRoots}
                 plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
@@ -3182,7 +3837,14 @@ function RunPanelBody({
                   // backlog tray instead of losing it. Refresh the tray right
                   // away and toast (not toast.error — nothing failed).
                   toast(reason);
-                  void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+                  // Captured before the async gap — see `currentTaskIdRef`'s
+                  // doc comment: this panel may have switched to a different
+                  // task by the time `getTask` resolves.
+                  const sentTaskId = task.id;
+                  void api.getTask(sentTaskId).then((fresh) => {
+                    if (currentTaskIdRef.current !== sentTaskId) return;
+                    setBacklogItems(fresh.backlog);
+                  }).catch(() => {});
                 }}
               />
             </>
@@ -3199,6 +3861,15 @@ function RunPanelBody({
           view-only (`readOnly`), so saved drafts aren't silently invisible. */}
       {activeStream === "main" && backlogItems.length > 0 && (
         <BacklogTray
+          // Keyed on task id so a switch between two tasks that both have
+          // backlog items remounts the tray instead of carrying over its
+          // internal `editingId` (RunPanelBody itself isn't remounted — see
+          // the `[task.id]` reset effect above, which resets everything IT
+          // owns but can't reach into a child's local state without this).
+          // Namespaced, not a bare `task.id`: `TerminalsSection` above is a
+          // keyed sibling in this same children list, and two siblings with
+          // one key make React leak the earlier one on every re-render.
+          key={`backlog-${task.id}`}
           fileScope={fileScope}
           items={backlogItems}
           canSend={canSend && !modalPending}
@@ -3259,8 +3930,6 @@ function RunPanelBody({
             value={input}
             onChange={setInput}
             agent={task.agent}
-            workdir={task.workdir}
-            branch={task.branch ?? undefined}
             references={sendRefs}
             onReferencesChange={setSendRefs}
             setReferences={setSendRefs}
@@ -3530,10 +4199,13 @@ function RunPanelBody({
       {/* Keyed by plan id (stable across in-place status/edit updates as
           `plans` refreshes from the poll or a mutation's returned Task) so
           the dialog's internal text/mode state resets on genuine plan
-          switches but survives its own plan being updated in place. */}
+          switches but survives its own plan being updated in place.
+          Namespaced (`plan-…`) like the other two keyed children of this
+          fragment (`TerminalsSection`, `BacklogTray`): no two children here
+          may ever share a key — see the comment on `TerminalsSection`. */}
       {openPlan && (
         <PlanDialog
-          key={openPlan.id}
+          key={`plan-${openPlan.id}`}
           task={task}
           plan={openPlan}
           agentKind={kind}
@@ -4370,15 +5042,49 @@ function RunsList({
  * themselves live on the bun side and survive the panel closing entirely.
  * Defaults open when the task already has terminals (`openTerminalCount`).
  */
-function TerminalsSection({ task }: { task: Task }) {
+function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTaskId: string) => Promise<void> }) {
   const count = task.openTerminalCount;
   // Seed open from the count at mount, then let the user own the toggle —
   // binding `open` to the polled count would re-expand the section whenever
-  // the count changes (e.g. closing one of two terminals). RunPanel remounts
-  // on task switch (keyed by id), so this re-seeds per task.
+  // the count changes (e.g. closing one of two terminals). `RunPanelBody`
+  // itself is NOT remounted on a task switch, but this section is keyed on
+  // `task.id` at its call site above, so it (and the `TerminalView` it
+  // mounts) gets a fresh instance per task — that's what re-seeds this open/
+  // closed state and closes the previous task's terminal sockets instead of
+  // carrying them over.
   const [open, setOpen] = useState(count > 0);
+  // Defer mounting `TerminalView` (and its `listTerminals` fetch) until the
+  // stream-first gate opens — same non-essential-fetch deferral as the
+  // git-status/PR-mergeability effects in `RunPanelBody` (see plan
+  // §3.4(c)): without this, a terminal list request competes with the SSE
+  // subscription for the webview's shared per-host connection budget in the
+  // task-switch burst. Seeded false and re-resolved on every mount because
+  // this component is keyed on `task.id` at its call site, so each task gets
+  // its own fresh `ready` gate.
+  const [ready, setReady] = useState(false);
+  // `awaitReady` (RunPanelBody's `awaitStreamReady`) is a plain function
+  // recreated every parent render, not a stable `useCallback` — captured in
+  // a ref (same pattern as `onCloseRef` above) so this effect doesn't tear
+  // down and re-run on every RunPanelBody re-render (e.g. the 2s kanban
+  // poll). This component is keyed on `task.id` at its call site, so it
+  // mounts fresh — and re-awaits — once per task regardless.
+  const awaitReadyRef = useRef(awaitReady);
+  awaitReadyRef.current = awaitReady;
+  useEffect(() => {
+    let cancelled = false;
+    // Pass this section's own task id: the gate is task-keyed because this
+    // mount effect runs BEFORE RunPanelBody's reset effect on a task switch,
+    // so a bare "is the stream ready" boolean would still be the previous
+    // task's answer here.
+    const forTaskId = task.id;
+    void awaitReadyRef.current(forTaskId).then(() => {
+      if (!cancelled) setReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [task.id]);
   return (
     <details
+      data-testid="terminals-section"
       className="border-b border-border/60"
       open={open}
       onToggle={(e) => setOpen(e.currentTarget.open)}
@@ -4389,7 +5095,7 @@ function TerminalsSection({ task }: { task: Task }) {
         </span>
       </summary>
       <div className="h-80 border-t border-border/60">
-        <TerminalView taskId={task.id} />
+        {ready && <TerminalView taskId={task.id} />}
       </div>
     </details>
   );
@@ -4423,6 +5129,8 @@ function RunEventList({
   runStatus,
   indicatorMode = "off",
   holdSummary = null,
+  recoveryNotice = null,
+  pausedRecovery = null,
   taskId,
   plans = [],
   onOpenPlan,
@@ -4444,6 +5152,28 @@ function RunEventList({
    *  (`holdSummary` in `RunPanelBody`) since it needs `task.column` and
    *  `runs`, neither of which this component has. */
   holdSummary?: string | null;
+  /** fx's own live retry-progress line (`liveRecoveryNotice` in
+   *  `RunPanelBody`, e.g. "⚠ Rate limited · HTTP 429 · … · retrying request
+   *  in 8s · attempt 5/10"), rendered as a `RecoveryNotice` directly under
+   *  `RunningIndicator`/`HoldingIndicator` at the bottom of the transcript —
+   *  the same "what's happening right now, in place" slot the heartbeat
+   *  occupies, not a transcript row, because it's ephemeral progress that
+   *  keeps rewriting itself in place as fx retries. `null` whenever there's
+   *  nothing live to show (see the caller's doc comment for the full gate).
+   *  The persisted explanation of what actually happened (paused/recovered)
+   *  lives in the transcript itself, written once by the driver — this prop
+   *  is a separate, purely-derived, disappearing-on-its-own affordance. */
+  recoveryNotice?: string | null;
+  /** fx paused (exhausted its retry budget) and the checkpoint is still
+   *  resumable — rendered as a `PausedRecoveryNotice` + Resume button in the
+   *  same bottom slot, mutually exclusive with `recoveryNotice` (see the
+   *  caller's `pausedRecovery` doc comment for the full gate, including why
+   *  it's archived- and subagent-tab-gated). `text` is the driver's own
+   *  persisted "…resume once the limit clears…" line reused for the live
+   *  affordance's label; `busy` disables the button while a resume request is
+   *  in flight; `onResume` is the click handler. `null` when there's nothing
+   *  to resume. */
+  pausedRecovery?: { text: string; busy: boolean; onResume: () => void } | null;
   /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
@@ -4451,7 +5181,9 @@ function RunEventList({
   /** The task's own filesystem roots (`worktreePath`, `workdir`) — used by
    *  `UserMessageBlock` for DISPLAY-ONLY folding of expanded absolute `@`
    *  paths back to the mention form the user typed. Never consulted for
-   *  chips/previews, which need the real absolute paths. */
+   *  chips/previews, which need the real absolute paths. Also consulted by
+   *  `MdImage` (via `MdImageScopeContext`, provided below) to resolve a
+   *  relative markdown image `src` against the task's roots. */
   pathRoots?: readonly (string | null | undefined)[];
   /** Plans detected on this task (`task.plans`) — Cursor's
    *  `createPlanToolCall` or claude-code's `ExitPlanMode`. Empty (`NO_PLANS`)
@@ -4797,12 +5529,27 @@ function RunEventList({
     return out;
   }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
 
+  // Scopes every `MdImage` under this list (assistant/user bubbles, tagged
+  // segments, the plan-approval preview) to this task's id + roots without
+  // threading props through each intermediate component. See
+  // `MdImageScopeContext`'s doc comment in `MdImage.tsx`. `allowLocal: true`
+  // — this is the user's own agent transcript, a trusted source, unlike
+  // `GitHubDialog`'s scope-less (`allowLocal: false`) default.
+  const mdImageScope = useMemo<MdImageScope>(
+    () => ({ taskId, roots: pathRoots ?? EMPTY_MD_IMAGE_SCOPE.roots, allowLocal: true }),
+    [taskId, pathRoots],
+  );
+
   return (
-    <div className="flex flex-col gap-4">
-      {blocks}
-      {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
-      {holdSummary && <HoldingIndicator text={holdSummary} />}
-    </div>
+    <MdImageScopeContext.Provider value={mdImageScope}>
+      <div className="flex flex-col gap-4">
+        {blocks}
+        {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
+        {holdSummary && <HoldingIndicator text={holdSummary} />}
+        {recoveryNotice && <RecoveryNotice text={recoveryNotice} />}
+        {pausedRecovery && <PausedRecoveryNotice {...pausedRecovery} />}
+      </div>
+    </MdImageScopeContext.Provider>
   );
 }
 
@@ -4840,6 +5587,139 @@ function HoldingIndicator({ text }: { text: string }) {
     <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
       <span className="inline-flex size-2 shrink-0 rounded-full bg-info" />
       <span>{text}</span>
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom, in-place progress line for an fx model call that's
+ * mid-retry (`liveRecoveryNotice` in `RunPanelBody`, derived from the newest
+ * `fx-recovery:` sentinel on the currently-`running` run). Lives right below
+ * `RunningIndicator` — same reasoning as `HoldingIndicator`: this is "what's
+ * happening under the transcript right now", not conversation content, so it
+ * doesn't get a transcript row. It rewrites itself in place as new sentinels
+ * arrive (the caller's memo recomputes on `events`) rather than accumulating
+ * one row per retry attempt. The persisted "recovery paused …" / "✓
+ * recovered …" lines that explain the outcome AFTER the fact live in the
+ * transcript itself — written once by the driver at the terminal transition,
+ * never derived here — so this component only ever shows the transient
+ * in-progress state, never the aftermath. `title` carries the identical text
+ * (there's no separate "long form" to fall back to); the visible line itself
+ * is clamped to one row via `truncate` so a long fx message (which can run to
+ * a full sentence with an embedded Gateway URL) doesn't wrap and push the
+ * composer down — hovering it reveals the full line. The visible content
+ * goes through `renderLinkified` so an embedded `https://…` Gateway URL
+ * renders as a clickable link; `title` stays the plain `text` string (a
+ * link inside a native tooltip wouldn't be clickable anyway).
+ */
+function RecoveryNotice({ text }: { text: string }) {
+  return (
+    <div
+      data-testid="fx-recovery-notice"
+      title={text}
+      className="truncate rounded-md border border-warning/30 bg-warning/10 px-2 py-1 text-[11px] text-warning"
+    >
+      {renderLinkified(text)}
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom notice for a PAUSED fx recovery checkpoint (fx exhausted
+ * its retry budget) plus the Resume affordance — same bottom slot as
+ * `RecoveryNotice`, mutually exclusive with it (`pausedRecovery` in
+ * `RunPanelBody` only ever computes non-null once the run has settled
+ * `failed`, at which point no run is `running` any more so `recoveryNotice`
+ * is already `null`). Unlike `RecoveryNotice` this one is NOT purely
+ * ephemeral progress — it stays up until the user either resumes or sends a
+ * new message (which the driver's own `cleared` sentinel will reflect,
+ * collapsing this notice on the next render) — but it's still layered on top
+ * of, not a replacement for, the driver's own persisted "…resume once the
+ * limit clears…" transcript line reused here as `text` — rendered through
+ * `renderLinkified` so an embedded Gateway URL is clickable, same as
+ * `RecoveryNotice`. Clicking Resume calls `RunPanelBody`'s
+ * `handleResumeFxRecovery`, which posts to `POST /tasks/:id/fx-resume` and
+ * continues the SAME paused model turn — no new user-authored message is
+ * sent.
+ *
+ * `autoResume`/`stopped`/`onCancelAuto`/`cancelBusy` are the
+ * `Task.fxRecovery`-derived auto-resume state layered on top of that same
+ * checkpoint (`docs/plans/fx-recovery-follow-ups.md` §3.5): when
+ * `autoResume` is set, a second line renders the live `useCountdown`
+ * countdown plus a Cancel button that calls `RunPanelBody`'s
+ * `handleCancelFxAutoResume` (`DELETE /tasks/:id/fx-auto-resume`); when
+ * instead `stopped` is set (no timer currently pending, and a reason is on
+ * record for why), a plain reason line explains it. Neither prop is
+ * required — a caller with no auto-resume schedule at all (e.g. before T2's
+ * engine has run) renders just the base notice + Resume button, identical
+ * to before this field existed.
+ */
+function PausedRecoveryNotice({
+  text,
+  busy,
+  onResume,
+  autoResume,
+  stopped,
+  onCancelAuto,
+  cancelBusy,
+}: {
+  text: string;
+  busy: boolean;
+  onResume: () => void;
+  autoResume?: TaskFxRecovery["autoResume"];
+  stopped?: TaskFxRecovery["autoResumeStopped"];
+  onCancelAuto?: () => void;
+  cancelBusy?: boolean;
+}) {
+  const countdown = useCountdown(autoResume?.at ?? null);
+  return (
+    <div
+      data-testid="fx-recovery-paused"
+      className="flex flex-col gap-1.5 rounded-md border border-danger/30 bg-danger/10 px-2 py-1.5 text-[11px] text-danger"
+    >
+      <div className="flex items-start gap-2">
+        <span className="min-w-0 flex-1">{renderLinkified(text)}</span>
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          data-testid="fx-recovery-resume"
+          disabled={busy}
+          onClick={onResume}
+          className="h-6 shrink-0 px-2 text-[11px]"
+        >
+          Resume
+        </Button>
+      </div>
+      {autoResume && (
+        <div className="flex items-center gap-2">
+          <span data-testid="fx-recovery-countdown" className="min-w-0 flex-1">
+            {`Auto-resume in ${countdown} (${autoResume.attempt}/${autoResume.max})`}
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            data-testid="fx-recovery-cancel-auto"
+            disabled={cancelBusy}
+            onClick={onCancelAuto}
+            className="h-6 shrink-0 px-2 text-[11px] text-danger hover:text-danger"
+          >
+            Cancel
+          </Button>
+        </div>
+      )}
+      {stopped && (
+        <span className="text-danger/80">
+          {stopped === "exhausted"
+            ? `Auto-resume gave up after ${FX_AUTO_RESUME_MAX} attempts.`
+            : stopped === "cancelled"
+              ? "Auto-resume cancelled."
+              : stopped === "failed"
+                ? "Auto-resume could not start — resume manually."
+                : "Auto-resume disabled in Settings."}
+        </span>
+      )}
     </div>
   );
 }
@@ -4980,6 +5860,27 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // visual position after expand/collapse.
   const pendingAdjustRef = useRef<{ scroller: HTMLElement; prevHeight: number } | null>(null);
 
+  // Normalize once, up front, and feed every branch below from this single
+  // string instead of the raw wire `text`: CR→LF (tmux's paste-buffer
+  // artifact — see event-dedup.ts) then `normalizeDeliveredUserText`
+  // (shared/user-message.ts) — which strips agetor's own typed lead-in line
+  // and unwraps claude CLI's `<pasted_content id="…">…</pasted_content
+  // id="…">` wrapper around a bracketed-paste follow-up (see
+  // docs/plans/pasted-content-tags.md D1/D2). Without this, a pasted send's
+  // lead-in + wrapper tags would show up verbatim in the ordinary-message
+  // fallback branch (`ordinary` below), which — unlike `parsed` — used to
+  // read straight off `text`. `parseUserMessage` re-runs the same
+  // normalization internally (a no-op here since it's already applied — see
+  // `normalizeDeliveredUserText`'s identity-on-no-match contract), so
+  // handing it already-normalized text changes nothing about its own
+  // behavior; it just means every downstream consumer (segments, path
+  // folding, "Show more" measuring, copy/quote of the bubble) sees the same
+  // clean string.
+  const normalizedText = useMemo(
+    () => normalizeDeliveredUserText(text.replace(/\r\n?/g, "\n")),
+    [text],
+  );
+
   // Recognize slash-command invocations (XML expansion or plain echo),
   // `<local-command-stdout>` blocks, and (see `src/shared/user-message.ts`'s
   // "tagged" kind) any other message carrying balanced top-level tags — a
@@ -4987,20 +5888,18 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // so all of these render as structured UI instead of literal `<tag>` text.
   // `null` for an ordinary message — the fallback branch below renders
   // exactly what this component always has.
-  const parsed = useMemo(() => parseUserMessage(text), [text]);
+  const parsed = useMemo(() => parseUserMessage(normalizedText), [normalizedText]);
 
   // For an ordinary (non-command) message, split off a trailing "Referenced
   // files/folders:" block the same way the command branch already does, so
   // an image-attached (or file/folder-attached) send renders its paths as
-  // chips instead of a literal bullet list in the markdown body. Newlines
-  // are normalized first — `splitReferences`' blank-line paragraph split
-  // needs real `\n`s, and the JSONL twin of a send can carry bare `\r`s (see
-  // event-dedup.ts). When there's no trailing refs block, `splitReferences`
-  // returns `args` unchanged and an empty `references` array, so this is a
-  // no-op split for the common case.
+  // chips instead of a literal bullet list in the markdown body. When
+  // there's no trailing refs block, `splitReferences` returns `args`
+  // unchanged and an empty `references` array, so this is a no-op split for
+  // the common case.
   const ordinary = useMemo(
-    () => splitReferences(text.replace(/\r\n?/g, "\n")),
-    [text],
+    () => splitReferences(normalizedText),
+    [normalizedText],
   );
 
   // Strip `[Image #N]` placeholders only when the message actually carries
@@ -5137,7 +6036,11 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
               you
             </div>
             <div ref={contentRef} className={collapseClassName}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={USER_MD_COMPONENTS}
+                urlTransform={MD_URL_TRANSFORM}
+              >
                 {displayOrdinaryArgs}
               </ReactMarkdown>
             </div>
@@ -5161,7 +6064,11 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
 const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
   return (
     <div className="agetor-md text-foreground">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={ASSISTANT_MD_COMPONENTS}
+        urlTransform={MD_URL_TRANSFORM}
+      >
         {text}
       </ReactMarkdown>
     </div>
@@ -5189,11 +6096,22 @@ const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
   );
 });
 
+// `text` stays a plain `string` prop (not the `renderLinkified` output)
+// specifically so `memo`'s default shallow comparator actually catches a
+// same-text rerender: `renderLinkified` returns a freshly allocated array
+// whenever it finds a link, so passing its result as the prop would hand
+// this component a new-identity node on every parent render and defeat the
+// memo outright. Linkifying happens INSIDE the component instead, via
+// `useMemo` keyed on `text`, so a status line carrying a bare URL (e.g. an
+// fx recovery/auto-resume line) still renders it as a clickable
+// `ExternalLink`, and a no-URL line still renders the identical text node
+// across rerenders.
 const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
+  const content = useMemo(() => renderLinkified(text), [text]);
   return (
     <div className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
       <span className="h-px flex-1 bg-border" />
-      <span>{text}</span>
+      <span>{content}</span>
       <span className="h-px flex-1 bg-border" />
     </div>
   );
@@ -5840,28 +6758,87 @@ function TaskDetails({
   task,
   agents,
   harnesses,
+  agentProfileDisplay,
+  agentProfileForCard,
+  onOpenSettingsAgents,
   agentModels,
   harnessModels,
   onRefreshModels,
   homeDir,
+  onTaskFieldsChanged,
   tmuxSession,
+  hasRun,
 }: {
   task: Task;
   agents: AgentStatus[];
   harnesses: Harness[];
+  /** Resolved agent-profile chip data for this task (`null` when the task
+   *  was never bound to a profile) — see `RunPanelBody`'s own computation,
+   *  reused here so the lock/hint/Detach affordances below and the header
+   *  chip never disagree on the profile's name / deleted state. */
+  agentProfileDisplay: TaskProfileDisplay | null;
+  /** The richer live-or-snapshot object `AgentProfileCard` itself renders
+   *  from (model/effort/mode/instructions/skills) — same object the header
+   *  chip uses (`RunPanelBody`'s `agentProfileForCard`), reused here for the
+   *  Agent row's chip so the two never disagree. `null` alongside
+   *  `agentProfileDisplay` when the task was never bound to a profile. */
+  agentProfileForCard: AgentProfile | AgentProfileSnapshot | null;
+  /** "Manage agents…" — the bound-profile hint's sibling link into Settings. */
+  onOpenSettingsAgents: () => void;
   agentModels: AgentModelMap;
   harnessModels: Record<string, { id: string; label?: string }[]>;
   onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
+  /** Optimistically merges partial task fields into the parent's `tasks`
+   *  state — used by Detach below so the unlock is visible immediately
+   *  instead of waiting for the next 2s poll. */
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
   /** Tmux session name from the latest run (claude-code only). `null` when
    *  no run has spawned a session yet — the Tmux row hides itself in that
    *  case rather than presenting an Attach button that's guaranteed to 404. */
   tmuxSession: string | null;
+  /** Whether this task has ever run — see the call site's doc comment
+   *  (`RunPanelBody`) for how this is derived. Threaded through to
+   *  `AgentProfileDetailsDialog`'s status line only. */
+  hasRun: boolean;
 }) {
   // Spins the Model row's ↻ button while a manual `onRefreshModels` probe is
   // in flight for this task's harness — mirrors NewTaskForm's affordance.
   const [refreshingModels, setRefreshingModels] = useState(false);
-  const editable = task.column !== "running" && task.column !== "blocked";
+  // A task bound to an agent profile (plan D5) locks the four dropdowns
+  // (+ cursor fast/max) regardless of run state — only Detach unlocks them.
+  // `runningLock` alone (the pre-existing rule) still gates the Detach
+  // button itself, so a bound task can't be detached mid-run.
+  const runningLock = task.column === "running" || task.column === "blocked";
+  const profileLock = task.agentProfileId != null;
+  const editable = !runningLock && !profileLock;
+  const [detaching, setDetaching] = useState(false);
+  // Agent-details modal (plan D2), opened by clicking the chip in the Agent
+  // row below. Closed defensively if the task becomes unbound while open —
+  // Detach clears `task.agentProfileId`/`agentProfile` out from under it, and
+  // a still-open dialog would otherwise render a suddenly-empty snapshot.
+  const [profileDialogOpen, setProfileDialogOpen] = useState(false);
+  useEffect(() => {
+    if (profileDialogOpen && !profileLock) setProfileDialogOpen(false);
+  }, [profileDialogOpen, profileLock]);
+  const detachProfile = async () => {
+    setDetaching(true);
+    try {
+      const updated = await api.detachTaskAgentProfile(task.id);
+      // Merge the returned task's cleared `agentProfileId`/`agentProfile`
+      // back optimistically — don't wait for the parent's 2s task poll
+      // (`App.tsx`) to unlock the dropdowns. Only these two fields, never
+      // the whole snapshot (would revert a concurrent optimistic patch).
+      onTaskFieldsChanged?.(task.id, {
+        agentProfileId: updated.agentProfileId,
+        agentProfile: updated.agentProfile,
+      });
+    } catch (e) {
+      toast.error("Couldn't detach agent", { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setDetaching(false);
+    }
+  };
   const kind = harnessKindOf(task.agent, harnesses);
   const selectedStatus = agents.find((a) => a.harnessId === task.agent);
 
@@ -5969,6 +6946,11 @@ function TaskDetails({
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
+    // A profile-bound task's effort is owned by the profile, not this
+    // cascade — mutating it here would PATCH a field the profile lock is
+    // supposed to keep the user's hands off (see the `profileLock`/`editable`
+    // rule above).
+    if (task.agentProfileId != null) return;
     if (task.effort && retainable.has(task.effort)) return;
     if (supportedEffortsForModel.length === 0) {
       if (task.effort !== null) void save({ effort: null });
@@ -5979,15 +6961,19 @@ function TaskDetails({
       : supportedEffortsForModel[0]!.id;
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel]);
+  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId]);
   useEffect(() => {
+    // Same profile-lock guard as the effort cascade above — `fast`/`maxMode`
+    // are also profile-owned fields once bound.
+    if (task.agentProfileId != null) return;
     if (task.fast && !fastAvailable) void save({ fast: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fastAvailable, task.fast]);
+  }, [fastAvailable, task.fast, task.agentProfileId]);
   useEffect(() => {
+    if (task.agentProfileId != null) return;
     if (task.maxMode && !maxModeAvailable) void save({ maxMode: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [maxModeAvailable, task.maxMode]);
+  }, [maxModeAvailable, task.maxMode, task.agentProfileId]);
 
   const onAgentChange = (nextId: string) => {
     if (nextId === task.agent) return;
@@ -5997,7 +6983,7 @@ function TaskDetails({
     // the user re-pick if they want something specific. Sent as one PATCH
     // so the server-side reconcile only fires once.
     const nextKind = harnessKindOf(nextId, harnesses);
-    const nextMode = AGENT_OPTIONS[nextKind].modes[0]?.id ?? "auto";
+    const nextMode = defaultModeFor(nextKind);
     const nextModel = DEFAULT_MODEL[nextKind];
     // Same merged-rows source `modelOptions` reads from (rule 7's
     // logged-out distrust), but for the harness being switched TO rather
@@ -6017,230 +7003,340 @@ function TaskDetails({
     void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
   };
 
+  const modeOptions = supportedModes(kind, task.model);
+  // A stored `task.mode === null` resolves at spawn/display time via the
+  // single shared `defaultModeFor(kind)` (`AGENT_OPTIONS[kind].modes[0]?.id
+  // ?? "auto"`, `shared/types.ts`) — every driver's `buildCommand` now
+  // resolves a null mode the same way, so this dropdown's fallback and the
+  // actual spawn default can't drift apart. For every kind except fx this is
+  // `"auto"`, because `modes[0]` IS `"auto"`. fx is the one exception: 0.0.8
+  // reordered `AGENT_OPTIONS.fx.modes` to put `yolo` ("Full access") first —
+  // per the owner's explicit call in `docs/plans/fx-recovery-follow-ups.md`
+  // §3.6, a null-mode fx row now spawns (and this dropdown shows) "Full
+  // access", not "auto", superseding the earlier no-silent-escalation rule.
+  //
+  // `defaultModeFor(kind)` is a kind-wide default and doesn't know about
+  // per-model mode denials (`MODEL_MODE_DENY`) — `modeOptions` above already
+  // filtered those out. Every deny list is empty today, so this guard is
+  // latent, but the <Select> below must never be handed a value with no
+  // matching <option>, so fall back to the first still-offered mode (or, in
+  // the pathological all-denied case, a hardcoded safe default) rather than
+  // trusting the kind-wide default blindly.
+  const preferred = defaultModeFor(kind);
+  const nullModeFallback = modeOptions.some((m) => m.id === preferred)
+    ? preferred
+    : (modeOptions[0]?.id ?? "bypass");
+  // Hint-line name fallback (finding F1-1): prefer the resolved display's
+  // name, then the raw frozen snapshot's own name, and only fall back to
+  // "an unknown agent" copy when neither yields anything — never interpolate
+  // an empty quoted name into the sentence.
+  const agentProfileHintName = agentProfileDisplay?.name || task.agentProfile?.name || null;
+  // Action-cluster gate (finding F1-1): a task can be locked
+  // (`task.agentProfileId != null`) with no readable snapshot AND no
+  // matching live profile — malformed snapshot JSON, or a retired harness
+  // kind — in which case `agentProfileForCard` is null even though the row
+  // is very much bound to *something*. Gating on `profileLock` in addition
+  // to `agentProfileDisplay` (which is itself already non-null whenever
+  // `profileLock` is true — see `resolveTaskProfileDisplay`) keeps the
+  // Detach/Manage affordances reachable in that case instead of stranding
+  // the user behind a "None" row they can't escape.
+  const showAgentProfileActions = profileLock || agentProfileDisplay != null;
+
   return (
-    <details className="border-b border-border/60 px-3 py-2 text-xs">
-      <summary className="cursor-pointer text-muted-foreground">
-        <span className="text-[10px] uppercase tracking-wide">Task details</span>
-      </summary>
-      <div className="mt-2 space-y-2">
-        <div>
-          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
-          <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
-        </div>
+    <>
+      <details className="border-b border-border/60 px-3 py-2 text-xs">
+        <summary className="cursor-pointer text-muted-foreground">
+          <span className="text-[10px] uppercase tracking-wide">Task details</span>
+        </summary>
+        <div className="mt-2 space-y-2">
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
+            <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
+          </div>
 
-        {!editable && (
-          <p className="text-[10px] italic text-muted-foreground">
-            Stop the run to change agent / mode / model / effort.
-          </p>
-        )}
+          {!editable && (
+            <p
+              className="text-[10px] italic text-muted-foreground"
+              data-testid={profileLock ? "task-agent-profile-hint" : undefined}
+            >
+              {profileLock
+                ? (agentProfileHintName
+                  ? `Bound to agent "${agentProfileHintName}" — detach to edit.`
+                  : "Bound to an unknown agent — detach to edit.")
+                : "Stop the run to change agent / mode / model / effort."}
+            </p>
+          )}
 
-        <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">
-          <dt className="text-muted-foreground">Agent</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <AgentSelect
-                value={task.agent}
-                harnesses={harnesses}
-                agents={agents}
-                onChange={onAgentChange}
-              />
-            ) : (
-              <span className="inline-flex items-center gap-1">
-                <AgentIcon kind={kind} className="size-3" /> {task.agent}
-              </span>
-            )}
-          </dd>
-
-          <dt className="text-muted-foreground">Mode</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.mode ?? supportedModes(kind, task.model)[0]?.id ?? "bypass"}
-                options={supportedModes(kind, task.model)}
-                onChange={(mode) => void save({ mode })}
-              />
-            ) : (
-              <span>{task.mode ?? "—"}</span>
-            )}
-          </dd>
-
-          <dt className="flex items-center gap-1 text-muted-foreground">
-            Model
-            {editable && (
-              <Tooltip label="Refresh model list">
-                <button
-                  type="button"
-                  aria-label="Refresh model list"
-                  data-testid="refresh-models-details"
-                  disabled={refreshingModels}
-                  className={cn(
-                    "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
-                    refreshingModels && "animate-spin",
+          <dl className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-[11px]">
+            <dt className="text-muted-foreground">Agent</dt>
+            <dd className="min-w-0">
+              {showAgentProfileActions ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  {agentProfileForCard ? (
+                    <button
+                      type="button"
+                      data-testid="task-agent-profile-open"
+                      aria-haspopup="dialog"
+                      aria-expanded={profileDialogOpen}
+                      aria-label="View agent details"
+                      onClick={() => setProfileDialogOpen(true)}
+                      className="min-w-0 max-w-full rounded-full transition-opacity hover:opacity-80"
+                    >
+                      <AgentProfileCard
+                        variant="chip"
+                        profile={agentProfileForCard}
+                        harnesses={harnesses}
+                        deleted={agentProfileDisplay?.deleted ?? true}
+                      />
+                    </button>
+                  ) : (
+                    <span data-testid="task-agent-profile-unknown" className="text-warning">
+                      Unknown agent
+                    </span>
                   )}
-                  onClick={async () => {
-                    setRefreshingModels(true);
-                    try {
-                      await onRefreshModels(task.agent);
-                    } catch {
-                      // The SSE / ready-retry paths also refetch.
-                    } finally {
-                      setRefreshingModels(false);
-                    }
-                  }}
-                >
-                  <RefreshCw className="size-3" />
-                </button>
-              </Tooltip>
-            )}
-          </dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.model ?? DEFAULT_MODEL[kind]}
-                options={modelOptions}
-                onChange={(model) => void save({ model })}
-              />
-            ) : (
-              <span>{task.model ?? "—"}</span>
-            )}
-          </dd>
-
-          <dt className="text-muted-foreground">Effort</dt>
-          <dd className="min-w-0">
-            {editable ? (
-              <CompactSelect
-                value={task.effort ?? ""}
-                options={effortSelectOptions}
-                onChange={(effort) => void save({ effort })}
-                disabled={supportedEffortsForModel.length === 0}
-                placeholder="n/a"
-              />
-            ) : (
-              <span>{task.effort ?? "—"}</span>
-            )}
-          </dd>
-
-          {kind === "cursor" && (maxModeAvailable || task.maxMode) && (
-            <>
-              <dt className="text-muted-foreground">Max Mode</dt>
-              <dd className="min-w-0">
-                {editable ? (
-                  <Switch
-                    checked={task.maxMode}
-                    onCheckedChange={(maxMode) => void save({ maxMode })}
-                    disabled={!maxModeAvailable}
-                    aria-label="Use Cursor Max Mode context"
-                  />
-                ) : (
-                  <span>{task.maxMode ? "on" : "off"}</span>
-                )}
-              </dd>
-            </>
-          )}
-
-          {kind === "cursor" && (fastAvailable || task.fast) && (
-            <>
-              <dt className="text-muted-foreground">Fast</dt>
-              <dd className="min-w-0">
-                {editable ? (
-                  <Switch
-                    checked={task.fast}
-                    onCheckedChange={(fast) => void save({ fast })}
-                    disabled={!fastAvailable}
-                    aria-label="Use Cursor fast variant"
-                  />
-                ) : (
-                  <span>{task.fast ? "on" : "off"}</span>
-                )}
-              </dd>
-            </>
-          )}
-
-          <dt className="text-muted-foreground">Project</dt>
-          <dd className="min-w-0 truncate font-mono" title={task.workdir}>
-            {abbreviateHome(task.workdir, homeDir)}
-          </dd>
-
-          <dt className="text-muted-foreground">Isolation</dt>
-          <dd className="min-w-0">{task.isolation}</dd>
-
-          {task.branch && (
-            <>
-              <dt className="text-muted-foreground">Branch</dt>
-              <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
-            </>
-          )}
-          {task.baseRef && (
-            <>
-              <dt className="text-muted-foreground">Base</dt>
-              <dd className="min-w-0 truncate font-mono">{task.baseRef.slice(0, 12)}</dd>
-            </>
-          )}
-          {kind === "claude-code" && tmuxSession && (
-            <>
-              <dt className="text-muted-foreground">Tmux</dt>
-              <dd className="flex min-w-0 items-center justify-between gap-2">
-                <span className="min-w-0 truncate font-mono" title={tmuxSession}>
-                  {tmuxSession}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 px-2 text-[10px]"
+                    data-testid="task-agent-profile-detach"
+                    disabled={runningLock || detaching}
+                    onClick={() => void detachProfile()}
+                  >
+                    Detach
+                  </Button>
+                  <button
+                    type="button"
+                    data-testid="task-agent-profile-manage"
+                    onClick={onOpenSettingsAgents}
+                    className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    Manage agents…
+                  </button>
+                </div>
+              ) : (
+                <span data-testid="task-agent-profile-none" className="text-muted-foreground">
+                  None
                 </span>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 shrink-0 px-2 text-[11px]"
-                  onClick={() => {
-                    void api.openTmux(task.id).catch((err: unknown) => {
-                      const msg = err instanceof Error ? err.message : "Could not attach to tmux session";
-                      toast.error(msg);
-                    });
-                  }}
-                  title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
-                >
-                  <Terminal className="mr-1 size-3" /> Attach
-                </Button>
-              </dd>
-            </>
-          )}
-          {task.references.length > 0 && (
-            <>
-              <dt className="text-muted-foreground self-start">Files</dt>
-              <dd className="min-w-0">
-                <details open>
-                  <summary className="cursor-pointer text-muted-foreground">
-                    <span className="font-mono">({task.references.length})</span>{" "}
-                    files / folders
-                  </summary>
-                  <ul className="mt-1 space-y-0.5">
-                    {task.references.map((r) => {
-                      const Icon = iconForRef(r);
-                      return (
-                        <li
-                          key={r.path}
-                          title={r.path}
-                          className="flex items-center gap-1"
-                        >
-                          <Icon className="size-3 shrink-0 opacity-70" />
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void api
-                                .openPath({ path: r.path, taskId: task.id })
-                                .catch(() => {})
-                            }
-                            className="truncate font-mono text-left hover:underline"
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Harness</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <AgentSelect
+                  value={task.agent}
+                  harnesses={harnesses}
+                  agents={agents}
+                  onChange={onAgentChange}
+                />
+              ) : (
+                <span className="inline-flex items-center gap-1">
+                  <AgentIcon kind={kind} className="size-3" /> {task.agent}
+                </span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Mode</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.mode ?? nullModeFallback}
+                  options={modeOptions}
+                  onChange={(mode) => void save({ mode })}
+                />
+              ) : (
+                <span>{task.mode ?? "—"}</span>
+              )}
+            </dd>
+
+            <dt className="flex items-center gap-1 text-muted-foreground">
+              Model
+              {editable && (
+                <Tooltip label="Refresh model list">
+                  <button
+                    type="button"
+                    aria-label="Refresh model list"
+                    data-testid="refresh-models-details"
+                    disabled={refreshingModels}
+                    className={cn(
+                      "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                      refreshingModels && "animate-spin",
+                    )}
+                    onClick={async () => {
+                      setRefreshingModels(true);
+                      try {
+                        await onRefreshModels(task.agent);
+                      } catch {
+                        // The SSE / ready-retry paths also refetch.
+                      } finally {
+                        setRefreshingModels(false);
+                      }
+                    }}
+                  >
+                    <RefreshCw className="size-3" />
+                  </button>
+                </Tooltip>
+              )}
+            </dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.model ?? DEFAULT_MODEL[kind]}
+                  options={modelOptions}
+                  onChange={(model) => void save({ model })}
+                />
+              ) : (
+                <span>{task.model ?? "—"}</span>
+              )}
+            </dd>
+
+            <dt className="text-muted-foreground">Effort</dt>
+            <dd className="min-w-0">
+              {editable ? (
+                <CompactSelect
+                  value={task.effort ?? ""}
+                  options={effortSelectOptions}
+                  onChange={(effort) => void save({ effort })}
+                  disabled={supportedEffortsForModel.length === 0}
+                  placeholder="n/a"
+                />
+              ) : (
+                <span>{task.effort ?? "—"}</span>
+              )}
+            </dd>
+
+            {kind === "cursor" && (maxModeAvailable || task.maxMode) && (
+              <>
+                <dt className="text-muted-foreground">Max Mode</dt>
+                <dd className="min-w-0">
+                  {editable ? (
+                    <Switch
+                      checked={task.maxMode}
+                      onCheckedChange={(maxMode) => void save({ maxMode })}
+                      disabled={!maxModeAvailable}
+                      aria-label="Use Cursor Max Mode context"
+                    />
+                  ) : (
+                    <span>{task.maxMode ? "on" : "off"}</span>
+                  )}
+                </dd>
+              </>
+            )}
+
+            {kind === "cursor" && (fastAvailable || task.fast) && (
+              <>
+                <dt className="text-muted-foreground">Fast</dt>
+                <dd className="min-w-0">
+                  {editable ? (
+                    <Switch
+                      checked={task.fast}
+                      onCheckedChange={(fast) => void save({ fast })}
+                      disabled={!fastAvailable}
+                      aria-label="Use Cursor fast variant"
+                    />
+                  ) : (
+                    <span>{task.fast ? "on" : "off"}</span>
+                  )}
+                </dd>
+              </>
+            )}
+
+            <dt className="text-muted-foreground">Project</dt>
+            <dd className="min-w-0 truncate font-mono" title={task.workdir}>
+              {abbreviateHome(task.workdir, homeDir)}
+            </dd>
+
+            <dt className="text-muted-foreground">Isolation</dt>
+            <dd className="min-w-0">{task.isolation}</dd>
+
+            {task.branch && (
+              <>
+                <dt className="text-muted-foreground">Branch</dt>
+                <dd className="min-w-0 truncate font-mono">{task.branch}</dd>
+              </>
+            )}
+            {task.baseRef && (
+              <>
+                <dt className="text-muted-foreground">Base</dt>
+                <dd className="min-w-0 truncate font-mono">{task.baseRef.slice(0, 12)}</dd>
+              </>
+            )}
+            {kind === "claude-code" && tmuxSession && (
+              <>
+                <dt className="text-muted-foreground">Tmux</dt>
+                <dd className="flex min-w-0 items-center justify-between gap-2">
+                  <span className="min-w-0 truncate font-mono" title={tmuxSession}>
+                    {tmuxSession}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 shrink-0 px-2 text-[11px]"
+                    onClick={() => {
+                      void api.openTmux(task.id).catch((err: unknown) => {
+                        const msg = err instanceof Error ? err.message : "Could not attach to tmux session";
+                        toast.error(msg);
+                      });
+                    }}
+                    title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
+                  >
+                    <Terminal className="mr-1 size-3" /> Attach
+                  </Button>
+                </dd>
+              </>
+            )}
+            {task.references.length > 0 && (
+              <>
+                <dt className="text-muted-foreground self-start">Files</dt>
+                <dd className="min-w-0">
+                  <details open>
+                    <summary className="cursor-pointer text-muted-foreground">
+                      <span className="font-mono">({task.references.length})</span>{" "}
+                      files / folders
+                    </summary>
+                    <ul className="mt-1 space-y-0.5">
+                      {task.references.map((r) => {
+                        const Icon = iconForRef(r);
+                        return (
+                          <li
+                            key={r.path}
+                            title={r.path}
+                            className="flex items-center gap-1"
                           >
-                            {refBasename(r.path)}{r.isDirectory ? "/" : ""}
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </details>
-              </dd>
-            </>
-          )}
-        </dl>
-      </div>
-    </details>
+                            <Icon className="size-3 shrink-0 opacity-70" />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void api
+                                  .openPath({ path: r.path, taskId: task.id })
+                                  .catch(() => {})
+                              }
+                              className="truncate font-mono text-left hover:underline"
+                            >
+                              {refBasename(r.path)}{r.isDirectory ? "/" : ""}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </details>
+                </dd>
+              </>
+            )}
+          </dl>
+        </div>
+      </details>
+      <AgentProfileDetailsDialog
+        open={profileDialogOpen}
+        onClose={() => setProfileDialogOpen(false)}
+        task={task}
+        display={agentProfileDisplay}
+        deleted={agentProfileDisplay?.deleted ?? false}
+        hasRun={hasRun}
+        harnesses={harnesses}
+        onOpenSettingsAgents={onOpenSettingsAgents}
+      />
+    </>
   );
 }
 
@@ -6629,7 +7725,11 @@ function TmuxPromptCard({
         </p>
         {planMarkdown && (
           <div className="agetor-md mb-3 max-h-64 overflow-y-auto rounded-md border border-border/40 bg-muted/20 p-2 text-foreground">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={ASSISTANT_MD_COMPONENTS}
+              urlTransform={MD_URL_TRANSFORM}
+            >
               {planMarkdown}
             </ReactMarkdown>
           </div>

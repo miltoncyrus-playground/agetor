@@ -247,7 +247,12 @@ async function killGracefully(child: ChildProcess): Promise<void> {
  * per test; see that fixture's doc comment for why it exists) below.
  * `logLabel` only affects log/error messages (e.g. "worker 2" vs a test
  * title) so a startup failure or mid-suite-death report points at the right
- * instance.
+ * instance. `options.extraEnv` (default `{}`) is merged on top of the base
+ * env below — additive, spread last so a spec-supplied value always wins —
+ * for a test that needs a seam env var (e.g.
+ * `AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS`, see `docs/plans/task-details-blank-
+ * while-session-restores.md` §5 E1) on its own dedicated backend rather than
+ * the worker-shared one. See the `backendEnv` fixture option below.
  */
 async function provisionBackend(
   apiPort: number,
@@ -255,9 +260,10 @@ async function provisionBackend(
   githubStubPort: number,
   logLabel: string,
   use: (backend: E2EBackend) => Promise<void>,
-  options?: { fakePickRefsDir?: boolean },
+  options?: { fakePickRefsDir?: boolean; extraEnv?: Record<string, string> },
 ): Promise<void> {
   const fakePickRefsDir = options?.fakePickRefsDir ?? true;
+  const extraEnv = options?.extraEnv ?? {};
   const apiBase = `http://127.0.0.1:${apiPort}`;
 
   await assertPortFree(apiBase, apiPort);
@@ -326,6 +332,26 @@ async function provisionBackend(
       // fixture — no spec here starts a run on any of them.
       AGETOR_FX_DRIVER: "fake",
       AGETOR_FX_BIN: fxStubBinPath,
+      // Test seam for the fx auto-resume engine (`docs/plans/fx-recovery-
+      // follow-ups.md` §3, `orchestrator.ts`'s `fxAutoResumePrefs`) — shrinks
+      // the auto-resume delay from the 120s default down to 2s so
+      // `e2e/fx-recovery.spec.ts` can observe a scheduled/cancelled/fired
+      // auto-resume within a normal test timeout instead of waiting out the
+      // production default. Read once per schedule/re-arm, so it applies to
+      // every fx task this worker's backend ever runs, not just one spec's
+      // tasks — no other spec file in this fixture starts an fx run.
+      AGETOR_FX_AUTO_RESUME_DELAY_MS: "2000",
+      // Test seam for the fake fx driver's recovery scenario (`src/bun/
+      // agents.ts`'s `FAKE_FX_RECOVERY_URL_PROMPT_MARKER` doc comment) —
+      // process-wide equivalent of the per-task prompt marker, so every
+      // `active`/`paused` recovery message this worker's fake fx driver
+      // emits carries a fake Gateway URL suffix
+      // (" · upgrade at https://example.invalid/upgrade"), letting
+      // `e2e/fx-recovery.spec.ts` exercise the notice's clickable-link
+      // rendering without a real Gateway URL. Off (unset) would leave every
+      // such message byte-identical to before this constant existed — on
+      // is what this spec's tests are written against.
+      AGETOR_FAKE_FX_RECOVERY_URL: "1",
       // Points every GitHub REST/GraphQL call this backend makes at a local
       // stub server instead of the real api.github.com (see
       // src/bun/github.ts's `GITHUB_API_BASE` seam and e2e/github-stub.ts).
@@ -341,6 +367,9 @@ async function provisionBackend(
       // shells out to `gh auth token` on the dev machine (which could hang,
       // fail, or leak a real token into a test run).
       GITHUB_TOKEN: "e2e-github-token",
+      // Spec-supplied overrides/additions (see `extraEnv`'s doc above) —
+      // spread last so they can override any of the defaults above too.
+      ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -469,7 +498,7 @@ const HEADLESS_PICK_BASE_API_PORT = 5000;
 const HEADLESS_PICK_GITHUB_STUB_BASE_PORT = 5100;
 
 export const test = base.extend<
-  { freshBackend: E2EBackend; headlessPickBackend: E2EBackend },
+  { freshBackend: E2EBackend; headlessPickBackend: E2EBackend; backendEnv: Record<string, string> },
   { backend: E2EBackend }
 >({
   backend: [
@@ -507,11 +536,18 @@ export const test = base.extend<
   // independently (fresh welcome dialog, skip-then-persist, existing-user
   // auto-dismiss), so each gets its own virgin backend instead of fighting
   // over one shared DB.
-  freshBackend: async ({}, use, testInfo) => {
+  // Additive test option (not a fixture with real setup/teardown of its
+  // own — `{ option: true }` makes it configurable via
+  // `test.use({ backendEnv: {...} })`), consumed by `freshBackend` below.
+  // Defaults to `{}` so every existing `freshBackend` consumer spawns its
+  // backend exactly as before.
+  backendEnv: [{}, { option: true }],
+
+  freshBackend: async ({ backendEnv }, use, testInfo) => {
     const apiPort = FRESH_BASE_API_PORT + testInfo.parallelIndex;
     const apiToken = `e2e-fresh-w${testInfo.parallelIndex}-${randomUUID()}`;
     const githubStubPort = FRESH_GITHUB_STUB_BASE_PORT + testInfo.parallelIndex;
-    await provisionBackend(apiPort, apiToken, githubStubPort, `test "${testInfo.title}"`, use);
+    await provisionBackend(apiPort, apiToken, githubStubPort, `test "${testInfo.title}"`, use, { extraEnv: backendEnv });
   },
 
   // Test-scoped, structurally identical to `freshBackend` above, but spawned

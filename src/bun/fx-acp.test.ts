@@ -14,6 +14,7 @@ import path from "node:path";
 import {
   dropFxSession,
   fxSessionActive,
+  parseFxEffortOption,
   reapLiveFxProcs,
   spawnFxViaAcp,
   type FxLaunchOptions,
@@ -21,6 +22,7 @@ import {
 } from "./fx-acp.ts";
 import {
   FX_PROVIDER_STATUS_PREFIX,
+  FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
@@ -98,6 +100,30 @@ const FAKE_ACP_SERVER_SRC = [
   "  }, ms);",
   "}",
   "",
+  "// fx >=0.0.9's `configOptions[{id:\"effort\"}]` shape (TT1) — a real",
+  "// `session/new`/`resume`/`load` result carries this entry only when the",
+  "// active model advertises efforts (see docs/plans/fx-0.0.10-compat.md §3,",
+  "// the zai/glm-5.3-flash row: [max, high, low, auto]); the fake always",
+  "// offers auto/low/high/max in that order (matching the plan's example",
+  "// breadcrumb text 'offers: auto, low, high, max') so every TT1 scenario's",
+  "// expected text is stable regardless of which currentValue it starts at.",
+  "function effortOption(currentValue) {",
+  "  return {",
+  '    id: "effort",',
+  '    name: "Reasoning Effort",',
+  '    description: "Controls how much the model thinks before responding",',
+  '    category: "thought_level",',
+  '    type: "select",',
+  "    currentValue: currentValue,",
+  "    options: [",
+  '      { value: "auto", name: "default" },',
+  '      { value: "low", name: "low" },',
+  '      { value: "high", name: "high" },',
+  '      { value: "max", name: "max" }',
+  "    ]",
+  "  };",
+  "}",
+  "",
   'process.on("SIGTERM", function () {',
   '  capture("sigterm", {});',
   "  process.exit(0);",
@@ -145,6 +171,27 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (scenario === "provider") {',
   '    result.configOptions = [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }];',
   "  }",
+  "  if (scenario === \"effort-set\" || scenario === \"effort-auto-default\" || scenario === \"effort-not-offered\" || scenario === \"effort-set-error\") {",
+  '    result.configOptions = [effortOption("auto")];',
+  "  }",
+  "  // \"effort-option-absent\" and everything else deliberately get no",
+  "  // configOptions field at all — the 0.0.8-shaped result parseFxEffortOption",
+  "  // must read as \"no effort entry\" (returns null).",
+  "  if (scenario === \"effort-option-empty\") {",
+  "    // Phase 5 review fix: a PRESENT effort entry with an empty options",
+  '    // list — genuinely-offered-but-nothing-to-offer — must be treated the',
+  '    // same as an absent entry by applyFxEffort, not routed into the',
+  '    // "isn\'t offered (offers: )" breadcrumb.',
+  "    result.configOptions = [{",
+  '      id: "effort",',
+  '      name: "Reasoning Effort",',
+  '      description: "Controls how much the model thinks before responding",',
+  '      category: "thought_level",',
+  '      type: "select",',
+  '      currentValue: "auto",',
+  "      options: []",
+  "    }];",
+  "  }",
   "  ok(id, result);",
   "}",
   "",
@@ -164,6 +211,59 @@ const FAKE_ACP_SERVER_SRC = [
   "  }",
   '  if (scenario === "provider") {',
   '    ok(id, { configOptions: [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }] });',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replays-paused" || scenario === "resume-replays-paused-prompt-fails" || scenario === "resume-continue-repause") {',
+  "    // fx replays the session's prior history — including a still-paused",
+  "    // recovery checkpoint — onto the NEW run BEFORE the resume response",
+  "    // itself resolves (TT3 scenario 5; also shared by the finding #4",
+  "    // prompt-error variant and the finding #2 dedupe-reset scenario, both",
+  "    // of which need the identical replay to set up their own case).",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
+  '  if (scenario === "effort-on-resume") {',
+  "    // Persisted currentValue from a prior turn — TT1 scenario 6 (and its",
+  '    // effort-auto-reset variant) reuse this one server-side shape.',
+  '    ok(id, { configOptions: [effortOption("high")] });',
+  "    return;",
+  "  }",
+  '  if (scenario === "effort-on-load") {',
+  "    // Force the session/load fallback so the effort option is applied",
+  "    // from the LOAD result instead of resume's (TT1 scenario 7).",
+  '    fail(id, -32602, "Invalid params (fake, forcing fallback for effort-on-load)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-same-chunk-update") {',
+  "    // Phase 5 review fix: pumpStdout drains a whole stdout chunk",
+  "    // synchronously (handleLine called for every complete line in it)",
+  "    // before the driver's `await sendRpc(..., \"session/resume\")` ever",
+  "    // resumes as a microtask — so a session/update that fx writes into",
+  "    // the SAME chunk as the resume response must be judged by the line",
+  "    // ORDER within that chunk, not by whether the awaiting code has run",
+  "    // yet. One raw process.stdout.write call, three newline-terminated",
+  "    // JSON lines: a replayed tool_call (still inside the replay window —",
+  "    // must be dropped), the session/resume response itself (closes the",
+  "    // window), then a live agent_message_chunk (must NOT be dropped).",
+  "    var sameChunkToolCall = JSON.stringify({ jsonrpc: \"2.0\", method: \"session/update\", params: { update: { sessionUpdate: \"tool_call\", toolCallId: \"same-chunk-hist-1\", name: \"shell\", title: \"Run ls (replayed)\", kind: \"execute\", status: \"pending\", rawInput: { command: \"ls\" } } } });",
+  "    var sameChunkResponse = JSON.stringify({ jsonrpc: \"2.0\", id: id, result: {} });",
+  "    var sameChunkLiveUpdate = JSON.stringify({ jsonrpc: \"2.0\", method: \"session/update\", params: { update: { sessionUpdate: \"agent_message_chunk\", messageId: \"same-chunk-msg\", content: { type: \"text\", text: \"same-chunk live text\" } } } });",
+  '    process.stdout.write(sameChunkToolCall + "\\n" + sameChunkResponse + "\\n" + sameChunkLiveUpdate + "\\n");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replay-structured") {',
+  "    // TT1 scenario 9: 0.0.9+ structured replay of a paused checkpoint —",
+  "    // real tool_call/tool_call_update frames plus assistant text and a",
+  "    // title update, all sent BEFORE the resume response itself, while",
+  "    // the driver's `state.replaying` window is open.",
+  '    notify("session/update", { update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "replayed user text" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "hist-1", name: "shell", title: "Run ls", kind: "execute", status: "pending", rawInput: { command: "ls" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "hist-1", status: "completed", content: [{ type: "content", content: { type: "text", text: "ok" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "hist-msg", content: { type: "text", text: "partial answer" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", title: "Replayed title" } });',
+  "    ok(id, {});",
   "    return;",
   "  }",
   "  ok(id, {});",
@@ -187,13 +287,19 @@ const FAKE_ACP_SERVER_SRC = [
   "    ok(id, {});",
   "    return;",
   "  }",
+  '  if (scenario === "effort-on-load") {',
+  "    // TT1 scenario 7: the effort option arrives on the LOAD result (not",
+  "    // resume's, which failed above), currentValue still at fx's default.",
+  '    ok(id, { configOptions: [effortOption("auto")] });',
+  "    return;",
+  "  }",
   "  ok(id, {});",
   "}",
   "",
   "function handlePrompt(id, params) {",
   "  promptId = id;",
   '  capture("session/prompt", params);',
-  '  if (scenario === "happy" || scenario === "resume" || scenario === "resume-fallback") {',
+  '  if (scenario === "happy" || scenario === "resume" || scenario === "resume-fallback" || scenario === "resume-replays-paused") {',
   "    streamHappyUpdates();",
   '    endTurn(id, 20, "end_turn");',
   "    return;",
@@ -400,11 +506,86 @@ const FAKE_ACP_SERVER_SRC = [
   '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
+  '  if (scenario === "recovery") {',
+  "    // TT3 scenario 1: 429 storm — two updates for attempt 1 (with/without",
+  "    // delaySeconds, mirroring fx's real per-attempt double-send), attempt",
+  "    // 2, then a terminal paused update, then a refused stopReason with an",
+  '    // empty usage object (fx\'s real shape on a refused turn).',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 1, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request · attempt 1/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 1, attemptLimit: 10, delaySeconds: 1, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request in 1s · attempt 1/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "active", kind: "auto_retry", cause: "rate_limited", action: "retrying_request", attempt: 2, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · retrying request · attempt 2/10" } } } } });',
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  '    endTurnWithUsage(id, 15, "refused", {});',
+  "    return;",
+  "  }",
+  '  if (scenario === "continue") {',
+  "    // TT3 scenario 2: continueRecovery turn — fx resumes the paused",
+  "    // checkpoint and it succeeds on the first attempt.",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "recovered", kind: "auto_recovered", attempt: 1, attemptLimit: 10, durable: true, message: "✓ recovered · succeeded on attempt 1/10" } } } } });',
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "continue-rejected") {',
+  "    // TT3 scenario 3: fx's own -32602 validation error for a second",
+  "    // continue against an already-consumed checkpoint.",
+  '    fail(id, -32602, "No paused model response to continue");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-invalid-params") {',
+  "    // TT3 scenario 6: a normal (non-continueRecovery) -32602 must NOT get",
+  "    // the continueRecovery-only verbatim treatment — still wrapped.",
+  '    fail(id, -32602, "Invalid params (fake, no continueRecovery carve-out)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replays-paused-prompt-fails") {',
+  "    // Finding #4 regression: the NORMAL prompt that would otherwise",
+  "    // consume the replayed checkpoint fails at the transport level",
+  "    // instead of resolving — the cleared sentinel must NOT fire, since",
+  "    // fx never actually got to run the prompt that clears its checkpoint.",
+  '    fail(id, -32602, "Invalid params (fake, replayed-paused prompt error)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-continue-repause") {',
+  "    // Finding #2 regression: the continueRecovery turn immediately",
+  "    // re-pauses with a payload BYTE-IDENTICAL to the one just replayed",
+  "    // by session/resume above — without resetting the dedupe key at the",
+  "    // close of the replay window, this live update would be silently",
+  "    // swallowed as a duplicate of the replay.",
+  '    notify("session/update", { update: { sessionUpdate: "session_info_update", _meta: { fx: { modelResponseRecovery: { state: "paused", kind: "terminal_provider_error", cause: "rate_limited", action: "paused", requiredAction: "continue_later", attempt: 10, attemptLimit: 10, durable: true, message: "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts" } } } } });',
+  '    endTurnWithUsage(id, 15, "refused", {});',
+  "    return;",
+  "  }",
   '  if (scenario === "stall-for-drop") {',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-same-chunk-update") {',
+  "    // Everything this scenario needs to prove was already sent, in one",
+  "    // stdout chunk, from handleSessionResume above — just end the turn so",
+  "    // the coalescer flushes and the run settles.",
+  '    endTurn(id, 15, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-replay-structured") {',
+  "    // The LIVE half of TT1 scenario 9 — a real tool call/result pair and",
+  "    // assistant text sent AFTER session/resume resolved (state.replaying",
+  "    // is false by now), which must reach onChunk normally.",
+  '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "live-1", name: "shell", title: "Run pwd", kind: "execute", status: "pending", rawInput: { command: "pwd" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "tool_call_update", toolCallId: "live-1", status: "completed", content: [{ type: "content", content: { type: "text", text: "/tmp" } }] } });',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", messageId: "live-msg", content: { type: "text", text: "live answer" } } });',
+  '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
   "  streamHappyUpdates();",
   '  endTurn(id, 20, "end_turn");',
+  "}",
+  "",
+  "function handleSetConfigOption(id, params) {",
+  '  capture("session/set_config_option", params);',
+  '  if (scenario === "effort-set-error") {',
+  '    fail(id, -32602, "Reasoning effort is not available for the active model");',
+  "    return;",
+  "  }",
+  "  ok(id, { configOptions: [effortOption(params.value)] });",
   "}",
   "",
   "function handleCancel(params) {",
@@ -461,6 +642,7 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (method === "session/resume") { handleSessionResume(id, params); return; }',
   '  if (method === "session/load") { handleSessionLoad(id, params); return; }',
   '  if (method === "session/set_mode") { ok(id, {}); return; }',
+  '  if (method === "session/set_config_option") { handleSetConfigOption(id, params); return; }',
   '  if (method === "session/prompt") { handlePrompt(id, params); return; }',
   '  if (method === "session/cancel") { handleCancel(params); return; }',
   '  fail(id, -32601, "method not found (fake): " + method);',
@@ -529,7 +711,22 @@ function readCaptured(captureFile: string): Array<{ label: string; msg: unknown 
 
 function spawnFake(
   scenario: string,
-  opts: { mode?: FxMode; resumeSessionId?: string; env?: Record<string, string> } = {},
+  opts: {
+    mode?: FxMode;
+    resumeSessionId?: string;
+    env?: Record<string, string>;
+    continueRecovery?: boolean;
+    /** Agetor's stored effort id for the task — threaded straight through to
+     *  `FxLaunchOptions.effort` (TT1). `null` is a distinct, intentional
+     *  value from `undefined` (both mean "no RPC", but tests exercise both
+     *  spellings — see the "effort-null" describe block). */
+    effort?: string | null;
+    /** `FxLaunchOptions.model` — the fake's argv carries no `--model` flag
+     *  (unlike a real launch via `buildCommand`), so any test that asserts
+     *  on `applyFxEffort`'s breadcrumb text must pass this explicitly or
+     *  the breadcrumb falls back to the generic "the active model" phrase. */
+    model?: string;
+  } = {},
 ) {
   const chunks: Chunk[] = [];
   const onChunk: FxLaunchOptions["onChunk"] = (stream, data, lineUuid) => chunks.push({ stream, data, lineUuid });
@@ -547,6 +744,9 @@ function spawnFake(
     promptText: "hello fx",
     mode: opts.mode ?? "auto",
     resumeSessionId: opts.resumeSessionId,
+    continueRecovery: opts.continueRecovery,
+    effort: opts.effort,
+    model: opts.model,
     onChunk,
     onSessionId: (id) => sessionIds.push(id),
   });
@@ -1696,4 +1896,693 @@ describe("signal handlers", () => {
     expect(process.listenerCount("SIGTERM")).toBeGreaterThanOrEqual(1);
     expect(process.listenerCount("SIGHUP")).toBeGreaterThanOrEqual(1);
   });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 14. Model-response-recovery channel (`_meta.fx.modelResponseRecovery`) —
+ *     docs/plans/fix-fx-harness-rate-limit.md TT3.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("recovery storm → paused → refused (scenario 1)", () => {
+  test(
+    "emits one FX_RECOVERY_STATUS_PREFIX sentinel per distinct payload (4, no dupes), exactly one paused summary line, and an enriched refused status; done=1",
+    async () => {
+      const { agent, chunks } = spawnFake("recovery");
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as Record<string, unknown>,
+      );
+      // Exactly one sentinel per distinct payload — the two attempt-1
+      // updates differ only by delaySeconds, so both emit (not deduped).
+      expect(payloads.map((p) => [p.state, p.attempt, p.delaySeconds ?? null])).toEqual([
+        ["active", 1, null],
+        ["active", 1, 1],
+        ["active", 2, null],
+        ["paused", 10, null],
+      ]);
+      expect(new Set(recoveryChunks.map((c) => c.data)).size).toBe(recoveryChunks.length);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      const summaryLines = statusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+      expect(summaryLines).toHaveLength(1);
+      expect(summaryLines[0]!.data).toBe(
+        "⚠ Rate limited · HTTP 429 · rate_limit_exceeded: too many requests · recovery paused after 10/10 attempts"
+          + " — resume once the limit clears, or send a new message.",
+      );
+
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx turn ended: refused (response paused after 10/10 attempts — resumable)",
+        ),
+      ).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("continueRecovery — resumes a paused checkpoint without a new prompt (scenario 2)", () => {
+  test(
+    "sends session/prompt with an empty prompt array and continueRecovery:true (no text block); recovered sentinel + its plain summary; no cleared sentinel; done=0",
+    async () => {
+      const resumeId = "resume-continue-1";
+      const { agent, chunks, captureFile } = spawnFake("continue", {
+        resumeSessionId: resumeId,
+        continueRecovery: true,
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const entries = readCaptured(captureFile);
+      const promptReq = entries.find((e) => e.label === "session/prompt");
+      expect(promptReq).toBeDefined();
+      // Exact captured session/prompt params for the continue turn — no
+      // `text` content block, matching fx's documented continueRecovery
+      // shape verbatim.
+      expect(promptReq!.msg).toEqual({
+        sessionId: resumeId,
+        prompt: [],
+        _meta: { fx: { continueRecovery: true } },
+      });
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      expect(recoveryChunks).toHaveLength(1);
+      const payload = JSON.parse(recoveryChunks[0]!.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string };
+      expect(payload.state).toBe("recovered");
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks.some((c) => c.data === "✓ recovered · succeeded on attempt 1/10")).toBe(true);
+
+      // No `{"state":"cleared"}` sentinel — this run's session/resume never
+      // replayed a paused checkpoint (a plain `ok(id, {})`, no recovery
+      // -shaped session/update during the resume window), so the
+      // pre-prompt "consume the checkpoint" branch has nothing to clear.
+      const clearedJson = `${FX_RECOVERY_STATUS_PREFIX}${JSON.stringify({ state: "cleared" })}`;
+      expect(chunks.some((c) => c.data === clearedJson)).toBe(false);
+    },
+    10_000,
+  );
+});
+
+describe("continueRecovery rejected by fx (-32602) (scenario 3)", () => {
+  test("surfaces fx's exact message verbatim — no 'fx acp: session/prompt failed:' wrapper, no '(code -32602)' suffix", async () => {
+    const resumeId = "resume-continue-rejected-1";
+    const { agent, chunks } = spawnFake("continue-rejected", { resumeSessionId: resumeId, continueRecovery: true });
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks).toHaveLength(1);
+    expect(statusChunks[0]!.data).toBe("No paused model response to continue");
+  }, 10_000);
+});
+
+describe("continueRecovery without a prior session id (scenario 4)", () => {
+  test(
+    "fails immediately with a dedicated status message, before any RPC traffic — the fake server dispatches no session/resume|load|prompt call",
+    async () => {
+      // The scenario name is irrelevant here: runFxTurn's continueRecovery
+      // guard runs before the process ever writes a single JSON-RPC message
+      // to the child's stdin, so no scenario branch is ever reached.
+      const { agent, chunks, captureFile } = spawnFake("happy", { continueRecovery: true });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      expect(statusChunks[0]!.data).toBe("fx acp: continueRecovery requires a prior session id");
+
+      // The fake's `handleInitialize` never calls `capture(...)` (only
+      // resume/load/prompt/reply/sigterm do), so "the fake server never
+      // received `initialize`" isn't independently observable through this
+      // harness. What IS observable, and asserted here: no RPC method that
+      // DOES capture itself (session/resume, session/load, session/prompt,
+      // a reply to a server-initiated request) ever appears — proving the
+      // driver never got far enough to send a prompt or handshake. (A
+      // "sigterm" capture line is NOT waited on here — settleFx's killProc
+      // fires within milliseconds of spawn, frequently before the freshly
+      // -spawned child has finished loading this script and installed its
+      // own SIGTERM handler, so the OS's default SIGTERM-terminates
+      // behavior can win the race and no "sigterm" line is ever written;
+      // that race is a fake-harness artifact of this specific fast-fail
+      // scenario, not something the driver's behavior depends on.)
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => ["session/resume", "session/load", "session/prompt", "reply"].includes(e.label))).toBe(
+        false,
+      );
+    },
+    10_000,
+  );
+});
+
+describe("session/resume replays a paused checkpoint onto a NEW run (scenario 5)", () => {
+  test(
+    "the replayed paused sentinel carries replayed:true and its terminal summary line is suppressed; a NORMAL follow-up prompt emits a `cleared` sentinel — but only AFTER session/prompt resolves, so it lands after the turn's own content chunks, not before the RPC is sent (finding #4)",
+    async () => {
+      const resumeId = "resume-replays-paused-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-replays-paused", { resumeSessionId: resumeId });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      // The replayed paused sentinel, then the cleared sentinel emitted
+      // once the subsequent normal prompt has resolved.
+      expect(payloads.map((p) => p.state)).toEqual(["paused", "cleared"]);
+      // Finding #8: the replayed sentinel is marked; the cleared one (a
+      // LIVE, driver-synthesized event, not replayed history) is not.
+      expect(payloads[0]!.replayed).toBe(true);
+      expect(payloads[1]!.replayed).toBeUndefined();
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // The paused terminal-summary PLAIN line must NOT reappear — it
+      // already reached the transcript on the run where the pause genuinely
+      // happened; a resume replay must not re-fire it.
+      expect(statusChunks.some((c) => c.data.includes("resume once the limit clears"))).toBe(false);
+
+      // The turn proceeded normally afterwards (the fake's shared "happy"
+      // response stream).
+      const assistantIndex = chunks.findIndex((c) => c.stream === "assistant" && c.data === "Hello world");
+      expect(assistantIndex).toBeGreaterThanOrEqual(0);
+
+      // Finding #4, directly observable now (previously the cleared
+      // sentinel fired BEFORE session/prompt was even sent, so it always
+      // preceded the turn's content by construction): the cleared sentinel
+      // is emitted only once session/prompt RESOLVES with a result — i.e.
+      // strictly AFTER every content chunk the fake streamed during that
+      // same prompt call, since those arrive as notifications on the wire
+      // before the RPC's own response line.
+      const clearedIndex = chunks.findIndex(
+        (c) => c.stream === "status" && c.data === FX_RECOVERY_STATUS_PREFIX + JSON.stringify({ state: "cleared" }),
+      );
+      expect(clearedIndex).toBeGreaterThan(assistantIndex);
+      // ...and it's the LAST recovery sentinel for the turn.
+      expect(recoveryChunks[recoveryChunks.length - 1]).toBe(chunks[clearedIndex]);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "a NORMAL prompt after a replayed paused that fails with a -32602 (or any transport-level) prompt error emits NO cleared sentinel — the checkpoint is still intact in fx, so the Resume affordance must not vanish (finding #4)",
+    async () => {
+      const resumeId = "resume-replays-paused-prompt-fails-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-replays-paused-prompt-fails", {
+        resumeSessionId: resumeId,
+      });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      // Only the replayed paused sentinel — no cleared sentinel, because the
+      // prompt call itself never resolved with a result.
+      expect(payloads.map((p) => p.state)).toEqual(["paused"]);
+      expect(payloads[0]!.replayed).toBe(true);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(
+        statusChunks.some(
+          (c) => c.data === FX_RECOVERY_STATUS_PREFIX + JSON.stringify({ state: "cleared" }),
+        ),
+      ).toBe(false);
+      // fx's own -32602 text surfaces verbatim (existing wrapper behavior
+      // for a normal, non-continueRecovery turn — see scenario 6 above).
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx acp: session/prompt failed: Invalid params (fake, replayed-paused prompt error) (code -32602)",
+        ),
+      ).toBe(true);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("replay-seeded dedupe reset (finding #2): a live re-pause right after the replay window is not swallowed by the replayed one", () => {
+  test(
+    "session/resume replays a paused checkpoint, then the continueRecovery prompt immediately pushes a byte-identical LIVE paused update and answers refused — the live update still emits its own sentinel, summary line, and enriched refused status (not deduped against the replay)",
+    async () => {
+      const resumeId = "resume-continue-repause-1";
+      const { agent, chunks } = spawnFake("resume-continue-repause", {
+        resumeSessionId: resumeId,
+        continueRecovery: true,
+      });
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const payloads = recoveryChunks.map(
+        (c) =>
+          JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as {
+            state: string;
+            attempt?: number;
+            replayed?: boolean;
+          },
+      );
+      // Two DISTINCT-by-source sentinels, both "paused", byte-identical
+      // apart from the replay marker — without the dedupe-key reset at
+      // replay close, the second (live) one would have been silently
+      // swallowed and this array would have length 1.
+      expect(payloads).toHaveLength(2);
+      expect(payloads.every((p) => p.state === "paused" && p.attempt === 10)).toBe(true);
+      expect(payloads[0]!.replayed).toBe(true); // the replayed checkpoint
+      expect(payloads[1]!.replayed).toBeUndefined(); // the LIVE re-pause
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // Exactly one persisted "resume once the limit clears" summary line —
+      // from the LIVE update only (replay summary lines stay suppressed).
+      const summaryLines = statusChunks.filter((c) => c.data.includes("resume once the limit clears"));
+      expect(summaryLines).toHaveLength(1);
+
+      // The enriched refused status line — proves ctx.lastRecovery got set
+      // from the LIVE paused update (not left stale/undefined by the
+      // dedupe bug), so `fxRefusedStatusLine` had a payload to enrich with.
+      expect(
+        statusChunks.some(
+          (c) => c.data === "fx turn ended: refused (response paused after 10/10 attempts — resumable)",
+        ),
+      ).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("session/prompt -32602 without continueRecovery keeps the existing wrapper (scenario 6)", () => {
+  test("wraps the message as 'fx acp: session/prompt failed: ...' — the continueRecovery-only verbatim carve-out doesn't apply to a normal turn", async () => {
+    const { agent, chunks } = spawnFake("prompt-invalid-params");
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks).toHaveLength(1);
+    expect(statusChunks[0]!.data).toBe(
+      "fx acp: session/prompt failed: Invalid params (fake, no continueRecovery carve-out) (code -32602)",
+    );
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * TT1 (docs/plans/fx-0.0.10-compat.md §5) — fx 0.0.9+ reasoning-effort
+ * config option and the 0.0.9+ structured session/resume replay. Every
+ * `effort-*` scenario below models the 0.0.10 `session/new`/`resume`/`load`
+ * result's `configOptions[{id:"effort"}]` entry via the fake server's
+ * `effortOption(currentValue)` helper (auto/low/high/max, in that order —
+ * see its own comment), and threads `opts.effort`/`opts.model` through
+ * `spawnFake` into `FxLaunchOptions.effort`/`.model` so `applyFxEffort`'s
+ * breadcrumb text names a real model instead of falling back to the
+ * generic "the active model" phrase.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("applyFxEffort — session/new applies the task's stored effort (TT1 scenario 1)", () => {
+  test("sends exactly one session/set_config_option before session/prompt; no breadcrumb", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "high" });
+
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    const promptIndex = entries.findIndex((e) => e.label === "session/prompt");
+    expect(promptIndex).toBeGreaterThan(setIndex);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("running at fx's default"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — effort 'auto' matches currentValue 'auto' (TT1 scenario 2)", () => {
+  test("no RPC, no breadcrumb", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-auto-default", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("running at fx's default"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — effort not in the offered list (TT1 scenario 3)", () => {
+  test("emits one breadcrumb naming the offers, sends no RPC, and the turn still completes normally", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-not-offered", {
+      effort: "medium",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+    expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    const matching = statusChunks.filter(
+      (c) =>
+        c.data ===
+        "fx: effort medium isn't offered for zai/glm-5.3-flash (offers: auto, low, high, max) — running at fx's default",
+    );
+    expect(matching).toHaveLength(1);
+  }, 10_000);
+});
+
+describe("applyFxEffort — configOptions carries no effort entry at all (0.0.8-shaped result / no-effort model, TT1 scenario 4)", () => {
+  test("effort set → one breadcrumb naming the model, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-absent", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data === "fx: zai/glm-5.3-flash exposes no reasoning-effort setting — running at fx's default",
+      ),
+    ).toBe(true);
+  }, 10_000);
+
+  test("effort 'auto' → silent (no breadcrumb, no RPC) — the model can't even set one, so auto needs no nudge", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-absent", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("reasoning-effort"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — configOptions carries a PRESENT-but-EMPTY effort entry (Phase 5 review fix)", () => {
+  test("effort set → the same 'exposes no reasoning-effort setting' breadcrumb as an absent entry, no RPC", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-empty", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    const matching = statusChunks.filter(
+      (c) => c.data === "fx: zai/glm-5.3-flash exposes no reasoning-effort setting — running at fx's default",
+    );
+    expect(matching).toHaveLength(1);
+    // Regression guard: before the fix, a present-but-empty `values` list
+    // fell into the "isn't offered" breadcrumb instead, which would read
+    // "(offers: )" here.
+    expect(statusChunks.some((c) => c.data.includes("isn't offered"))).toBe(false);
+  }, 10_000);
+
+  test("effort 'auto' → silent (no breadcrumb, no RPC) — same as an absent entry", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-option-empty", {
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("reasoning-effort"))).toBe(false);
+  }, 10_000);
+});
+
+describe("applyFxEffort — session/set_config_option RPC error degrades to a breadcrumb (TT1 scenario 5)", () => {
+  test("carries fx's own error message verbatim; session/prompt is still sent and the turn completes", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set-error", {
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(true);
+    expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) =>
+          c.data ===
+          "fx: couldn't set effort high — Reasoning effort is not available for the active model — running at fx's default",
+      ),
+    ).toBe(true);
+  }, 10_000);
+});
+
+describe("applyFxEffort — session/resume result carries the persisted effort (TT1 scenario 6)", () => {
+  test("stored effort already matches the persisted currentValue 'high' → no RPC", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-resume", {
+      resumeSessionId: "resume-effort-1",
+      effort: "high",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+  }, 10_000);
+
+  test("variant effort-auto-reset: stored effort 'auto' differs from the persisted 'high' → one set call resetting to auto", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-resume", {
+      resumeSessionId: "resume-effort-2",
+      effort: "auto",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "auto" });
+  }, 10_000);
+});
+
+describe("applyFxEffort — resume falls back to session/load; effort applied from load's result (TT1 scenario 7)", () => {
+  test("one set call after load, before prompt", async () => {
+    const { agent, captureFile } = spawnFake("effort-on-load", {
+      resumeSessionId: "resume-effort-load-1",
+      effort: "max",
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const setCalls = entries.filter((e) => e.label === "session/set_config_option");
+    expect(setCalls).toHaveLength(1);
+    expect(setCalls[0]!.msg).toMatchObject({ configId: "effort", value: "max" });
+
+    const loadIndex = entries.findIndex((e) => e.label === "session/load");
+    const setIndex = entries.findIndex((e) => e.label === "session/set_config_option");
+    const promptIndex = entries.findIndex((e) => e.label === "session/prompt");
+    expect(loadIndex).toBeGreaterThanOrEqual(0);
+    expect(setIndex).toBeGreaterThan(loadIndex);
+    expect(promptIndex).toBeGreaterThan(setIndex);
+  }, 10_000);
+});
+
+describe("applyFxEffort — no stored effort at all (TT1 scenario 8)", () => {
+  test("effort: null → no RPC, no breadcrumb, even though the option is present", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      effort: null,
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data.includes("reasoning-effort") || c.data.includes("running at fx's default"),
+      ),
+    ).toBe(false);
+  }, 10_000);
+
+  test("effort: undefined (never threaded) → same as null", async () => {
+    const { agent, chunks, captureFile } = spawnFake("effort-set", {
+      model: "zai/glm-5.3-flash",
+    });
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    expect(entries.some((e) => e.label === "session/set_config_option")).toBe(false);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(
+      statusChunks.some(
+        (c) => c.data.includes("reasoning-effort") || c.data.includes("running at fx's default"),
+      ),
+    ).toBe(false);
+  }, 10_000);
+});
+
+describe("parseFxEffortOption — pure helper matrix", () => {
+  test("null configOptions / non-array → null", () => {
+    expect(parseFxEffortOption(undefined)).toBeNull();
+    expect(parseFxEffortOption(null)).toBeNull();
+    expect(parseFxEffortOption("not an array")).toBeNull();
+    expect(parseFxEffortOption({})).toBeNull();
+  });
+
+  test("array with no id:'effort' entry → null", () => {
+    expect(
+      parseFxEffortOption([{ id: "provider", currentValue: "gateway" }, { id: "mode", currentValue: "code" }]),
+    ).toBeNull();
+  });
+
+  test("present entry → current + values, non-string option values dropped", () => {
+    expect(
+      parseFxEffortOption([
+        {
+          id: "effort",
+          currentValue: "high",
+          options: [{ value: "auto" }, { value: "low" }, { value: 7 }, "not-an-object", { value: "high" }],
+        },
+      ]),
+    ).toEqual({ current: "high", values: ["auto", "low", "high"] });
+  });
+
+  test("non-string currentValue reads as null; missing/non-array options reads as []", () => {
+    expect(parseFxEffortOption([{ id: "effort", currentValue: 7 }])).toEqual({ current: null, values: [] });
+    expect(parseFxEffortOption([{ id: "effort" }])).toEqual({ current: null, values: [] });
+    expect(parseFxEffortOption([{ id: "effort", currentValue: "auto", options: "nope" }])).toEqual({
+      current: "auto",
+      values: [],
+    });
+  });
+});
+
+describe("session/resume structured replay (0.0.9+) is suppressed except session_info_update (TT1 scenario 9)", () => {
+  test(
+    "replayed tool_call/tool_call_update/assistant content never reach onChunk; the recovery (replayed:true) and title sentinels do; the live turn's own tool call and assistant text after session/prompt arrive normally",
+    async () => {
+      const { agent, chunks } = spawnFake("resume-replay-structured", {
+        resumeSessionId: "resume-replay-structured-1",
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      // Nothing from the replayed history reached onChunk.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:hist-1:use")).toBe(false);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:hist-1:result")).toBe(false);
+      expect(chunks.some((c) => c.stream === "assistant" && c.data.includes("partial answer"))).toBe(false);
+
+      // The recovery sentinel DID arrive, marked replayed — followed by the
+      // live "cleared" sentinel once the normal follow-up prompt resolves
+      // (same two-sentinel shape as the existing "resume-replays-paused"
+      // scenario above — see finding #4/#8 in the file header).
+      const recoveryChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_RECOVERY_STATUS_PREFIX),
+      );
+      const recoveryPayloads = recoveryChunks.map(
+        (c) => JSON.parse(c.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) as { state: string; replayed?: boolean },
+      );
+      expect(recoveryPayloads.map((p) => p.state)).toEqual(["paused", "cleared"]);
+      expect(recoveryPayloads[0]!.replayed).toBe(true);
+      expect(recoveryPayloads[1]!.replayed).toBeUndefined();
+
+      // The title sentinel arrived too, exactly once.
+      const titleChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX),
+      );
+      expect(titleChunks).toHaveLength(1);
+      expect(titleChunks[0]!.data).toBe(FX_SESSION_TITLE_STATUS_PREFIX + "Replayed title");
+
+      // The LIVE tool call/result pair (sent after session/prompt, once
+      // state.replaying is back to false) DID arrive.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:live-1:use")).toBe(true);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:live-1:result")).toBe(true);
+
+      // The LIVE assistant text DID arrive.
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.some((c) => c.data === "live answer")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("session/resume replay window closes on the reply LINE, not on the awaiting microtask (Phase 5 review fix)", () => {
+  test(
+    "a live update in the SAME stdout chunk as the resume response reaches onChunk; a replayed update earlier in that same chunk is still dropped",
+    async () => {
+      const { agent, chunks } = spawnFake("resume-same-chunk-update", {
+        resumeSessionId: "resume-same-chunk-1",
+      });
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      // The replayed tool_call, written BEFORE the resume response in the
+      // same raw stdout.write call, is still inside the replay window by
+      // line order and must be dropped exactly as it would be if it had
+      // arrived in its own separate chunk.
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:same-chunk-hist-1:use")).toBe(false);
+      expect(chunks.some((c) => c.lineUuid === "fx:tool:same-chunk-hist-1:result")).toBe(false);
+
+      // The live agent_message_chunk, written AFTER the resume response in
+      // that SAME chunk, must reach onChunk as an assistant event — this is
+      // the regression the fix closes: before it, `state.replaying` was
+      // only cleared once `runFxTurn`'s `await sendRpc(...)` resumed as a
+      // microtask, which happens strictly after pumpStdout finishes
+      // draining every line already in the buffer, so this line would have
+      // been wrongly dropped as replay too.
+      const assistantChunks = chunks.filter((c) => c.stream === "assistant");
+      expect(assistantChunks.some((c) => c.data === "same-chunk live text")).toBe(true);
+    },
+    10_000,
+  );
 });

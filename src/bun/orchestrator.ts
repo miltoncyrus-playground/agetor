@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir } from "./db.ts";
+import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles } from "./db.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, pipelineToolset, leanContextEnabled, type LeanContext, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import { getDiscoveredEfforts } from "./agent-discovery.ts";
@@ -10,15 +10,20 @@ import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progre
 import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
 import { providerRepoForDir } from "./git-provider.ts";
 import {
-  AGENT_OPTIONS,
   DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
+  FX_AUTO_RESUME_MAX,
+  FX_RECOVERY_STATUS_PREFIX,
   IDLE_SESSION_REAP_MS,
   SESSION_DIED_STATUS_PREFIX,
+  SPAWN_RESPONSE_BUDGET_MS,
+  TURN_STALLED_STATUS_PREFIX,
+  TURN_STALL_RESUMED_STATUS_PREFIX,
   TASK_TYPES,
   branchPattern,
+  defaultModeFor,
   renderBranchTemplate,
   retainableEfforts,
   supportedEfforts,
@@ -27,6 +32,7 @@ import {
   type Harness,
   type TaskType,
 } from "../shared/types.ts";
+import { isFxRecoveryResumable, parseFxAutoResumePrefs, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
 
 /**
  * Resolve a task's harness id to its full row (falling back to a synthetic
@@ -145,13 +151,17 @@ import {
 import { tickBuild, completeChildBuild, buildBarrierState, subtaskFilesForChild } from "./build-scheduler.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import type {
+  AgentProfile,
+  AgentProfileSnapshot,
   BlockReason,
   ColumnId,
+  FxRecoveryPayload,
   GlobalEvent,
   RunEvent,
   RunStatus,
   SentFileEntry,
   Task,
+  TaskFxRecovery,
   WorktreeGitStatus,
   WorktreeInfo,
   WorktreeStaleReason,
@@ -162,8 +172,6 @@ import {
   PIPELINE_REVISION_CAP,
   PIPELINE_STAGE_COLUMNS,
   isActiveColumn,
-  TURN_STALLED_STATUS_PREFIX,
-  TURN_STALL_RESUMED_STATUS_PREFIX,
 } from "../shared/types.ts";
 import {
   SENT_FILES_DELIVERED_RE,
@@ -182,6 +190,7 @@ import { extractHandoff, renderHandoff } from "./stage-handoff.ts";
 import { writeReviewDiff, removeReviewDiff } from "./review-diff.ts";
 import { runPipelinePrecheck, precheckPasses, precheckEnabled, testerSkipEnabled, precheckPassedChecks } from "./pipeline-precheck.ts";
 import { filterClaudeMdForPipeline } from "./claude-md-filter.ts";
+import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 
 type Listener = (e: RunEvent) => void;
 const listeners = new Set<Listener>();
@@ -1028,6 +1037,48 @@ async function spawnAgentOrFail(
 }
 
 /**
+ * Race a spawn-in-progress continuation promise against
+ * `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc) so a slow agent
+ * launch never holds an HTTP response open. Clears its timer on whichever
+ * side wins — the same discipline `resolveClaudeTurnOutcome` uses below for
+ * `PASTE_OUTCOME_TIMEOUT_MS` — so a settled-early spawn doesn't leave a
+ * timer running (which would otherwise hold the Bun test runner open for up
+ * to `ms` past the real settle on every test exercising this path).
+ *
+ * `p` must never reject — every caller here builds it from a continuation
+ * that already catches its own errors (mirroring `spawnAgentOrFail`, which
+ * never throws either), so a rejection reaching this helper would be a bug
+ * upstream, not something this helper papers over.
+ */
+async function raceSpawnBudget<T>(
+  p: Promise<T>,
+  ms: number,
+): Promise<{ settled: true; value: T } | { settled: false }> {
+  // Defensive, belt-and-braces: `p` is documented above to never reject, but
+  // if that invariant is ever broken by a bug upstream, this attaches a
+  // rejection handler directly to `p` — separate from the `.then()`
+  // derivation below that `Promise.race` actually consumes — so a rejection
+  // arriving after the timeout has already won the race can never surface as
+  // a process-level unhandledRejection; it only logs. This handler is
+  // fire-and-forget and never rethrows, so it can't itself produce a
+  // rejection to go unhandled. Race semantics are unchanged: if `p` rejects
+  // BEFORE the timeout, `settled` below still rejects and `Promise.race`
+  // still rejects this function's own promise, exactly as before — every
+  // caller already wraps that.
+  p.catch((err) => {
+    console.error("[agetor] spawn continuation rejected:", err);
+  });
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<{ settled: false }>((resolve) => {
+    timer = setTimeout(() => resolve({ settled: false }), ms);
+  });
+  const settled = p.then((value): { settled: true; value: T } => ({ settled: true, value }));
+  const result = await Promise.race([settled, timeout]);
+  clearTimeout(timer!);
+  return result;
+}
+
+/**
  * Guards against two overlapping "mint a fresh run for this task" calls
  * racing each other. The same failure shape shows up at every entry point
  * that (a) reads `task.runId && active.has(task.runId)` (or, for claude,
@@ -1068,8 +1119,30 @@ async function spawnAgentOrFail(
  * / un-sendable for the remaining lifetime of the process — strictly better
  * than the old app-wide synchronous hang this replaced, and scoped to one
  * task rather than the whole app. Revisit if/when that op grows a timeout.
+ *
+ * `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc) does NOT shrink the
+ * window this claim closes: `startTaskInner` and `spawnResumedSession`
+ * (claude's fresh-spawn path) both respond to their HTTP caller once the
+ * budget elapses, before the underlying `spawnAgentOrFail` has necessarily
+ * settled, but the claim itself is released by the detached continuation's
+ * own `finally` once the spawn actually settles — not by the wrapper that
+ * took the claim returning early. A second overlapping call during that
+ * still-pending stretch keeps hitting the "already starting" guard above for
+ * as long as the real spawn takes, exactly as it did before the budget was
+ * bounded.
  */
 const startingTaskIds = new Set<string>();
+/**
+ * Runs the user asked to Stop while their spawn was still in flight (the
+ * bounded-spawn pending window, CLAUDE.md item 16): the run row exists and
+ * is the task's current run, but no `active` handle is registered yet, so
+ * `cancelRun` has nothing to kill. It records the intent here instead and
+ * the detached continuation honors it on settle — kills the just-spawned
+ * agent, drops the claude session, records the run `cancelled` and returns
+ * the task to `ready` — rather than registering a run the user already
+ * stopped. Consumed (deleted) by the continuation on every settle path.
+ */
+const pendingCancelRunIds = new Set<string>();
 
 /**
  * Verdict-only pipeline stages read and judge — they don't generate
@@ -1353,22 +1426,145 @@ async function pipelinePromptExtras(
   return extras;
 }
 
+/**
+ * Consume a Stop recorded in `pendingCancelRunIds` right before a run would
+ * register — the one hook every spawn path that inserts a run row BEFORE an
+ * `await` must call (`startTaskInner`/`spawnResumedSessionInner` do it
+ * inline, `spawnCodexTurnNow`/`spawnCursorTurnNow`/`spawnGeminiTurnNow`/
+ * `spawnFxRun` and the claude idle mint in `sendTurnInExistingSession` call
+ * this). Returns `false` — nothing consumed — in the common case. When a
+ * Stop was recorded: kills the just-spawned agent (`dropClaudeSession`
+ * additionally tears down a claude tmux session that was created for this
+ * run only — NOT for a turn pasted into a pre-existing live session, where
+ * Stop means "interrupt", same as `stopActiveHandle`), records the run
+ * `cancelled`, and — when the run is still the task's current one — returns
+ * the task to `ready` with a status line. The caller must then skip
+ * `registerActiveRun`/`attachDoneHandler` and settle its own follow-up queue
+ * exactly as it does for a failed spawn.
+ */
+async function consumePendingCancel(
+  runId: string,
+  taskId: string,
+  agent: SpawnedAgent,
+  onChunk: (stream: "status", data: string) => void,
+  opts: { dropClaudeSession: boolean },
+): Promise<boolean> {
+  if (!pendingCancelRunIds.delete(runId)) return false;
+  // Nothing will ever attach a handler to this agent's `done` — swallow the
+  // rejection a kill/drop may produce so it can't become an unhandledRejection.
+  agent.done.catch(() => {});
+  agent.kill();
+  if (opts.dropClaudeSession) await dropSession(taskId);
+  runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+  if (tasks.get(taskId)?.runId === runId) {
+    onChunk("status", "cancelled by user before the agent launched");
+    updateColumn(taskId, runId, "ready");
+  }
+  return true;
+}
+
+/**
+ * Resolve which {@link AgentProfileSnapshot} a task should actually launch
+ * with right now — "live" (follows edits to the profile) before the task's
+ * first run, "snapshot" (frozen at whatever it captured) from the first run
+ * on, per the freeze-at-first-run rule (docs/plans/agent-profiles.md D2).
+ * Returns `null` when the task has never been bound to a profile at all
+ * (`agentProfileId` unset AND no stored snapshot — the common "no agent"
+ * case).
+ *
+ * "Live" requires both that `task.agentProfileId` still resolves to a real
+ * row (`agentProfiles.get`) AND that the task has never run
+ * (`runs.countForTask(task.id) === 0`) — a task that ran even once, or whose
+ * profile has since been deleted, falls back to the stored snapshot instead.
+ * The live profile is converted to a snapshot shape via
+ * {@link snapshotFromProfile} using the harness resolved right now
+ * (`resolveHarness(profile.harness)`) so a harness rename/relabel is
+ * reflected — if that harness no longer resolves (deleted out from under an
+ * otherwise-live profile), the stored snapshot is used instead, since there's
+ * no live harness identity left to capture.
+ *
+ * Callers needing to know whether they're looking at a live or frozen value
+ * (`startTaskInner`'s pre-first-run refresh) get that via `source`; callers
+ * that only want "the profile to inject/display right now" (the CLI, the
+ * webview) can just read `.profile`.
+ */
+export function effectiveAgentProfile(
+  task: Task,
+): { profile: AgentProfileSnapshot; source: "live" | "snapshot" } | null {
+  if (!task.agentProfileId && !task.agentProfile) return null;
+
+  if (task.agentProfileId && runs.countForTask(task.id) === 0) {
+    const profile: AgentProfile | null = agentProfiles.get(task.agentProfileId);
+    if (profile) {
+      const harness = resolveHarness(profile.harness);
+      if (harness) {
+        return {
+          profile: snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, Date.now()),
+          source: "live",
+        };
+      }
+    }
+  }
+
+  if (!task.agentProfile) return null;
+  return { profile: task.agentProfile, source: "snapshot" };
+}
+
+/**
+ * Whether `next` (the live profile, converted to snapshot shape) differs
+ * meaningfully from `prior` (whatever's stored on the task row already) —
+ * "meaningfully" excluding `capturedAt`, which is stamped fresh on every call
+ * to {@link effectiveAgentProfile} and would otherwise make this always
+ * `true`, forcing `startTaskInner`'s live-refresh block to `tasks.update`
+ * (bumping `updated_at`) on every single Run click even when the bound
+ * profile hasn't changed at all. `prior === null` (never captured before)
+ * always counts as drifted.
+ */
+export function agentProfileSnapshotDrifted(
+  prior: AgentProfileSnapshot | null,
+  next: AgentProfileSnapshot,
+): boolean {
+  if (!prior) return true;
+  const { capturedAt: _priorCapturedAt, ...priorRest } = prior;
+  const { capturedAt: _nextCapturedAt, ...nextRest } = next;
+  return JSON.stringify(priorRest) !== JSON.stringify(nextRest);
+}
+
+/**
+ * Start (or restart) a task's agent. Bounded per `SPAWN_RESPONSE_BUDGET_MS`
+ * (see that constant's doc): once the run row exists, the task has flipped
+ * to `running`, and the initial prompt has been echoed as a `user` event,
+ * this responds as soon as either the spawn settles OR the budget elapses —
+ * whichever comes first. On the fast path (spawn settles within budget) the
+ * result is byte-identical to before this bound existed. On the slow path
+ * the result additionally carries `pending: true`: the spawn is still
+ * running detached, and the caller learns the real outcome (success,
+ * failure, session-died, …) from the task's normal event stream rather than
+ * from this HTTP response. See `startingTaskIds`'s doc above for how the
+ * "already starting" claim survives past this function returning early.
+ */
 export async function startTask(
   taskId: string,
-): Promise<{ runId: string; unresolvedRefs?: string[] } | { error: string }> {
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
   if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
   startingTaskIds.add(taskId);
-  try {
-    return await startTaskInner(taskId, task);
-  } finally {
-    startingTaskIds.delete(taskId);
-  }
+  return startTaskInner(taskId, task);
 }
 
-async function startTaskInner(taskId: string, task: Task): Promise<{ runId: string; unresolvedRefs?: string[] } | { error: string }> {
+async function startTaskInner(
+  taskId: string,
+  task: Task,
+): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
+  // Whether ownership of releasing the `startingTaskIds` claim (added by
+  // `startTask` above) has been handed off to the detached spawn
+  // continuation created further down (see its own `finally`). Every return
+  // path ABOVE that point (harness checks, worktree prep, prompt budget, …)
+  // still owns the release itself, via the `finally` below.
+  let claimTransferred = false;
+  try {
   // startTask auto-unarchives and materializes the worktree below — it must
   // not race a teardown archiveTask (or deleteTask) deferred for this task,
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
@@ -1381,6 +1577,46 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   if (task.archivedAt != null) {
     task = tasks.update(taskId, { archivedAt: null }) ?? task;
   }
+
+  // Freeze-at-first-run (docs/plans/agent-profiles.md D2): resolve the
+  // task's agent profile — if any — BEFORE the harness pre-flight below, so
+  // a live profile edit (including a harness swap) is what actually gets
+  // resolved/checked/spawned, not whatever the task row was last left with.
+  // Only a "live" result (profile still exists AND the task has never run)
+  // triggers a copy-down; a "snapshot" result means the task already ran at
+  // least once and must launch with exactly what it launched with before —
+  // nothing to refresh, `effective` below just carries it through unchanged.
+  const resolvedProfile = effectiveAgentProfile(task);
+  if (resolvedProfile?.source === "live") {
+    const { profile } = resolvedProfile;
+    // A profile's own `effort: null` means "no opinion" — but a model that
+    // requires an effort flag (`buildCommand`'s "effort is required for …"
+    // throw) must still get a real default here, same as the no-profile path
+    // in `createTask`. Only the resolved task-row `effort` gets this
+    // treatment; the stored snapshot (`profile`, and `task.agentProfile`
+    // below) keeps the profile's raw `null`.
+    const resolvedEffort = profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
+    const driftedFromRow =
+      task.agent !== profile.harness ||
+      task.model !== profile.model ||
+      task.effort !== resolvedEffort ||
+      task.mode !== profile.mode ||
+      task.fast !== profile.fast ||
+      task.maxMode !== profile.maxMode ||
+      agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
+    if (driftedFromRow) {
+      task = tasks.update(taskId, {
+        agent: profile.harness,
+        model: profile.model,
+        effort: resolvedEffort,
+        mode: profile.mode,
+        fast: profile.fast,
+        maxMode: profile.maxMode,
+      }) ?? task;
+      task = tasks.setAgentProfile(taskId, profile.id, profile) ?? task;
+    }
+  }
+  const effective: AgentProfileSnapshot | null = resolvedProfile?.profile ?? null;
 
   const harness = resolveHarness(task.agent);
   if (!harness) {
@@ -1403,13 +1639,17 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   }
   // Fail-open: only an explicit `false` means the CLI positively reported
   // it's logged out. `null` (not probed / unknown) must never block a run.
-  // Empirically (real fx v0.0.6, v0.0.7, and v0.0.8 — 0.0.8 re-verified
-  // 2026-09-08, HOME pointed at an empty dir): env-var auth IS reflected by
+  // Empirically (real fx v0.0.6, v0.0.7, v0.0.8, v0.0.9, and v0.0.10 — 0.0.8
+  // re-verified 2026-09-08, 0.0.9 and 0.0.10 re-verified 2026-09-14, HOME
+  // pointed at an empty dir): env-var auth IS reflected by
   // the probe (AI_GATEWAY_API_KEY / VERCEL_OIDC_TOKEN both report a
   // non-"missing" `auth` value) — since the probe runs with the same
   // harnessEnv(harness) a real spawn uses, a key-authenticated user is never
-  // gated out here. As of 0.0.7 (unchanged in 0.0.8 — the credential
-  // re-check code paths are byte-identical 0.0.7→0.0.8), that same explicit
+  // gated out here. As of 0.0.7 (unchanged through 0.0.10 — the credential
+  // re-check BEHAVIOUR and its `-32600` texts are unchanged 0.0.7→0.0.10;
+  // 0.0.10's only change is a `verified_recently` short-circuit inside
+  // `refreshModelCredential` (`server.zig`, `auth_runtime.requestPathCredentialVerifiedRecently`)
+  // that skips redundant refreshes and has no observable effect here), that same explicit
   // `false` can also come from an expired login that can't self-refresh
   // (`auth_expired === true && auth_refreshable === false`) — but that gate
   // explicitly exempts the env-key `auth` values above (see agent-status.ts's
@@ -1482,14 +1722,30 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
   // `spawnAgentOrFail`'s catch, exercised (with a run row landing `failed`)
   // by orchestrator-fx.test.ts's "spawn-throw hardening (gemini)" test —
   // so that pre-existing behavior/error text is unchanged by this feature.
-  const expandedOverage = promptByteOverage(harness.kind, appendReferences(expandedPrompt, task.references));
+  // Both budgets now include the agent-instructions preamble (`effective`,
+  // resolved above — null for a task with no bound profile, in which case
+  // `composeLaunchPrompt` is a no-op passthrough): the preamble is authored
+  // text that ships with every launch, so a profile whose instructions push
+  // an otherwise-fine prompt over budget must be caught by this same rule,
+  // and — since it's added identically to both sides — the
+  // `expandedOverage && !rawOverage` semantics (only the @-expansion itself
+  // pushed things over) are unchanged either way.
+  const expandedOverage = promptByteOverage(
+    harness.kind,
+    appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references),
+  );
   // Skip re-encoding the same text twice (R19, code review) when expansion
   // was a no-op — a prompt with no `@` tokens at all (or none that resolved)
-  // has `expandedPrompt === task.prompt`, so `expandedOverage` already IS
-  // what re-running `promptByteOverage` on the raw prompt would compute.
+  // has `expandedPrompt === sourcePrompt`, so `expandedOverage` already IS
+  // what re-running `promptByteOverage` on the raw prompt would compute
+  // (composing the same `effective` preamble around the same text again
+  // would only reproduce it).
   const rawOverage = expandedPrompt === sourcePrompt
     ? expandedOverage
-    : promptByteOverage(harness.kind, appendReferences(sourcePrompt, task.references));
+    : promptByteOverage(
+      harness.kind,
+      appendReferences(composeLaunchPrompt(effective, sourcePrompt), task.references),
+    );
   if (expandedOverage && !rawOverage) {
     return {
       error:
@@ -1505,6 +1761,20 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
     const sha = await resolveRef(task.workdir, "HEAD");
     if (sha) tasks.update(taskId, { baseRef: sha });
   }
+
+  // A fresh `startTask` (as opposed to `resumeFxRecovery`'s continue-recovery
+  // spawn) begins a brand-new turn, not a continuation of any pause — clear
+  // any leftover fx auto-resume schedule/row so it can't linger past the
+  // point it stopped being relevant (plan §3 T2 item 7). Deliberately placed
+  // here, past every early `return { error }` above (harness availability,
+  // worktree prep, prompt budget) rather than at the top of the function
+  // (Phase 8 review #2): a pre-flight failure means no new turn ever started,
+  // so a paused row (and its still-resumable checkpoint / pending auto-resume
+  // timer) must survive an aborted Start — clearing it there would silently
+  // strand the user's only path back to the paused response. From this point
+  // on a run row WILL be inserted below, so the old pause is genuinely
+  // superseded regardless of whether the spawn itself goes on to succeed.
+  if (harness.kind === "fx") clearFxRecovery(taskId);
 
   const runId = randomUUID();
   const now = Date.now();
@@ -1569,7 +1839,14 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
     emitGlobal({ kind: "column", taskId, runId, column: startColumn, prev: prevColumn, ts: now });
   }
 
-  const promptWithRefs = appendReferences(expandedPrompt, task.references);
+  // The agent-instructions preamble (from `effective`, if this task is bound
+  // to a profile) wraps the expanded prompt BEFORE references are appended —
+  // skills/instructions are authored text, references are file pointers, and
+  // the existing convention keeps references last (docs/plans/agent-profiles.md
+  // D3/D11). `composeLaunchPrompt` is a no-op passthrough when `effective` is
+  // null, so an unbound task's launch prompt is byte-identical to before this
+  // feature.
+  const promptWithRefs = appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references);
 
   const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
   // Status lines the pre-spawn pipeline extras collected before the run
@@ -1600,7 +1877,7 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
         ),
       }
     : lean;
-  const { agent, message } = await spawnAgentOrFail({
+  const spawnArgs: SpawnAgentArgs = {
     taskId,
     runId,
     harness,
@@ -1619,24 +1896,103 @@ async function startTaskInner(taskId: string, task: Task): Promise<{ runId: stri
         : { fxSessionId: sessionId });
     },
     opts: { mode: task.mode, model: resolveRunModel(task, harness.kind) ?? DEFAULT_MODEL[harness.kind], effort: resolveRunEffort(task, harness.kind), fast: task.fast, maxMode: task.maxMode, leanContext },
-  });
-  if (!agent) return { error: `failed to start agent: ${message}` };
-  registerActiveRun(runId, taskId, task, agent);
-  const runModel = resolveRunModel(task, harness.kind);
-  const modelNote = runModel !== task.model
-    ? `${runModel ?? "—"} (stage override; task default ${task.model ?? "—"})`
-    : (runModel ?? "—");
-  emit({
-    runId,
-    taskId,
-    stream: "status",
-    data: `started — ${prepared.note} — agent=${task.agent}, model=${modelNote}, mode=${task.mode ?? "auto"}`,
-    ts: now,
-  });
+  };
 
-  attachDoneHandler(runId, taskId, agent);
+  // Everything from here on — the actual spawn and everything that depends
+  // on its result — runs as a detached continuation raced against
+  // `SPAWN_RESPONSE_BUDGET_MS` (see that constant's doc). The run row, the
+  // `running` column flip and the `user` echo above are already persisted,
+  // which is all a caller needs to render this task — a slow spawn (claude
+  // `--resume` alone can take 5-30s in practice) no longer holds this HTTP
+  // response open waiting for it. Ownership of releasing the
+  // `startingTaskIds` claim moves to the continuation's own `finally` right
+  // here — NOT when this function returns, and NOT when the race below
+  // resolves via the budget timing out — so a second overlapping start for
+  // this task keeps hitting the "already starting" guard for as long as the
+  // real spawn takes.
+  claimTransferred = true;
+  const continuation: Promise<{ ok: true } | { ok: false; message: string }> = (async () => {
+    try {
+      const { agent, message } = await spawnAgentOrFail(spawnArgs);
+      // Consume a Stop that landed while the spawn was in flight (see
+      // `pendingCancelRunIds`) on every settle path, agent or not.
+      const cancelledWhilePending = pendingCancelRunIds.delete(runId);
+      if (!agent) return { ok: false as const, message: message ?? "unknown error" };
 
+      // Ownership guard: by the time the spawn settles the task may have
+      // been deleted, archived, or this run may no longer be the task's
+      // current run (replaced by a later send/start, or cancelled) while the
+      // spawn was still in flight. Registering against a stale or archived
+      // task would leak a live session nothing else knows about — a
+      // force-archive (`archiveTask`'s `active.has(task.runId)` guard is
+      // false during this exact pending window, since `registerActiveRun`
+      // hasn't run yet) must be treated the same as delete/replace here.
+      const fresh = tasks.get(taskId);
+      if (!fresh || fresh.archivedAt != null || fresh.runId !== runId || cancelledWhilePending) {
+        agent.kill();
+        if (harness.kind === "claude-code") await dropSession(taskId);
+        runs.update(runId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        if (cancelledWhilePending && fresh && fresh.runId === runId) {
+          // A user Stop, not a delete/replace: settle the task like the done
+          // handler would for a cancelled run (`ready`, this run stays its
+          // latest) and say why nothing ran.
+          spawnArgs.onChunk("status", "cancelled by user before the agent launched");
+          updateColumn(taskId, runId, "ready");
+        }
+        return { ok: true as const };
+      }
+
+      registerActiveRun(runId, taskId, fresh, agent);
+      // A stage/child spawn may have tiered the model down from the task's
+      // own default (resolveRunModel, O-7) — surface that as an explicit
+      // "stage override" note rather than silently reporting the task's own
+      // model, which the agent wasn't actually launched with.
+      const runModel = resolveRunModel(task, harness.kind);
+      const modelNote = runModel !== task.model
+        ? `${runModel ?? "—"} (stage override; task default ${task.model ?? "—"})`
+        : (runModel ?? "—");
+      emit({
+        runId,
+        taskId,
+        stream: "status",
+        // A stored `null` mode doesn't spawn as a literal "auto" for every
+        // kind (Phase 8 review #3) — `buildCommand` resolves it via
+        // `defaultModeFor`, which is `yolo` for fx since
+        // `AGENT_OPTIONS.fx.modes[0]` is "Full access", not "auto". Mirror
+        // that same resolution here so the opening breadcrumb reports what
+        // actually launched.
+        data: `started — ${prepared.note} — agent=${task.agent}, model=${modelNote}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
+        ts: now,
+      });
+      attachDoneHandler(runId, taskId, agent);
+      return { ok: true as const };
+    } catch (err) {
+      // `spawnAgentOrFail` never throws (it catches internally and already
+      // records the run failed / bounces the task to `ready`) — this is
+      // belt-and-braces against a throw anywhere else in this continuation,
+      // e.g. the ownership-guard cleanup above.
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[agetor] detached spawn continuation failed for task ${taskId} run ${runId}:`, err);
+      return { ok: false as const, message };
+    } finally {
+      startingTaskIds.delete(taskId);
+    }
+  })();
+
+  const raced = await raceSpawnBudget(continuation, SPAWN_RESPONSE_BUDGET_MS);
+  if (!raced.settled) {
+    // Spawn is still running detached — `spawnAgentOrFail`'s existing
+    // failure handling (run `failed`, task back to `ready`, stderr chunk)
+    // simply happens after this response now, same as the ownership-guard
+    // cleanup above; the caller learns either outcome from the task's event
+    // stream / column, not from this result.
+    return { runId, pending: true, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
+  }
+  if (!raced.value.ok) return { error: `failed to start agent: ${raced.value.message}` };
   return { runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
+  } finally {
+    if (!claimTransferred) startingTaskIds.delete(taskId);
+  }
 }
 
 /** Cheap pre-filter before doing the more expensive JSON-parse + DB query a
@@ -2396,6 +2752,12 @@ function attachDoneHandler(
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       }
+      // fx-only: record/schedule an auto-resume for a fresh resumable pause,
+      // or clear a stale row — must run BEFORE drainFxQueue (plan §3 T2 item
+      // 4), since a queued follow-up's own spawn is what actually clears the
+      // row once it drains, and `recordFxPause` needs to see the queue as it
+      // stands right now to decide whether to skip scheduling.
+      noteFxRunSettled(task, runId, newStatus);
       // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
       // for a task of a different kind).
       await drainCodexQueue(taskId);
@@ -2455,6 +2817,9 @@ function attachDoneHandler(
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       }
+      // fx-only settlement hook — see the matching call/comment in the
+      // `.then` branch above.
+      noteFxRunSettled(task, runId, newStatus);
       // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
       // for a task of a different kind).
       await drainCodexQueue(taskId);
@@ -3470,6 +3835,10 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     cursorTurnQueue.delete(taskId);
     geminiTurnQueue.delete(taskId);
     fxTurnQueue.delete(taskId);
+    // Same reasoning for a pending fx auto-resume schedule: it belongs to
+    // the old fx session, and the new agent (fx or otherwise) has nothing to
+    // resume (plan §3 T2 item 8). Harmless no-op when there was none.
+    clearFxRecovery(taskId);
     // Cross-kind switches (e.g. claude-code → codex alias) leave mode/
     // model/effort ids that belong to the old kind's option set; the
     // next spawn would error or fall through to verbatim flags. Reset
@@ -3477,7 +3846,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // RunPanel's `onAgentChange` already applies client-side. Same-kind
     // alias swaps keep the picks — those ids stay valid.
     if (afterKind && beforeKind !== afterKind) {
-      const nextMode = AGENT_OPTIONS[afterKind].modes[0]?.id ?? "auto";
+      const nextMode = defaultModeFor(afterKind);
       tasks.update(taskId, { mode: nextMode, model: null, effort: null, fast: false, maxMode: false });
     }
     return;
@@ -4001,9 +4370,29 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // restart. Interrupt the live session and release the hold; the run itself
     // already succeeded, so the card advances to `review`.
     const taskId = runs.get(runId)?.taskId;
-    if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
-    await stopHeldTask(taskId, "cancelled by user");
-    return true;
+    if (!taskId) return false;
+    if (isHeldByBackgroundAgents(taskId)) {
+      await stopHeldTask(taskId, "cancelled by user");
+      return true;
+    }
+    // A paused fx task has no `active` handle either — there's no live
+    // process to interrupt — but Stop should still do something when a
+    // pending auto-resume timer is what's left to act on (plan §3 T2 item 8):
+    // cancel the schedule rather than reporting failure.
+    if (fxAutoResumeTimers.has(taskId)) {
+      return cancelFxAutoResume(taskId, "stopped");
+    }
+    // Bounded-spawn pending window: the run is the task's current run and
+    // still `running`, but its agent hasn't registered yet. Record the
+    // cancel for the continuation (see `pendingCancelRunIds`) instead of
+    // reporting "nothing to stop".
+    const run = runs.get(runId);
+    if (run && run.status === "running" && tasks.get(taskId)?.runId === runId) {
+      pendingCancelRunIds.add(runId);
+      cancelPendingForTask(taskId, "cancelled by user");
+      return true;
+    }
+    return false;
   }
   // Stop targets the whole task, not just one run.
   stopActiveHandle(h, "cancelled by user");
@@ -4034,9 +4423,19 @@ export async function cancelRun(runId: string): Promise<boolean> {
  * cwd — a typo, a file not present in this cwd's tree, or an `@name`
  * extension mention (`@github`) are all indistinguishable here; the server
  * reports the fact, callers decide what's noise.
+ *
+ * `pending` (delivered variant only, omitted whenever falsy): set when
+ * claude's dead/no-session mint path (`sendClaudeTurn` → `spawnResumedSession`)
+ * responded before its underlying `claude --resume` spawn actually settled —
+ * see `SPAWN_RESPONSE_BUDGET_MS`'s doc. The run row, the `running` column
+ * flip and the `user` event are already persisted at that point (this is
+ * still `delivered: true`, not a new outcome kind); the spawn keeps running
+ * detached and the caller learns its real outcome from the task's normal
+ * event stream. Every other dispatch path (fold-while-busy, codex/cursor/
+ * gemini/fx's queue-and-resume) is unaffected and never sets this.
  */
 export type SendInputResult =
-  | { delivered: true; runId: string; unresolvedRefs?: string[] }
+  | { delivered: true; runId: string; unresolvedRefs?: string[]; pending?: true }
   | { delivered: false; reason: string; withheld?: true; savedToBacklog?: true };
 
 /**
@@ -4079,6 +4478,17 @@ export type SendInputResult =
  * (e.g. the branch was deleted or checked out elsewhere) is surfaced as a
  * `delivered: false` result rather than silently falling back to an
  * unisolated cwd.
+ *
+ * Bounded wait: claude's dead/no-session mint path (idle send with no live
+ * tmux session — `sendClaudeTurn` → `spawnResumedSession`) never holds this
+ * promise open past `SPAWN_RESPONSE_BUDGET_MS` waiting for the underlying
+ * `claude --resume` spawn, which has taken 5-30s in practice (see that
+ * constant's doc). When the spawn hasn't settled by then, this resolves
+ * `{ delivered: true, runId, pending: true }` — the run row, column flip and
+ * `user` event are already persisted, which is what the caller needs to
+ * render — and the spawn keeps running detached. Every other path (folding
+ * into an active run, and codex/cursor/gemini/fx's queue-and-resume) is
+ * unaffected and never sets `pending`.
  */
 export async function sendInput(runId: string, line: string): Promise<SendInputResult> {
   const row = db.query<{ task_id: string; agent: string }, [string]>(
@@ -4175,7 +4585,12 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
       }
       return { delivered: false, reason: result.reason };
     }
-    return { delivered: true, runId: result.runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
+    return {
+      delivered: true,
+      runId: result.runId,
+      ...(unresolvedRefs.length ? { unresolvedRefs } : {}),
+      ...(result.pending ? { pending: true as const } : {}),
+    };
   }
   // The four `send*Turn` helpers below return `null` in two cases: the task
   // vanished between `sendInput`'s own lookup above and their internal
@@ -4356,6 +4771,13 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
       codexTurnQueue.delete(taskId);
       return newRunId;
     }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and, as in the `!agent` branch above,
+      // attachDoneHandler never runs, so drop the queue the same way.
+      codexTurnQueue.delete(taskId);
+      return newRunId;
+    }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
@@ -4525,6 +4947,13 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       // failed this run and attachDoneHandler (the only caller of
       // drainCursorQueue) never runs, so drop the queue rather than let queued
       // follow-ups resurface out of order on a later turn.
+      cursorTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and, as in the `!agent` branch above,
+      // attachDoneHandler never runs, so drop the queue the same way.
       cursorTurnQueue.delete(taskId);
       return newRunId;
     }
@@ -4700,6 +5129,13 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
       geminiTurnQueue.delete(taskId);
       return newRunId;
     }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // the run is settled `cancelled` and, as in the `!agent` branch above,
+      // attachDoneHandler never runs, so drop the queue the same way.
+      geminiTurnQueue.delete(taskId);
+      return newRunId;
+    }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
@@ -4751,17 +5187,118 @@ function findLastGeminiSessionId(taskId: string): string | null {
 const fxTurnQueue = new Map<string, string[]>();
 
 /**
+ * Pending auto-resume timer for a paused fx task, one per task id (plan
+ * `docs/plans/fx-recovery-follow-ups.md` §3.2, T2). Every timer stored here
+ * is `.unref()`'d (never what keeps the process alive) and identity-checked
+ * on fire — the callback compares itself against whatever is CURRENTLY in
+ * this map for the task id before acting, so a stale callback from a timer
+ * that was already cancelled-and-replaced (or cancelled outright, if
+ * `clearTimeout` itself somehow didn't prevent the fire) can never double-act.
+ * See `armFxAutoResumeTimer`/`cancelFxAutoResumeTimer`.
+ */
+const fxAutoResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * Synchronous double-resume guard for `resumeFxRecovery` (moved here from
+ * the route's own `fxResumesInFlight` set — see that function's doc): claimed
+ * before any `await`, so two POSTs (or a POST racing the auto-resume timer)
+ * landing on the same task can't both pass the function's internal gating and
+ * both spawn a continue-recovery run against fx's single checkpoint.
+ */
+const resumingTaskIds = new Set<string>();
+
+/**
+ * Read the fx auto-resume preference pair, with the `AGETOR_FX_AUTO_RESUME_
+ * DELAY_MS` env var (test seam — an integer number of milliseconds, `>= 0`)
+ * overriding the preference-derived delay when set. Preferences are read
+ * fresh on every call (no caching) — this only ever runs at pause-record time
+ * and re-arm time, not on any hot path.
+ */
+function fxAutoResumePrefs(): { enabled: boolean; delayMs: number } {
+  const { enabled, delaySec } = parseFxAutoResumePrefs(preferences.list());
+  let delayMs = delaySec * 1000;
+  const envOverride = process.env.AGETOR_FX_AUTO_RESUME_DELAY_MS;
+  if (envOverride !== undefined) {
+    const parsed = Number.parseInt(envOverride, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) delayMs = parsed;
+  }
+  return { enabled, delayMs };
+}
+
+/**
+ * Arm (or re-arm) the auto-resume timer for `taskId` to fire at `at` (ms
+ * epoch) — shared by `recordFxPause` (fresh schedule) and `rearmFxAutoResumes`
+ * (boot re-arm). Any existing timer for the task is cleared first, so calling
+ * this twice for the same task never leaves two timers racing. The armed
+ * timer identity-checks itself against the map before acting (see
+ * `fxAutoResumeTimers`'s doc) and is `.unref()`'d.
+ */
+function armFxAutoResumeTimer(taskId: string, at: number): void {
+  const existing = fxAutoResumeTimers.get(taskId);
+  if (existing) clearTimeout(existing);
+  const delayMs = Math.max(0, at - Date.now());
+  const handle = setTimeout(() => {
+    if (fxAutoResumeTimers.get(taskId) !== handle) return;
+    fxAutoResumeTimers.delete(taskId);
+    void fireFxAutoResume(taskId, at);
+  }, delayMs);
+  handle.unref();
+  fxAutoResumeTimers.set(taskId, handle);
+}
+
+/** Cancel any pending auto-resume timer for `taskId` — timer bookkeeping
+ *  only, never touches the persisted `fxRecovery` row. See `clearFxRecovery`
+ *  for the DB-clearing counterpart, and `cancelFxAutoResume` for the
+ *  user-facing cancel (which does both, plus a status line and event). */
+function cancelFxAutoResumeTimer(taskId: string): void {
+  const existing = fxAutoResumeTimers.get(taskId);
+  if (existing) {
+    clearTimeout(existing);
+    fxAutoResumeTimers.delete(taskId);
+  }
+}
+
+/** Cancel the task's auto-resume timer AND clear its persisted `fxRecovery`
+ *  row outright — no status line, no `autoResumeStopped` reason, no event:
+ *  this is the "the pause chain is over, full stop" reset used by
+ *  `spawnFxRun`'s `{line}` row lifecycle, `startTask` (starting an fx task
+ *  fresh), `reconcileTaskSession` (agent switch), `archiveTask`, and
+ *  `deleteTask`. Contrast `cancelFxAutoResume`, the user-facing cancel that
+ *  keeps the row (just nulls its schedule) and leaves a breadcrumb. */
+function clearFxRecovery(taskId: string): void {
+  cancelFxAutoResumeTimer(taskId);
+  tasks.setFxRecovery(taskId, null);
+}
+
+/** Append a plain status line to an already-settled run and broadcast it —
+ *  the same `runs.appendEvent` + `emit` pair used post-hoc elsewhere (e.g.
+ *  `pullBackParkedTask`), for auto-resume breadcrumbs landing on a run that
+ *  finished before this code runs. */
+function appendFxStatusLine(taskId: string, runId: string, data: string): void {
+  runs.appendEvent(runId, "status", data);
+  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/**
  * Send a follow-up to an fx task. Each follow-up is its own run row + its own
  * resumed ACP turn (sequential-turn model, same as codex/cursor/gemini). When
  * a turn is already running, the message is queued; otherwise it spawns
  * immediately. Returns the run id the message was attached to, or null on
- * lookup failure — or when `spawnFxTurnNow` declined to mint a run because
+ * lookup failure — or when `spawnFxRun` declined to mint a run because
  * `startingTaskIds` was already claimed for this task (see that set's doc,
  * near `startTask`).
  */
 async function sendFxTurn(taskId: string, line: string): Promise<string | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
+  // A follow-up message is an implicit cancel of any pending auto-resume
+  // schedule (plan §3.4 / T2 item 8) — whichever branch below runs, the
+  // pause chain is over. The full row clear happens once the turn actually
+  // spawns, via `spawnFxRun`'s `{ line }` row lifecycle (immediately below
+  // for the idle branch, or later via `drainFxQueue` for the queued one) —
+  // here it's just the timer, so a still-in-flight schedule can't fire while
+  // this follow-up is in transit.
+  cancelFxAutoResumeTimer(taskId);
   if (task.runId && active.has(task.runId)) {
     const q = fxTurnQueue.get(taskId) ?? [];
     q.push(line);
@@ -4774,8 +5311,31 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
     emit({ runId, taskId, stream: "user", data, ts: Date.now() });
     return runId;
   }
-  return spawnFxTurnNow(task, taskId, line);
+  // `spawnFxRun` now returns `{ runId, spawned, error? }` (Phase 8 review
+  // #10) so `resumeFxRecovery` can tell a real spawn from a run row that's
+  // already `failed`; a follow-up send has no separate "spawn failed" status
+  // to report through — the failure is already visible on the run row and
+  // its `stderr`/status chunks, same as before this change — so this caller
+  // keeps returning the bare run id string, mapping `null` (already
+  // starting) through unchanged.
+  const result = await spawnFxRun(task, taskId, { line });
+  return result ? result.runId : null;
 }
+
+/**
+ * The two shapes `spawnFxRun` can start: an ordinary follow-up carrying a
+ * user-typed `line` (echoed as a `user` bubble, sent as the turn's prompt),
+ * or a `continueRecovery` turn that resumes a PAUSED model response (see
+ * `resumeFxRecovery`, plan §3.5) with no new prompt at all — fx's own
+ * checkpoint supplies the continuation. `origin`/`attempt`/`max` are set only
+ * when `resumeFxRecovery` was itself invoked by the auto-resume engine
+ * (`fireFxAutoResume`) — they change nothing about the spawn itself, only the
+ * opening status line text (plan §3 T2 item 6), so a transcript reader can
+ * tell an automatic resume apart from a manual click.
+ */
+type FxTurn =
+  | { line: string }
+  | { continueRecovery: true; origin?: "manual" | "auto"; attempt?: number; max?: number };
 
 /**
  * Spawn a fresh fx turn that resumes the task's prior conversation via fx's
@@ -4784,8 +5344,36 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
  * thread id, fx's session id is DISCOVERED post-hoc (from ACP's `session/new`
  * response), so it's carried forward on the insert below and re-stamped
  * (idempotently) once `onSessionId` fires again for this turn.
+ *
+ * Handles both {@link FxTurn} variants; everything (the `startingTaskIds`
+ * claim, the run-row insert, the column flip/emit, `spawnAgentOrFail` /
+ * `registerActiveRun` / `attachDoneHandler`, and the queue-drop-on-spawn-
+ * failure) is identical between them. They differ only in: whether a `user`
+ * bubble is echoed (never for `continueRecovery` — nothing was typed), the
+ * status line, the prompt text handed to the driver (`""` for
+ * `continueRecovery`; fx-acp.ts sends an empty `prompt` content array
+ * downstream when `continueRecovery` is set, per ACP's continue-recovery
+ * shape), and `opts.continueRecovery`.
+ *
+ * Return shape (Phase 8 review #10 fix): `null` still means "declined to
+ * mint a run because `startingTaskIds` was already claimed for this task" —
+ * the pre-existing "already starting" signal every caller already checks
+ * for. Every OTHER path now returns `{ runId, spawned, error? }` instead of
+ * a bare `runId` string, because the two failure branches below (missing
+ * harness; `spawnAgentOrFail` throw) used to return the SAME `newRunId` a
+ * successful spawn does, even though the run row they just wrote is already
+ * `failed` and no agent process is running. `resumeFxRecovery` used to take
+ * that truthy `runId` at face value and report `{ ok: true, runId }` for a
+ * resume that never started — see that function's doc for the HTTP-layer
+ * fallout. `spawned: false` carries a human-readable `error` (the harness
+ * text, or `spawnAgentOrFail`'s own `message`) so callers can surface real
+ * failure text instead of pretending the turn is running.
  */
-async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+async function spawnFxRun(
+  task: Task,
+  taskId: string,
+  turn: FxTurn,
+): Promise<{ runId: string; spawned: boolean; error?: string } | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
   // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
@@ -4822,26 +5410,60 @@ async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise
 
     const kind: AgentKind = harness?.kind ?? "fx";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-    onChunk("user", normalizeUserText(line));
-    onChunk(
-      "status",
-      priorSessionId
-        ? `resuming fx session ${priorSessionId.slice(0, 8)}…`
-        : "no prior fx session — starting fresh",
-    );
-
-    if (!harness) {
-      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
-      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
-      tasks.update(taskId, { column: "ready", runId: null });
-      return newRunId;
+    if ("line" in turn) {
+      onChunk("user", normalizeUserText(turn.line));
+      onChunk(
+        "status",
+        priorSessionId
+          ? `resuming fx session ${priorSessionId.slice(0, 8)}…`
+          : "no prior fx session — starting fresh",
+      );
+      // A fresh follow-up turn is spawning — the pause chain (if any) is
+      // over: whatever checkpoint fx had, this new prompt supersedes it, and
+      // there's nothing left to auto-resume (plan §3 T2 item 7).
+      clearFxRecovery(taskId);
+    } else {
+      // `resumeFxRecovery` already checked `findLastFxSessionId(taskId)` is
+      // non-null before ever calling this — `priorSessionId` here is a
+      // fresh re-read of the same query, not the value that check saw, so
+      // the `?? ""` stays purely defensive against a same-instant race
+      // rather than a case this path expects to hit.
+      const sessionPrefix = (priorSessionId ?? "").slice(0, 8);
+      onChunk(
+        "status",
+        turn.origin === "auto"
+          ? `auto-resuming paused fx response (${turn.attempt}/${turn.max}) in session ${sessionPrefix}…`
+          : `resuming paused fx response in session ${sessionPrefix}…`,
+      );
+      // A continue-recovery turn is now in flight for this pause — cancel
+      // any pending timer (the resume is happening right now, manually or
+      // automatically) but KEEP the row (just clear its schedule) rather than
+      // wipe it outright: `noteFxRunSettled`/`recordFxPause` read the row's
+      // `autoResumeCount` when this run settles, and if it pauses again that
+      // read is what continues the chain's count instead of restarting it at
+      // 0. Re-read fresh rather than trusting `task.fxRecovery` — a manual
+      // resume may have just mutated the row moments ago in `resumeFxRecovery`
+      // (plan §3 T2 item 7).
+      cancelFxAutoResumeTimer(taskId);
+      const currentRec = tasks.get(taskId)?.fxRecovery;
+      if (currentRec) {
+        tasks.setFxRecovery(taskId, { ...currentRec, autoResume: null, autoResumeStopped: undefined });
+      }
     }
 
-    const { agent } = await spawnAgentOrFail({
+    if (!harness) {
+      const error = `harness "${task.agent}" not found — cannot resume`;
+      onChunk("stderr", error);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      tasks.update(taskId, { column: "ready", runId: null });
+      return { runId: newRunId, spawned: false, error };
+    }
+
+    const { agent, message } = await spawnAgentOrFail({
       taskId,
       runId: newRunId,
       harness,
-      prompt: line,
+      prompt: "line" in turn ? turn.line : "",
       cwd,
       onChunk,
       onSessionId: (sessionId) => {
@@ -4854,6 +5476,7 @@ async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise
         fast: task.fast,
         maxMode: task.maxMode,
         resumeSessionId: priorSessionId,
+        ...("continueRecovery" in turn ? { continueRecovery: true } : {}),
       },
     });
     if (!agent) {
@@ -4862,11 +5485,22 @@ async function spawnFxTurnNow(task: Task, taskId: string, line: string): Promise
       // drainFxQueue) never runs, so drop the queue rather than let queued
       // follow-ups resurface out of order on a later turn.
       fxTurnQueue.delete(taskId);
-      return newRunId;
+      return {
+        runId: newRunId,
+        spawned: false,
+        error: message || "fx could not be started — see the run's status line",
+      };
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
+      // settled `cancelled`; attachDoneHandler never runs, so drop the queue
+      // exactly like the `!agent` branch above.
+      fxTurnQueue.delete(taskId);
+      return { runId: newRunId, spawned: false, error: "cancelled by user before the agent launched" };
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
-    return newRunId;
+    return { runId: newRunId, spawned: true };
   } finally {
     startingTaskIds.delete(taskId);
   }
@@ -4892,7 +5526,7 @@ async function drainFxQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) fxTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnFxTurnNow(task, taskId, next);
+  if (next !== undefined) await spawnFxRun(task, taskId, { line: next });
 }
 
 /** Most-recent fx session id across the task's runs (for resume). */
@@ -4904,6 +5538,435 @@ function findLastFxSessionId(taskId: string): string | null {
      LIMIT 1`,
   ).get(taskId);
   return row?.fx_session_id ?? null;
+}
+
+/**
+ * The single source of truth for "does this task have a resumable fx pause
+ * right now, and which run/payload is it?" — extracted from what used to be
+ * `resumeFxRecovery`'s own inline gating (plan §3 T2 item 3) so
+ * `noteFxRunSettled`/`recordFxPause` (deciding whether to schedule an
+ * auto-resume) and `rearmFxAutoResumes` (deciding whether a persisted
+ * schedule still points at something real) can mirror the exact same check
+ * `resumeFxRecovery` itself uses, without duplicating the run/sentinel
+ * lookup. Returns `null` when the task's latest run isn't `failed`, or its
+ * last `FX_RECOVERY_STATUS_PREFIX` sentinel isn't resumable
+ * (`isFxRecoveryResumable`) — same two SQL lookups `resumeFxRecovery` always
+ * ran, just named and reusable now.
+ */
+function latestResumableFxPause(taskId: string): { runId: string; payload: FxRecoveryPayload } | null {
+  const latestRun = db.query<{ id: string; status: string }, [string]>(
+    `SELECT id, status FROM runs WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`,
+  ).get(taskId);
+  if (!latestRun || latestRun.status !== "failed") return null;
+
+  const sentinelRow = db.query<{ data: string }, [string, string]>(
+    `SELECT data FROM run_events WHERE run_id = ? AND stream = 'status' AND data LIKE ? ORDER BY id DESC LIMIT 1`,
+  ).get(latestRun.id, `${FX_RECOVERY_STATUS_PREFIX}%`);
+  const payload = sentinelRow ? parseFxRecoveryPayload(sentinelRow.data.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
+  if (!payload || !isFxRecoveryResumable(payload)) return null;
+
+  return { runId: latestRun.id, payload };
+}
+
+/**
+ * fx-only settlement hook (plan §3 T2 item 4) — called from BOTH
+ * `attachDoneHandler` branches (`.then` and `.catch`) right after the run's
+ * status/column are persisted and BEFORE `drainFxQueue` runs, so a queued
+ * follow-up (whose own spawn clears this row — see `spawnFxRun`'s `{ line }`
+ * row lifecycle) always sees this hook's decision land first. A no-op for
+ * every non-fx task.
+ *
+ * Takes the already-fetched `task` from the caller (Phase 8 review #4) rather
+ * than re-reading by id — `attachDoneHandler` already has it in scope at both
+ * call sites, and a second unconditional `tasks.get` here was a redundant
+ * query on every single run settlement, fx or not. The kind check below reads
+ * from that (possibly a beat stale by the time earlier settlement steps ran)
+ * object — `task.agent`/its harness kind cannot change mid-settlement, so
+ * staleness there is harmless. Freshness only actually matters for the
+ * decision that follows, so THAT re-reads explicitly, right where it's used.
+ *
+ * Two outcomes: the run that just settled IS the task's latest resumable
+ * pause (`newStatus === "failed"` and `latestResumableFxPause` names this
+ * exact `runId`) → `recordFxPause` records/schedules it. Otherwise, if the
+ * task was carrying a stale `fxRecovery` row from an earlier pause in this
+ * chain, it's cleared via `clearFxRecovery` (not a bare `tasks.setFxRecovery(
+ * taskId, null)` — Phase 8 review #5: a bare DB clear left the in-memory
+ * `fxAutoResumeTimers` entry armed, so a run that settled for an unrelated
+ * reason while an auto-resume timer from an earlier pause was still pending
+ * could let that timer fire later against a row that no longer says
+ * `autoResume`, doing nothing useful but leaking the timer past this task's
+ * own settlement) — a run that recovered, or failed for an unrelated reason,
+ * or succeeded outright, all end the chain the same way.
+ */
+function noteFxRunSettled(task: Task | null, runId: string, newStatus: RunStatus): void {
+  if (!task || resolveHarness(task.agent)?.kind !== "fx") return;
+  const taskId = task.id;
+  const pause = newStatus === "failed" ? latestResumableFxPause(taskId) : null;
+  if (pause && pause.runId === runId) {
+    recordFxPause(taskId, runId, pause.payload);
+    return;
+  }
+  // Freshness matters here: `task.fxRecovery` may already be behind by the
+  // time this runs (earlier settlement steps in the same handler — column
+  // update, plan detection — could have touched the row), so re-read before
+  // deciding whether a stale row needs clearing.
+  const fresh = tasks.get(taskId);
+  if (fresh?.fxRecovery != null) clearFxRecovery(taskId);
+}
+
+/**
+ * Record a freshly-paused fx run and, unless auto-resume is disabled, the
+ * chain has hit its cap, or a follow-up is already queued (see below),
+ * schedule the next auto-resume attempt. Called only from `noteFxRunSettled`
+ * once it has confirmed `runId` IS the task's current resumable pause.
+ *
+ * `autoResumeCount` carries forward from the task's PRIOR `fxRecovery` row
+ * when one exists — a non-null `prev` means this run was itself a
+ * continue-recovery turn that paused again, so the chain continues counting
+ * rather than resetting to 0 (only a full `clearFxRecovery` — a normal turn,
+ * recovery, archive/delete/switch — resets the count, by clearing the row
+ * entirely).
+ *
+ * `attempt` convention (Phase 8 review #6) — every `fx-auto-resume`
+ * `GlobalEvent` and every `TaskFxRecovery.autoResume` row carries an
+ * `attempt` field, but what it COUNTS differs by state, so read it against
+ * the state it's attached to, not in isolation:
+ *   - `scheduled` / `fired` → the ordinal of the attempt being armed (here)
+ *     or fired (`fireFxAutoResume`) — i.e. `autoResumeCount + 1` at the
+ *     moment the timer is set, echoed back unchanged when it fires.
+ *   - `disabled` → the ordinal that WOULD have been scheduled had the
+ *     preference been on (`autoResumeCount + 1`) — there is no real attempt
+ *     to number, so this reports what was skipped.
+ *   - `exhausted` → always `FX_AUTO_RESUME_MAX` (the cap itself, same value
+ *     as `max`), not `autoResumeCount` — the row only reaches this branch
+ *     once `autoResumeCount` has already climbed to the cap, so the two are
+ *     numerically identical today, but pinning it to the named constant
+ *     documents the intent ("we stopped AT the cap") instead of leaning on
+ *     an incidental equality between a counter and a constant.
+ */
+function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload): void {
+  const prev = tasks.get(taskId)?.fxRecovery ?? null;
+  const autoResumeCount = prev?.autoResumeCount ?? 0;
+
+  const base: TaskFxRecovery = {
+    state: "paused",
+    runId,
+    pausedAt: Date.now(),
+    autoResume: null,
+    autoResumeCount,
+  };
+  if (payload.cause !== undefined) base.cause = payload.cause;
+  if (payload.attempt !== undefined) base.attempt = payload.attempt;
+  if (payload.attemptLimit !== undefined) base.attemptLimit = payload.attemptLimit;
+  if (payload.message !== undefined) base.message = payload.message;
+
+  // A follow-up is already queued for this task — it will consume the
+  // checkpoint (and clear this row via `spawnFxRun`'s `{ line }` row
+  // lifecycle) a beat from now, via `drainFxQueue` right after this hook
+  // returns. Persist the row so `autoResumeCount` still carries forward if
+  // THAT turn also pauses, but skip the schedule/status-line/event — there's
+  // nothing here for the user to act on (plan §3 T2 item 4).
+  if ((fxTurnQueue.get(taskId)?.length ?? 0) > 0) {
+    tasks.setFxRecovery(taskId, base);
+    return;
+  }
+
+  const prefs = fxAutoResumePrefs();
+  if (!prefs.enabled) {
+    // `disabled`: the ordinal that would have run — see this function's
+    // "attempt convention" doc.
+    const attempt = autoResumeCount + 1;
+    tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "disabled" });
+    appendFxStatusLine(taskId, runId, "auto-resume disabled in Settings — resume manually");
+    emitGlobal({ kind: "fx-auto-resume", taskId, state: "disabled", attempt, max: FX_AUTO_RESUME_MAX, ts: Date.now() });
+    return;
+  }
+
+  if (autoResumeCount >= FX_AUTO_RESUME_MAX) {
+    tasks.setFxRecovery(taskId, { ...base, autoResumeStopped: "exhausted" });
+    appendFxStatusLine(
+      taskId,
+      runId,
+      `auto-resume gave up after ${FX_AUTO_RESUME_MAX} attempts — resume manually once the limit clears`,
+    );
+    emitGlobal({
+      kind: "fx-auto-resume",
+      taskId,
+      state: "exhausted",
+      // `exhausted`: the cap itself, not `autoResumeCount` — see this
+      // function's "attempt convention" doc.
+      attempt: FX_AUTO_RESUME_MAX,
+      max: FX_AUTO_RESUME_MAX,
+      ts: Date.now(),
+    });
+    return;
+  }
+
+  const { delayMs } = prefs;
+  const at = Date.now() + delayMs;
+  const delaySec = Math.round(delayMs / 1000);
+  // `scheduled`: the ordinal being armed — see this function's "attempt
+  // convention" doc.
+  const attempt = autoResumeCount + 1;
+  tasks.setFxRecovery(taskId, { ...base, autoResume: { at, attempt, max: FX_AUTO_RESUME_MAX, delaySec } });
+  appendFxStatusLine(taskId, runId, `auto-resume scheduled in ${delaySec} s (${attempt}/${FX_AUTO_RESUME_MAX})`);
+  emitGlobal({ kind: "fx-auto-resume", taskId, state: "scheduled", at, attempt, max: FX_AUTO_RESUME_MAX, ts: Date.now() });
+  armFxAutoResumeTimer(taskId, at);
+}
+
+/**
+ * Fire one auto-resume attempt (plan §3 T2 item 5). Identity-checking and
+ * removing the timer entry itself is the caller's job (`armFxAutoResumeTimer`'s
+ * `setTimeout` callback) — by the time this runs, the timer that scheduled it
+ * is already gone from `fxAutoResumeTimers`. Re-validates against a fresh
+ * read before acting: the persisted schedule must still name this exact `at`
+ * (a cancel, a manual resume, or a re-arm since this timer was set would have
+ * changed or nulled it), the task must not be archived, and no turn may
+ * already be in flight — all of which can legitimately have changed in the
+ * time between arming and firing.
+ *
+ * The `attempt` this emits/persists is "the ordinal being fired" — see the
+ * convention note on `recordFxPause`. If `resumeFxRecovery` itself rejects
+ * the attempt (a gate flipped between arming and firing, or the spawn threw),
+ * that's a genuine failure of THIS auto-resume attempt, not a user cancel —
+ * the row is marked `autoResumeStopped: "failed"` (not `"cancelled"`, which
+ * is reserved for an explicit user/Stop cancel via `cancelFxAutoResume`) so
+ * the notice/badge can tell the two apart.
+ */
+async function fireFxAutoResume(taskId: string, at: number): Promise<void> {
+  const task = tasks.get(taskId);
+  const rec = task?.fxRecovery ?? null;
+  if (!task || !rec?.autoResume || rec.autoResume.at !== at) return;
+  if (task.archivedAt != null) return;
+  if (task.runId && active.has(task.runId)) return;
+
+  const { max } = rec.autoResume;
+  const attempt = rec.autoResumeCount + 1;
+  tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeCount: attempt });
+  emitGlobal({ kind: "fx-auto-resume", taskId, state: "fired", attempt, max, ts: Date.now() });
+
+  const result = await resumeFxRecovery(taskId, { origin: "auto", attempt, max });
+  if (!result.ok) {
+    appendFxStatusLine(taskId, rec.runId, `auto-resume could not start: ${result.error}`);
+    const latest = tasks.get(taskId)?.fxRecovery;
+    if (latest) tasks.setFxRecovery(taskId, { ...latest, autoResumeStopped: "failed" });
+  }
+}
+
+/**
+ * User-facing cancel of a pending auto-resume schedule (plan §3 T2 item 8) —
+ * used by the `DELETE /tasks/:id/fx-auto-resume` route (notice button,
+ * context-menu entry, `agetor resume <id> --cancel`) and by `cancelRun` when
+ * Stop targets a paused task with a pending timer instead of a live run.
+ * `reason` distinguishes an explicit cancel from a Stop-triggered one at the
+ * call site; both persist the same `autoResumeStopped: "cancelled"` value —
+ * `TaskFxRecovery`'s reason union has no separate "stopped" state, since
+ * "cancelled" already answers "why isn't a timer pending" either way.
+ * Returns `false` (no-op, nothing touched) when the task has no pending
+ * schedule — the caller (`DELETE` route) maps that to 400.
+ *
+ * `reason` is intentionally not threaded into the persisted value or event —
+ * both call sites mean the same thing to the schedule itself ("no timer is
+ * pending because the user acted"), it just documents at the call site
+ * *which* user action did it.
+ *
+ * Cancel semantics (Phase 8 review #8): this only cancels the ONE pending
+ * timer — it is not a durable "never auto-resume this task again" switch. If
+ * the same pause chain later produces another failed-and-resumable run (e.g.
+ * a manual Resume that itself re-pauses), `recordFxPause` schedules again
+ * from scratch, same as it would after any other terminal reason
+ * (`exhausted`/`disabled`) clears. The Settings `fxAutoResume` preference is
+ * the actual off switch — toggling it off is what stops every future
+ * schedule from being armed at all, on this task and every other one.
+ */
+export function cancelFxAutoResume(taskId: string, reason: "cancelled" | "stopped"): boolean {
+  const rec = tasks.get(taskId)?.fxRecovery ?? null;
+  cancelFxAutoResumeTimer(taskId);
+  if (!rec?.autoResume) return false;
+
+  const { attempt, max } = rec.autoResume;
+  tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeStopped: "cancelled" });
+  appendFxStatusLine(taskId, rec.runId, "auto-resume cancelled");
+  emitGlobal({ kind: "fx-auto-resume", taskId, state: "cancelled", attempt, max, ts: Date.now() });
+  return true;
+}
+
+/**
+ * Re-arm in-memory auto-resume timers for every task that still has one
+ * pending, at boot (plan §3 T2 item 9) — in-memory `setTimeout` handles never
+ * survive a process restart, so without this a pause recorded in a prior
+ * process would sit forever with a persisted `autoResume.at` that nothing
+ * will ever fire. Called right after `reconcileOrphans()` in both boot paths
+ * (`index.ts`, `headless.ts`), so reattach/orphan resolution — which can
+ * itself flip a run's status — settles first.
+ *
+ * For each pending row: if the task's CURRENT latest resumable pause no
+ * longer matches the `runId` the schedule was recorded for (recovered,
+ * superseded by a newer pause some other way, or otherwise stale), the row
+ * is cleared outright rather than re-armed for a pause that's gone. A
+ * schedule whose `at` has already passed (agetor was down through it) is
+ * re-armed with a short, staggered delay — `now + 5000 + i * 2000` per
+ * overdue entry, persisted back onto the row so its countdown reads
+ * correctly — rather than firing every overdue task in the same tick.
+ * Returns the count actually armed (clears don't count).
+ */
+export async function rearmFxAutoResumes(): Promise<number> {
+  const pending = tasks.listFxAutoResumePending();
+  const now = Date.now();
+  let armed = 0;
+  let staggerIndex = 0;
+  for (const { id: taskId, fxRecovery: rec } of pending) {
+    const pause = latestResumableFxPause(taskId);
+    if (!pause || pause.runId !== rec.runId) {
+      tasks.setFxRecovery(taskId, null);
+      continue;
+    }
+    const schedule = rec.autoResume;
+    if (!schedule) continue; // listFxAutoResumePending already filters this — defensive only.
+    let at = schedule.at;
+    if (at <= now) {
+      at = now + 5000 + staggerIndex * 2000;
+      staggerIndex++;
+      tasks.setFxRecovery(taskId, { ...rec, autoResume: { ...schedule, at } });
+    }
+    armFxAutoResumeTimer(taskId, at);
+    armed++;
+  }
+  return armed;
+}
+
+/** Test/shutdown hook: clear every in-memory auto-resume timer without
+ *  touching any persisted `fxRecovery` row. Mirrors the "stop timers, leave
+ *  the DB alone" shape tests need to reset module state between runs. */
+export function stopFxAutoResumeTimers(): void {
+  for (const timer of fxAutoResumeTimers.values()) clearTimeout(timer);
+  fxAutoResumeTimers.clear();
+}
+
+/**
+ * Continue a PAUSED fx model response (plan `docs/plans/fix-fx-harness-rate-
+ * limit.md` §2 "Resume evidence", §3 decision 5) — the Vercel AI Gateway hit
+ * its free-tier rate limit, fx retried up to its attempt cap, and gave up
+ * with a durable, resumable checkpoint (`FxRecoveryPayload.state ===
+ * "paused"`, `requiredAction === "continue_later"`). Resuming replays that
+ * checkpoint via a fresh `session/resume` + `session/prompt {..,
+ * _meta:{fx:{continueRecovery:true}}}` turn (see `spawnFxRun`'s
+ * `continueRecovery` variant and fx-acp.ts) — no new prompt is sent, so the
+ * user's next real message still lands on the same conversation.
+ *
+ * Called from two places: a manual resume (`opts.origin` omitted or
+ * `"manual"` — the `/tasks/:id/fx-resume` route, `agetor resume`, the
+ * webview's Resume button) and the auto-resume engine's own timer
+ * (`fireFxAutoResume`, `opts.origin: "auto"` with `attempt`/`max` naming
+ * which attempt this is — plan `docs/plans/fx-recovery-follow-ups.md` §3 T2
+ * item 6). The two differ only in: a manual resume additionally cancels any
+ * pending auto-resume timer up front (the user acting IS an implicit
+ * cancel — a scheduled auto-resume must not also fire later and double-spawn
+ * a turn against the checkpoint this manual resume is about to consume) with
+ * no status line of its own (`spawnFxRun`'s own row lifecycle for the
+ * `continueRecovery` branch already leaves the row in the right shape); and
+ * the opening status line `spawnFxRun` writes differs (see `FxTurn`'s doc).
+ *
+ * Claims the module-level `resumingTaskIds` set synchronously, before any
+ * `await` — this is what used to be the `/fx-resume` route's own
+ * `fxResumesInFlight` claim, moved here so the auto-resume timer and every
+ * HTTP caller share ONE guard against a double-resume race (two POSTs, or a
+ * POST racing the timer, landing on the same task). Released in `finally`.
+ *
+ * Every OTHER gating check below runs BEFORE `spawnFxRun` is ever called,
+ * because an ungated call would spawn a real run row (flipping the card to
+ * `running`, opening a live fx ACP process) only to have fx's own
+ * `session/prompt` answer `-32602 "No paused model response to continue"` —
+ * a run failing for a reason agetor could have caught synchronously against
+ * data it already has. Order matters: existence and archival first (cheap,
+ * no DB scan), then the harness-kind check (a non-fx task can never have a
+ * recovery sentinel, but checking first gives a clearer error than "no
+ * paused response"), then in-flight (nothing to gate against once a turn is
+ * already running), then the run/sentinel/session-id lookups that actually
+ * decide resumability (`latestResumableFxPause`, extracted from what used to
+ * be this function's own inline lookup — see that function's doc).
+ *
+ * `spawnFxRun` can still fail AFTER all of the above passes (missing
+ * harness — effectively unreachable here since the `kind !== "fx"` check
+ * just above resolves the identical harness synchronously, with no `await`
+ * in between for it to vanish; or `spawnAgentOrFail` throwing, e.g. a
+ * transient spawn error) — Phase 8 review #10: that failure used to be
+ * invisible, because `spawnFxRun` returned the SAME truthy `runId` a real
+ * spawn does even on those branches, so this function reported `{ ok: true,
+ * runId }` for a resume that never started. The caller (`POST
+ * /tasks/:id/fx-resume`, `agetor resume`, the webview's Resume button,
+ * `fireFxAutoResume`) has no way to see the run row's own `failed` status the
+ * way a live run panel does, so a `spawned: false` result is now surfaced as
+ * a real HTTP failure (500 — the request was well-formed and passed every
+ * gate, but the server genuinely couldn't start the turn) rather than a
+ * false 200. The run row `spawnFxRun` already wrote (status `failed`, with
+ * the failure reason on its `stderr`/status chunks) is kept as-is — it's the
+ * durable record of the failed resume attempt, not rolled back or deleted
+ * here.
+ */
+export async function resumeFxRecovery(
+  taskId: string,
+  opts?: { origin?: "manual" | "auto"; attempt?: number; max?: number },
+): Promise<
+  { ok: true; runId: string } | { ok: false; status: 400 | 404 | 409 | 500; error: string }
+> {
+  if (resumingTaskIds.has(taskId)) {
+    return { ok: false, status: 409, error: "a resume is already in flight for this task" };
+  }
+  resumingTaskIds.add(taskId);
+  try {
+    let task = tasks.get(taskId);
+    if (!task) return { ok: false, status: 404, error: "not found" };
+    if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
+    if (resolveHarness(task.agent)?.kind !== "fx") {
+      return { ok: false, status: 400, error: "only fx tasks can resume a paused response" };
+    }
+    if ((task.runId && active.has(task.runId)) || startingTaskIds.has(taskId)) {
+      return { ok: false, status: 409, error: "a turn is already in flight for this task" };
+    }
+
+    if (!latestResumableFxPause(taskId)) {
+      return { ok: false, status: 400, error: "no paused fx response to resume" };
+    }
+
+    if (findLastFxSessionId(taskId) === null) {
+      return { ok: false, status: 400, error: "no fx session to resume" };
+    }
+
+    const origin = opts?.origin ?? "manual";
+    if (origin === "manual") {
+      // The user acting is an implicit cancel of any pending auto-resume
+      // schedule — see this function's doc. No status line: `spawnFxRun`'s
+      // own `continueRecovery` row lifecycle (below) already leaves the row
+      // in the post-cancel shape once the run actually starts; this just
+      // closes the window between "gating passed" and "spawnFxRun runs" so
+      // a timer can't fire in between.
+      cancelFxAutoResumeTimer(taskId);
+      const rec = task.fxRecovery;
+      if (rec?.autoResume) {
+        tasks.setFxRecovery(taskId, { ...rec, autoResume: null, autoResumeStopped: undefined });
+        task = tasks.get(taskId) ?? task;
+      }
+    }
+
+    const result = await spawnFxRun(task, taskId, {
+      continueRecovery: true,
+      ...(origin === "auto" ? { origin, attempt: opts?.attempt, max: opts?.max } : {}),
+    });
+    if (result === null) {
+      return { ok: false, status: 409, error: "a turn is already starting for this task" };
+    }
+    if (!result.spawned) {
+      return {
+        ok: false,
+        status: 500,
+        error: result.error ?? "fx could not be started — see the run's status line",
+      };
+    }
+    return { ok: true, runId: result.runId };
+  } finally {
+    resumingTaskIds.delete(taskId);
+  }
 }
 
 /**
@@ -4920,7 +5983,14 @@ function findLastFxSessionId(taskId: string): string | null {
  *
  *   • `delivered: true` — the paste landed (or no `pasteOutcome` was offered
  *     to await, e.g. `spawnResumedSession`'s fresh-spawn path, which has no
- *     live modal to withhold against).
+ *     live modal to withhold against). `pending: true` rides along on this
+ *     variant only, and only from `spawnResumedSession`'s fresh-spawn path:
+ *     the message WAS recorded (run row inserted, task flipped to `running`,
+ *     `user` event appended) but the actual `claude --resume` process spawn
+ *     is still running detached past `SPAWN_RESPONSE_BUDGET_MS` — see that
+ *     constant's doc. Omitted (never `false`) whenever the spawn settled
+ *     within budget, so this result stays byte-identical to before the
+ *     budget existed on the fast path.
  *   • `delivered: false; withheld: true` — the underlying `PasteOutcome` was
  *     specifically the modal-guard withhold (a blocking claude modal was
  *     still on the pane when the paste's grace window elapsed). This is the
@@ -4936,7 +6006,7 @@ function findLastFxSessionId(taskId: string): string | null {
  *     withheld/savedToBacklog framing.
  */
 type ClaudeTurnResult =
-  | { runId: string; delivered: true }
+  | { runId: string; delivered: true; pending?: true }
   | { runId: string; delivered: false; withheld: true }
   | { runId: string; delivered: false; withheld: false; reason: string };
 
@@ -5044,6 +6114,13 @@ async function resolveClaudeTurnOutcome(
  * (there are none in production — `sendInput` always passes it — but keeping
  * it optional avoids forcing every test/helper caller to thread a value that
  * happens to equal `line` anyway).
+ *
+ * The dead/no-session mint branch (`spawnResumedSession`) may resolve before
+ * its underlying `claude --resume` spawn has actually settled — bounded by
+ * `SPAWN_RESPONSE_BUDGET_MS` — in which case the returned `ClaudeTurnResult`
+ * carries `pending: true` alongside `delivered: true`. The fold-while-busy
+ * paste path (`pasteFollowUp`, above) never does this — a live-session paste
+ * is fast and has no comparable spawn to bound.
  */
 async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): Promise<ClaudeTurnResult | null> {
   const task = tasks.get(taskId);
@@ -5080,13 +6157,19 @@ async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): P
     };
   }
   startingTaskIds.add(taskId);
-  try {
-    // A fresh spawn has no live modal to withhold a keystroke against, so
-    // there's no `pasteOutcome` to await here — always delivered.
-    return { runId: await spawnResumedSession(task, taskId, line), delivered: true };
-  } finally {
-    startingTaskIds.delete(taskId);
-  }
+  // A fresh spawn has no live modal to withhold a keystroke against, so
+  // there's no `pasteOutcome` to await here — always delivered. Unlike
+  // before `SPAWN_RESPONSE_BUDGET_MS` existed, this call is NOT wrapped in a
+  // `try/finally` that releases the `startingTaskIds` claim once it returns:
+  // `spawnResumedSession` may now return before its underlying spawn has
+  // settled (see `pending` below), and releasing the claim here would let a
+  // second overlapping send start racing behind a spawn that's still in
+  // flight. `spawnResumedSession` itself owns releasing the claim — via its
+  // detached continuation's own `finally` on the slow path, or synchronously
+  // before returning on every path that never reaches that continuation
+  // (missing harness, a synchronous throw during its own setup).
+  const { runId, pending } = await spawnResumedSession(task, taskId, line);
+  return { runId, delivered: true, ...(pending ? { pending: true as const } : {}) };
 }
 
 /**
@@ -5194,6 +6277,13 @@ async function sendTurnInExistingSession(
     const agent = await sendTurn(taskId, line, onChunk, {
       onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, rawLine ?? line, outcome),
     });
+    // Stop landed while the paste was in flight (see `pendingCancelRunIds`):
+    // interrupt the turn (Ctrl+C, the session stays alive — same as a normal
+    // Stop) and settle the run `cancelled` instead of registering it. The
+    // message was already pasted, so `delivered` stays truthful.
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      return { runId: newRunId, delivered: true };
+    }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome);
@@ -5436,8 +6526,48 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
  *
  * Reuses the existing worktree (`task.worktreePath`) so the agent operates
  * on the same checkout as before.
+ *
+ * Only the run-row insert, the column flip and the `user`/`status` echoes
+ * are synchronous. The actual `claude --resume` spawn — which in practice
+ * has taken 5-30s in the packaged app (see
+ * `docs/plans/task-details-blank-while-session-restores.md` §2) — runs as a
+ * detached continuation raced against `SPAWN_RESPONSE_BUDGET_MS`: this
+ * function returns as soon as either the spawn settles or the budget
+ * elapses, whichever comes first. `sendClaudeTurn` (this function's only
+ * caller) has already claimed `startingTaskIds` for `taskId` before calling
+ * in; releasing that claim is THIS function's responsibility on every
+ * return path — either synchronously (missing-harness branch) or via the
+ * continuation's own `finally` once the real spawn settles, never merely
+ * once this promise resolves. See `startingTaskIds`'s doc (near `startTask`)
+ * for why the claim must outlive a budget-triggered early return.
  */
-async function spawnResumedSession(task: Task, taskId: string, line: string): Promise<string> {
+async function spawnResumedSession(
+  task: Task,
+  taskId: string,
+  line: string,
+): Promise<{ runId: string; pending?: true }> {
+  try {
+    return await spawnResumedSessionInner(task, taskId, line);
+  } catch (err) {
+    // A synchronous throw anywhere before the continuation was created
+    // (below) means no continuation exists to release the claim in its own
+    // `finally` — release it here instead, matching this function's
+    // pre-budget behavior, where any such throw propagated straight through
+    // `sendClaudeTurn`'s old `finally { startingTaskIds.delete(taskId) }`.
+    // Once the continuation exists, `raceSpawnBudget` never rejects (it
+    // never throws itself, and the continuation catches its own errors), so
+    // this catch can't fire for anything the continuation is responsible
+    // for — no double-delete risk.
+    startingTaskIds.delete(taskId);
+    throw err;
+  }
+}
+
+async function spawnResumedSessionInner(
+  task: Task,
+  taskId: string,
+  line: string,
+): Promise<{ runId: string; pending?: true }> {
   const priorSessionId = findLastClaudeSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
 
@@ -5479,34 +6609,78 @@ async function spawnResumedSession(task: Task, taskId: string, line: string): Pr
     onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
     runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
     tasks.update(taskId, { column: "ready", runId: null });
-    return newRunId;
+    // No continuation was ever created for this run — release the claim
+    // `sendClaudeTurn` took before calling in, right here.
+    startingTaskIds.delete(taskId);
+    return { runId: newRunId };
   }
-  const { agent } = await spawnAgentOrFail({
-    taskId,
-    runId: newRunId,
-    harness,
-    prompt: line,
-    cwd,
-    onChunk,
-    onSessionId: (sessionId) => {
-      runs.update(newRunId, { claudeSessionId: sessionId });
-    },
-    opts: {
-      mode: task.mode,
-      model: task.model ?? DEFAULT_MODEL[harness.kind],
-      effort: task.effort,
-      fast: task.fast,
-      maxMode: task.maxMode,
-      resumeSessionId: priorSessionId,
-    },
-  });
-  // claude has no turn queue (spawnResumedSession is only reached from the
-  // idle branch of sendInput) — nothing to drop on failure here.
-  if (!agent) return newRunId;
 
-  registerActiveRun(newRunId, taskId, task, agent);
-  attachDoneHandler(newRunId, taskId, agent);
-  return newRunId;
+  // Everything past this point — the spawn itself and everything that
+  // depends on its result — is the detached continuation raced below.
+  const continuation: Promise<void> = (async () => {
+    try {
+      const { agent } = await spawnAgentOrFail({
+        taskId,
+        runId: newRunId,
+        harness,
+        prompt: line,
+        cwd,
+        onChunk,
+        onSessionId: (sessionId) => {
+          runs.update(newRunId, { claudeSessionId: sessionId });
+        },
+        opts: {
+          mode: task.mode,
+          model: task.model ?? DEFAULT_MODEL[harness.kind],
+          effort: task.effort,
+          fast: task.fast,
+          maxMode: task.maxMode,
+          resumeSessionId: priorSessionId,
+        },
+      });
+      // claude has no turn queue (spawnResumedSession is only reached from
+      // the idle branch of sendInput) — nothing to drop on failure here;
+      // `spawnAgentOrFail`'s own catch already recorded the run failed and
+      // bounced the task back to `ready`.
+      // Consume a Stop that landed while the spawn was in flight (see
+      // `pendingCancelRunIds`) on every settle path, agent or not.
+      const cancelledWhilePending = pendingCancelRunIds.delete(newRunId);
+      if (!agent) return;
+
+      // Ownership guard: by the time the spawn settles the task may have
+      // been deleted, archived, or this run may no longer be the task's
+      // current run (replaced by a later send/start, or cancelled) while the
+      // spawn was still in flight. Registering against a stale or archived
+      // task would leak a live tmux session nothing else knows about — a
+      // force-archive (`archiveTask`'s `active.has(task.runId)` guard is
+      // false during this exact pending window, since `registerActiveRun`
+      // hasn't run yet) must be treated the same as delete/replace here.
+      const fresh = tasks.get(taskId);
+      if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId || cancelledWhilePending) {
+        agent.kill();
+        await dropSession(taskId);
+        runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+        if (cancelledWhilePending && fresh && fresh.runId === newRunId) {
+          onChunk("status", "cancelled by user before the agent launched");
+          updateColumn(taskId, newRunId, "ready");
+        }
+        return;
+      }
+
+      registerActiveRun(newRunId, taskId, fresh, agent);
+      attachDoneHandler(newRunId, taskId, agent);
+    } catch (err) {
+      // `spawnAgentOrFail` never throws (it catches internally) — this is
+      // belt-and-braces against a throw anywhere else in this continuation,
+      // e.g. the ownership-guard cleanup above.
+      console.warn(`[agetor] detached claude resume spawn failed for task ${taskId} run ${newRunId}:`, err);
+    } finally {
+      startingTaskIds.delete(taskId);
+    }
+  })();
+
+  const raced = await raceSpawnBudget(continuation, SPAWN_RESPONSE_BUDGET_MS);
+  return raced.settled ? { runId: newRunId } : { runId: newRunId, pending: true };
 }
 
 /**
@@ -5563,6 +6737,37 @@ export interface CreateTaskInput extends Partial<Task> {
    * task.
    */
   pipeline?: boolean;
+  /**
+   * Bind this task to a reusable {@link AgentProfile} at create time
+   * (docs/plans/agent-profiles.md). When set to a resolvable profile id,
+   * `createTask` overrides the effective `agent`/`model`/`effort`/`mode`/
+   * `fast`/`maxMode` from the profile — any of those six fields also present
+   * in the body are ignored — and stores both the id and a point-in-time
+   * `AgentProfileSnapshot` on the new row. Also settable via the inherited
+   * `Partial<Task>` field; listed here too so its doc comment lives next to
+   * the override it triggers. An unresolvable id fails the whole create with
+   * `{ error }` rather than silently falling back to "no agent".
+   */
+  agentProfileId?: string | null;
+}
+
+/**
+ * The kind-default effort id for `model` — "kind default if offered, else
+ * strongest offered id, else null" (mirrors the picker's own rule). Shared by
+ * `createTask` (no-profile, no-explicit-effort path) and by
+ * `startTaskInner`'s live-profile refresh, which both need to fill in an
+ * effort when neither the caller nor a bound {@link AgentProfile} supplied
+ * one — a profile's own `effort: null` means "no opinion", not "no effort
+ * flag", so a model that requires one (see `buildCommand`'s
+ * "effort is required for …" throw) must still get a real default here.
+ * Discovered efforts (e.g. Codex's own app-server catalog) win over the
+ * curated `MODEL_EFFORT_SUPPORT` table when the harness reported a non-empty
+ * list for this model — see `supportedEfforts`/`getDiscoveredEfforts`.
+ */
+function defaultEffortFor(kind: AgentKind, model: string, harnessId: string): string | null {
+  const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harnessId));
+  if (support.length === 0) return null;
+  return support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id;
 }
 
 /**
@@ -5638,17 +6843,34 @@ export async function createTask(
 
   const id = randomUUID();
 
+  // Agent profile override (docs/plans/agent-profiles.md D2/D3): resolved
+  // BEFORE the harness/model/effort defaulting below, since a bound profile
+  // wins outright over any of those six body-provided fields. An
+  // unresolvable id fails the whole create rather than silently degrading to
+  // "no agent" — the caller explicitly asked for a profile that doesn't
+  // exist (deleted between the picker fetching the list and the submit
+  // landing, or a typo'd CLI `--profile` id that bypassed `matchAgentProfileRef`).
+  let profile: AgentProfile | null = null;
+  const requestedProfileId = input.agentProfileId?.trim();
+  if (requestedProfileId) {
+    profile = agentProfiles.get(requestedProfileId);
+    if (!profile) {
+      return { error: `unknown agent profile "${requestedProfileId}"` };
+    }
+  }
+
   // Resolve the harness so we can default model/effort by kind. A bad alias
   // id is rejected up-front rather than persisted and surfacing as a launch
   // failure later. Falls back to the built-in claude-code id when the caller
-  // omits `agent` entirely.
-  const agentId = input.agent ?? "claude-code";
+  // omits `agent` entirely. A bound profile's own harness always wins over
+  // `input.agent`.
+  const agentId = profile ? profile.harness : (input.agent ?? "claude-code");
   const harness = resolveHarness(agentId);
   if (!harness) {
     return { error: `unknown harness "${agentId}"` };
   }
   const kind = harness.kind;
-  const model = input.model ?? DEFAULT_MODEL[kind];
+  const model = profile ? profile.model : (input.model ?? DEFAULT_MODEL[kind]);
   // Discovered efforts (e.g. Codex's own app-server catalog) win when the
   // harness reported a non-empty list for this model; the curated
   // MODEL_EFFORT_SUPPORT table is only the fallback (see
@@ -5659,18 +6881,39 @@ export async function createTask(
   // effort support list is empty either way) sends null effort.
   //
   // Deliberate side effect versus the old direct-table read: an *unlisted*
-  // gemini/fx model id used to store `high` here (`MODEL_EFFORT_SUPPORT[kind][model]`
+  // gemini model id used to store `high` here (`MODEL_EFFORT_SUPPORT[kind][model]`
   // read `undefined` for an unknown key, which failed the `Array.isArray`
   // check and fell through to `DEFAULT_EFFORT[kind]`), while a *listed*
-  // gemini/fx model (whose curated set is `[]`) stored `null`. Routing
-  // through `supportedEfforts` makes both cases resolve to `null` — that's
+  // gemini model (whose curated set is `[]`) stored `null`. Routing through
+  // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
-  // unknown id, so this closes a known inconsistency, on purpose.
-  const support = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, harness.id));
-  const effort = input.effort
-    ?? (support.length === 0
-      ? null
-      : support.some((o) => o.id === DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : support[0]!.id);
+  // unknown id, so this closes a known inconsistency, on purpose. fx is
+  // different: 16 of its 28 curated models advertise real efforts (live-probed
+  // 2026-09-14), so both a listed and an unlisted fx model resolve through
+  // `supportedEfforts` to `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model —
+  // or the `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of
+  // those 16; only the remaining 12 no-effort fx models (e.g. `zai/glm-4.7`)
+  // resolve to `null`. That whole computation is `defaultEffortFor` below.
+  //
+  // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —
+  // the Settings form only ever offers `supportedEfforts` rows, so a stored
+  // value is already sane, and re-validating here would just re-litigate the
+  // same "discovered can understate the live API" problem the PATCH route's
+  // null-clear guard already carves an exception for. A profile whose own
+  // `effort` is `null` ("no opinion") still needs a real default when the
+  // model requires one — `buildCommand` throws "effort is required for …"
+  // otherwise — so it falls through to the same `defaultEffortFor` the
+  // no-profile path uses. Only the resolved task-row `effort` gets this
+  // treatment; `agentProfileSnapshot` below is built straight from `profile`
+  // and keeps the raw `null`.
+  let effort: string | null;
+  if (profile) {
+    effort = profile.effort ?? defaultEffortFor(kind, model, harness.id);
+  } else if (input.effort !== undefined && input.effort !== null) {
+    effort = input.effort;
+  } else {
+    effort = defaultEffortFor(kind, model, harness.id);
+  }
 
   // Validate taskType against the known set so a bogus value can't poison
   // the row (the picker only ever sends one of the canonical ids, but
@@ -5747,6 +6990,15 @@ export async function createTask(
     validatedIssueUrl = normalizeIssueUrl(rawIssueUrl);
   }
 
+  // Point-in-time capture of the bound profile (null when none). Taken here,
+  // right before insert, using the SAME `harness` this create already
+  // resolved above — never a second lookup — so the snapshot's
+  // `harnessKind`/`harnessLabel` can't drift from what the task row itself
+  // just got assigned.
+  const agentProfileSnapshot: AgentProfileSnapshot | null = profile
+    ? snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, now)
+    : null;
+
   const task = tasks.insert({
     id,
     title: input.title,
@@ -5763,11 +7015,13 @@ export async function createTask(
     // No PR exists for a brand-new task; set server-side by pull-create.
     prUrl: null,
     issueUrl: validatedIssueUrl,
-    mode: input.mode ?? null,
+    mode: profile ? profile.mode : (input.mode ?? null),
     model,
     effort,
-    fast: input.fast === true,
-    maxMode: input.maxMode === true,
+    fast: profile ? profile.fast : input.fast === true,
+    maxMode: profile ? profile.maxMode : input.maxMode === true,
+    agentProfileId: profile?.id ?? null,
+    agentProfile: agentProfileSnapshot,
     references: input.references ?? [],
     // Brand-new tasks start with an empty backlog; drafts are added later from
     // the run panel.
@@ -6037,6 +7291,9 @@ export async function archiveTask(
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
+  // Same for a pending fx auto-resume schedule — an archived task has
+  // nothing left to resume (plan §3 T2 item 8).
+  clearFxRecovery(taskId);
   // Deferred: the actual teardown (tmux kill, terminal shells, worktree
   // detach) is pushed onto this task's source-workdir teardown queue rather
   // than awaited here, so `archiveTask` can flip the DB column and return in
@@ -6325,6 +7582,9 @@ export async function deleteTask(taskId: string): Promise<void> {
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
+  // Same for a pending fx auto-resume schedule, before the task row itself
+  // goes (plan §3 T2 item 8).
+  clearFxRecovery(taskId);
   // Routed through the same per-workdir teardown queue archiveTask uses —
   // DELETE's semantics are unchanged (still awaited before `tasks.delete`
   // below), but this serializes it behind any archive teardown already in
@@ -6788,3 +8048,38 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
 
   return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false };
 }
+
+/**
+ * Test-only escape hatch (mirrors the `__testing` convention already used in
+ * agent-status.ts / interactions.ts / model-discovery.ts / agent-discovery.ts).
+ * Exposes `spawnFxRun` directly so its "harness not found" failure branch
+ * (Phase 8 review #10 — `spawned: false`, see that function's doc) can be
+ * exercised deterministically. That branch is NOT reachable through
+ * `resumeFxRecovery` itself: `resumeFxRecovery`'s own `kind !== "fx"` gate
+ * resolves the identical harness synchronously, with no `await` in between
+ * for the harness row to vanish before `spawnFxRun` re-resolves it — so any
+ * call that gets past that gate is guaranteed a resolvable harness. Calling
+ * `spawnFxRun` directly with a task whose `agent` doesn't resolve sidesteps
+ * that gate and hits the branch under test. See
+ * orchestrator-fx.test.ts's "spawnFxRun / resumeFxRecovery: not-spawned
+ * mapping" tests.
+ *
+ * `pendingFxAutoResume` additionally exposes whether an in-memory
+ * auto-resume timer is currently armed for a task — `fxAutoResumeTimers`
+ * itself is module-private, so tests need this to assert a timer was (or
+ * wasn't) armed/cancelled without reaching into the DB row alone (the row
+ * can be in the "scheduled" shape even in the brief window before/after the
+ * in-memory timer is armed — see `recordFxPause`/`cancelFxAutoResume`).
+ *
+ * `noteFxRunSettled` is exposed too (Phase 8 review #5's regression test):
+ * every REAL spawn path that could reach it (startTaskInner, both of
+ * `spawnFxRun`'s row lifecycles) already disarms any still-pending
+ * auto-resume timer for the task before its own run can settle, so there is
+ * no way to drive "a run settles while an unrelated timer from an earlier
+ * pause is still armed" through the public API alone — calling the hook
+ * directly is the only deterministic way to exercise that branch.
+ */
+function pendingFxAutoResume(taskId: string): boolean {
+  return fxAutoResumeTimers.has(taskId);
+}
+export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled };
