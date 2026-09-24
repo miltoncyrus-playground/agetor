@@ -14,6 +14,7 @@ import { displayColumnMeta, toDisplayColumn } from "@/lib/display-columns";
 import { AGE_BADGE_MIN_MS, formatAge } from "@/lib/board-status";
 import { useMinuteNow } from "@/lib/minute-tick";
 import { AgentIcon } from "./AgentIcon";
+import { PipelineBadge } from "@/components/pipelines";
 
 interface Props {
   task: Task;
@@ -243,7 +244,13 @@ function TaskCardImpl({ task, tasksById, childCountsByParent, onOpen, isOpen, on
          *  harness id — the snapshot is server-managed and always present
          *  once `agentProfileId` is set (plan D1/D14), so no live profile
          *  lookup is needed here. */}
-        {task.agentProfile ? (
+        {/* A pipeline task's identity is its pipeline name + step progress
+         *  (D5/D9, docs/plans/pipelines.md) — the agent profile is per-step,
+         *  not per-task, so it replaces the profile/harness slot outright
+         *  rather than sitting alongside it. */}
+        {task.pipelineRun ? (
+          <PipelineBadge run={task.pipelineRun} className="shrink-0" />
+        ) : task.agentProfile ? (
           <span className="flex min-w-0 shrink-0 items-center gap-1" title={task.agent} data-testid="task-card-agent-profile">
             <AgentIcon kind={task.agentProfile.harnessKind} className="size-3 shrink-0" />
             <span className="shrink-0">{task.agentProfile.name}</span>

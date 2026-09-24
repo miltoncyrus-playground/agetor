@@ -12,6 +12,7 @@ import {
   type AgentKind,
   type Harness,
   type RunEventStream,
+  type Task,
 } from "../shared/types.ts";
 
 // agents.ts imports codex-tmux.ts/gemini-tmux.ts, both of which import
@@ -38,8 +39,9 @@ const {
   FAKE_FX_REPAUSE_PROMPT_MARKER,
   FAKE_FX_RECOVERY_URL_PROMPT_MARKER,
   FAKE_FX_EFFORT_UNOFFERED_PROMPT_MARKER,
+  FAKE_CLAUDE_HANDOFF_PROMPT_MARKER,
 } = await import("./agents.ts");
-const { dataDir } = await import("./db.ts");
+const { dataDir, tasks } = await import("./db.ts");
 
 beforeEach(() => {
   // Force the literal "claude" / "codex" names in argv. Production
@@ -71,6 +73,7 @@ afterEach(() => {
   delete process.env.AGETOR_FAKE_FX_RECOVERY_URL;
   delete process.env.AGETOR_FAKE_FX_RECOVERY;
   delete process.env.AGETOR_FAKE_FX_EFFORT_UNOFFERED;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -108,7 +111,7 @@ const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as co
 const codexDefaults = { mode: "auto", model: "gpt-6-astra", effort: "high" } as const;
 // Cursor's effort rides inside the --model id (`cursorModelArg` composes
 // model + effort + fast into one string), not a separate flag.
-const cursorDefaults = { mode: "auto", model: "cursor-grok-4.6", effort: "high" } as const;
+const cursorDefaults = { mode: "auto", model: "grok-4.7", effort: "high" } as const;
 // Gemini has no effort flag at all (see MODEL_EFFORT_SUPPORT.gemini in
 // shared/types.ts) — buildCommand's gemini branch never reads opts.effort.
 const geminiDefaults = { mode: "auto", model: "gemini-3.1-pro-preview" } as const;
@@ -232,6 +235,16 @@ test("claude-code 'opus-4.8' maps to --model claude-opus-4-8", () => {
   ]);
 });
 
+test("claude-code 'opus-5.5' maps to --model claude-opus-5-5", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "opus-5.5", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-opus-5-5",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code 'opus-5' maps to --model claude-opus-5", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "opus-5", mode: "auto" });
   expect(cmd).toEqual([
@@ -301,7 +314,7 @@ test("claude-code 'sonnet-5' maps to --model claude-sonnet-5", () => {
 // ---------------------------------------------------------------------------
 
 test("claudeModelPickerFamily maps each current-release id to its picker row family", () => {
-  expect(claudeModelPickerFamily("opus-5")).toBe("Opus");
+  expect(claudeModelPickerFamily("opus-5.5")).toBe("Opus");
   expect(claudeModelPickerFamily("sonnet-5")).toBe("Sonnet");
   expect(claudeModelPickerFamily("fable-5.1")).toBe("Fable");
   expect(claudeModelPickerFamily("haiku-4.5")).toBe("Haiku");
@@ -317,6 +330,10 @@ test("claudeModelPickerFamily returns null for ids the picker's single per-famil
   expect(claudeModelPickerFamily("sonnet-4.6")).toBeNull();
   // fable-5 is now superseded by fable-5.1 — same "wrong version" hazard.
   expect(claudeModelPickerFamily("fable-5")).toBeNull();
+  // opus-5 is now superseded by opus-5.5 — claude 2.1.280 makes
+  // claude-opus-5-5 the default Opus model, so the picker's Opus row would
+  // land on the wrong version.
+  expect(claudeModelPickerFamily("opus-5")).toBeNull();
   // No picker row at all for either Mythos id.
   expect(claudeModelPickerFamily("mythos-5")).toBeNull();
   expect(claudeModelPickerFamily("mythos-5.1")).toBeNull();
@@ -580,6 +597,30 @@ test("codex model 'gpt-6-astra-aeon' passes through verbatim as --model", () => 
   ]);
 });
 
+test("codex model 'gpt-6-sol' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6-sol", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-6-sol",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
+test("codex model 'gpt-6-luna' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6-luna", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-6-luna",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
 test("codex model 'gpt-5.5' passes through verbatim as --model", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5.5", mode: "auto" });
   expect(cmd).toEqual([
@@ -709,6 +750,28 @@ test("codex effort 'none' passes through verbatim on gpt-5.6-sol (-c model_reaso
   expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=none");
 });
 
+test("codex effort 'ultra' passes through verbatim on gpt-6-sol (-c model_reasoning_effort=ultra)", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6-sol",
+    effort: "ultra",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=ultra");
+});
+
+test("codex effort 'none' passes through verbatim on gpt-6-luna (-c model_reasoning_effort=none)", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6-luna",
+    effort: "none",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=none");
+});
+
 test("codex throws when model is missing", () => {
   expect(() =>
     buildCommand(builtin("codex"), "hi", { mode: "auto", effort: "high" }),
@@ -726,12 +789,12 @@ test("codex throws when effort is missing for a model that supports it", () => {
 // spawn time via its own injection-safe quoting. `buildCommand`'s job is just
 // the flags: -p stream-json, --model, the auto/ask force+sandbox posture, and
 // --resume. Cursor effort/Fast/Max Mode are composed into the --model id.
-test("cursor with defaults emits -p --output-format stream-json --model cursor-grok-4.6-high --force --sandbox disabled", () => {
+test("cursor with defaults emits -p --output-format stream-json --model grok-4.7-high --force --sandbox disabled", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
   expect(cmd).toEqual([
     "cursor-agent",
     "-p", "--output-format", "stream-json",
-    "--model", "cursor-grok-4.6-high",
+    "--model", "grok-4.7-high",
     "--force", "--sandbox", "disabled",
   ]);
 });
@@ -741,7 +804,7 @@ test("cursor 'ask' mode emits no --force / --sandbox flags (propose-only — cur
   expect(cmd).toEqual([
     "cursor-agent",
     "-p", "--output-format", "stream-json",
-    "--model", "cursor-grok-4.6-high",
+    "--model", "grok-4.7-high",
   ]);
   expect(cmd).not.toContain("--force");
   expect(cmd).not.toContain("--sandbox");
@@ -900,7 +963,7 @@ test("AGETOR_CURSOR_ARGS extra args land after the mode flags and before --resum
   expect(cmd).toEqual([
     "cursor-agent",
     "-p", "--output-format", "stream-json",
-    "--model", "cursor-grok-4.6-high",
+    "--model", "grok-4.7-high",
     "--force", "--sandbox", "disabled",
     "--verbose", "--foo",
     "--resume", "sess-1",
@@ -1981,4 +2044,156 @@ test("leanContextEnabled: on by default, off only for the literal '0'", () => {
   } finally {
     if (prior === undefined) delete process.env.AGETOR_PIPELINE_LEAN_CONTEXT; else process.env.AGETOR_PIPELINE_LEAN_CONTEXT = prior;
   }
+});
+
+// --- AGETOR_CLAUDE_DRIVER=fake pipeline-handoff two-turn suffixes -----------
+// See docs/plans/pipelines.md and agents.ts's FAKE_CLAUDE_HANDOFF_PROMPT_MARKER
+// doc comment: the pipeline runner sends ONE automatic reminder (a plain
+// follow-up sendInput turn, no marker of its own) when a step's reply lacked
+// a valid <handoff>, and `missing-then-done` / `invalid-then-done` /
+// `missing-then-<StepName>` model "fail the first turn, succeed after the
+// reminder" so pipeline-runner.test.ts (owned elsewhere) can exercise that
+// recovery path against the fake driver. These tests drive `spawnAgent`
+// directly against the claude-code fake driver, mirroring the fx fake-driver
+// tests above.
+
+/** Minimal hand-built Task fixture — mirrors db-sent-files.test.ts's
+ *  makeTaskRow. Only `prompt` matters here: it's what
+ *  `resolveFakeHandoffPromptSource` falls back to when a follow-up turn's
+ *  own prompt carries no marker. */
+function makeHandoffTaskRow(taskId: string, prompt: string): Task {
+  return {
+    id: taskId,
+    title: "t",
+    prompt,
+    agent: "claude-code",
+    workdir: "/tmp",
+    isolation: "none",
+    taskType: "task",
+    branch: null,
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    prUrl: null,
+    mode: null,
+    model: null,
+    effort: null,
+    fast: false,
+    maxMode: false,
+    references: [],
+    backlog: [],
+    plans: [],
+    draft: null,
+    column: "ready",
+    runId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+    pipelineStage: null, planApproved: false, implementationApproved: false, revisionCount: 0, pipelineFeedback: null, pausedAt: null, blockReason: null, parentTaskId: null, planSubtaskId: null, childMergeStatus: null, satisfiedSubtasks: [],
+  };
+}
+
+/** Spawn one fake claude-code handoff turn for `taskId` with the given
+ *  `prompt`, collect its assistant text, and return whether a <handoff> tag
+ *  was present in it — `"missing"` (no tag at all), `"invalid"` (tag present
+ *  but JSON.parse fails), or the parsed handoff object. */
+async function runFakeHandoffTurn(
+  taskId: string,
+  prompt: string,
+): Promise<"missing" | "invalid" | { next: string | null }> {
+  process.env.AGETOR_CLAUDE_DRIVER = "fake";
+  let assistantText = "";
+  const handle = await spawnAgent({
+    taskId,
+    runId: `run-${taskId}-${Date.now()}-${Math.random()}`,
+    harness: builtin("claude-code"),
+    prompt,
+    cwd: "/tmp",
+    onChunk: (stream, data) => { if (stream === "assistant") assistantText += data; },
+    opts: { model: "claude-opus-4-7", effort: "high" },
+  });
+  await handle.done;
+  if (!assistantText.includes("<handoff>")) return "missing";
+  const match = /<handoff>\n([\s\S]*?)\n<\/handoff>/.exec(assistantText);
+  if (!match) return "invalid";
+  try {
+    return JSON.parse(match[1] as string) as { next: string | null };
+  } catch {
+    return "invalid";
+  }
+}
+
+test("claude fake driver: missing-then-done emits no handoff on turn 1 and a valid handoff on turn 2 for the same taskId", async () => {
+  const taskId = "task-handoff-missing-then-done";
+  const prompt = `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing-then-done`;
+  const turn1 = await runFakeHandoffTurn(taskId, prompt);
+  expect(turn1).toBe("missing");
+  const turn2 = await runFakeHandoffTurn(taskId, prompt);
+  expect(turn2).not.toBe("missing");
+  expect(turn2).not.toBe("invalid");
+  expect((turn2 as { next: string | null }).next).toBeNull();
+});
+
+test("claude fake driver: invalid-then-done emits an unparsable handoff on turn 1 and a valid handoff on turn 2", async () => {
+  const taskId = "task-handoff-invalid-then-done";
+  const prompt = `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:invalid-then-done`;
+  const turn1 = await runFakeHandoffTurn(taskId, prompt);
+  expect(turn1).toBe("invalid");
+  const turn2 = await runFakeHandoffTurn(taskId, prompt);
+  expect((turn2 as { next: string | null }).next).toBeNull();
+});
+
+test("claude fake driver: missing-then-<StepName> emits no handoff on turn 1 and a handoff naming that step on turn 2", async () => {
+  const taskId = "task-handoff-missing-then-step";
+  const prompt = `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing-then-StepB`;
+  const turn1 = await runFakeHandoffTurn(taskId, prompt);
+  expect(turn1).toBe("missing");
+  const turn2 = await runFakeHandoffTurn(taskId, prompt);
+  expect((turn2 as { next: string | null }).next).toBe("StepB");
+});
+
+test("claude fake driver: a follow-up prompt without a marker inherits the task's original stored-prompt marker", async () => {
+  const taskId = "task-handoff-inherit-plain";
+  tasks.insert(makeHandoffTaskRow(taskId, `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:StepC`));
+  // The follow-up line itself (e.g. a real pipeline-runner reminder, or any
+  // other marker-less resend) carries no marker at all.
+  const result = await runFakeHandoffTurn(taskId, "please try again and include a <handoff> block");
+  expect(result).not.toBe("missing");
+  expect(result).not.toBe("invalid");
+  expect((result as { next: string | null }).next).toBe("StepC");
+});
+
+test("claude fake driver: a follow-up without a marker plus an unstarted/unknown taskId never enters the handoff branch", async () => {
+  process.env.AGETOR_CLAUDE_DRIVER = "fake";
+  let assistantText = "";
+  const handle = await spawnAgent({
+    taskId: "task-handoff-unknown-no-marker",
+    runId: "run-handoff-unknown-no-marker",
+    harness: builtin("claude-code"),
+    prompt: "plain follow-up with no marker and no task row",
+    cwd: "/tmp",
+    onChunk: (stream, data) => { if (stream === "assistant") assistantText += data; },
+    opts: { model: "claude-opus-4-7", effort: "high" },
+  });
+  await handle.done;
+  expect(assistantText).not.toContain("<handoff>");
+  expect(assistantText).not.toContain("I finished the work but forgot the handoff.");
+});
+
+test("claude fake driver: two-turn inheritance combines with a task's stored marker (turn 1 missing, turn 2 done via reminder-style follow-up)", async () => {
+  const taskId = "task-handoff-inherit-two-turn";
+  const original = `Do the step. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing-then-done`;
+  tasks.insert(makeHandoffTaskRow(taskId, original));
+  // Turn 1: launched with the task's own original prompt (as the real
+  // pipeline runner does on first launch).
+  const turn1 = await runFakeHandoffTurn(taskId, original);
+  expect(turn1).toBe("missing");
+  // Turn 2: the runner's automatic reminder — no marker of its own —
+  // inherits the ORIGINAL prompt's marker/suffix and, since this is now
+  // turn 2 for this taskId, resolves to the "then" (done) behavior.
+  const turn2 = await runFakeHandoffTurn(taskId, "no <handoff> was found in your last reply — please retry");
+  expect((turn2 as { next: string | null }).next).toBeNull();
 });

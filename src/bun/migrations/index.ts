@@ -74,10 +74,10 @@ import m053 from "./053_task_agent_profile.sql" with { type: "text" };
 // token-efficiency-branch migrations; renumbered to 060-068 on syncing
 // upstream/main (v0.1.10) back into the fork, which had independently
 // claimed 051-053 for unrelated features in the meantime (same
-// renumber-with-alias pattern used throughout this file — every id this
+// renumber-with-alias pattern used throughout this file -- every id this
 // block has ever used, at every prior renumber, is kept as an alias so a
 // dev DB that already applied it under an older id is not re-migrated).
-// Pipeline's own 041_harness_quota is NOT ported — superseded by upstream's
+// Pipeline's own 041_harness_quota is NOT ported -- superseded by upstream's
 // 043_harness_usage/usage-tracker system, which covers claude-code/codex/
 // cursor rather than claude-only.
 import m060 from "./060_pipeline_tasks.sql" with { type: "text" };
@@ -89,6 +89,26 @@ import m065 from "./065_account_usage.sql" with { type: "text" };
 import m066 from "./066_satisfied_subtasks.sql" with { type: "text" };
 import m067 from "./067_run_usage.sql" with { type: "text" };
 import m068 from "./068_pipeline_stage_state.sql" with { type: "text" };
+// Arrived from upstream/feature/agetor-pipelines (alamops/agetor#244) as
+// 054-059, renumbered to 069-073 on merge: this fork's own 060-068 block
+// above had already claimed every id through 068, so the incoming ids
+// collided outright. They are appended above the fork's tail rather than
+// dropped into the free 054-059 gap -- the array's order is the apply
+// order, and an id in that gap would sort before migrations it logically
+// follows. Original ids kept as aliases (append-only: 071/072 carry BOTH
+// the id upstream first shipped them under and the one it renumbered them
+// to in e1a9ab1), so a dev DB that already applied one under an older id is
+// not re-migrated.
+// Upstream's own 054_account_usage is NOT registered here: it is this fork's
+// 065_account_usage (authored here as 040_account_usage, taken upstream as
+// #236 and renumbered to 054 there). Same SQL, unguarded CREATE TABLEs --
+// registering both would fail a fresh boot on `table usage_files already
+// exists`. The fork's 065 is left untouched.
+import m069 from "./069_normalize_cursor_grok_4_7.sql" with { type: "text" };
+import m070 from "./070_normalize_cursor_opus_5_5.sql" with { type: "text" };
+import m071 from "./071_pipelines.sql" with { type: "text" };
+import m072 from "./072_task_pipeline.sql" with { type: "text" };
+import m073 from "./073_task_pipeline_id_index.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -159,4 +179,9 @@ export const migrations: Migration[] = [
   { id: "066_satisfied_subtasks", sql: m066, aliases: ["042_satisfied_subtasks", "057_satisfied_subtasks"] },
   { id: "067_run_usage", sql: m067, aliases: ["043_run_usage", "058_run_usage"] },
   { id: "068_pipeline_stage_state", sql: m068, aliases: ["044_pipeline_stage_state", "059_pipeline_stage_state"] },
+  { id: "069_normalize_cursor_grok_4_7", sql: m069, aliases: ["055_normalize_cursor_grok_4_7"] },
+  { id: "070_normalize_cursor_opus_5_5", sql: m070, aliases: ["056_normalize_cursor_opus_5_5"] },
+  { id: "071_pipelines", sql: m071, aliases: ["056_pipelines", "057_pipelines"] },
+  { id: "072_task_pipeline", sql: m072, aliases: ["057_task_pipeline", "058_task_pipeline"] },
+  { id: "073_task_pipeline_id_index", sql: m073, aliases: ["059_task_pipeline_id_index"] },
 ];

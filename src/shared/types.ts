@@ -496,6 +496,346 @@ export interface AgentProfileSnapshot {
   capturedAt: number;
 }
 
+/**
+ * One node in a {@link PipelineGraph} — a named, agent-profile-bound unit of
+ * work. `name` is unique per pipeline (case-insensitive, trimmed): the
+ * agent's handoff `next` field targets a step by this name (or by an edge
+ * label), so renaming a step is how you'd break a running pipeline's
+ * in-flight `next` resolution — `resolveNextSteps` in `src/shared/
+ * pipeline.ts` is where that matching happens. `id` is a stable uuid that
+ * survives renames and is what edges/`startStepId`/handoff history actually
+ * reference. See `docs/plans/pipelines.md` (D3/D4) for the full design.
+ */
+export interface PipelineStep {
+  id: string;
+  name: string;
+  /** Step-specific prompt text, composed into the launch prompt by
+   *  `composeStepPrompt` alongside the pipeline goal and prior handoffs. */
+  instructions: string;
+  /** {@link AgentProfile} this step's task launches from, or null (the run
+   *  refuses to start a step with no profile — `profile-missing`). */
+  agentProfileId: string | null;
+  /** Canvas coordinates in the React Flow editor. Purely presentational. */
+  position: { x: number; y: number };
+  /** Agent profiles this step's agent may delegate to as subagents, plus an
+   *  optional cap on how many it may spawn (`null` = no limit). */
+  subagents: { profileIds: string[]; cap: number | null };
+  /** After this step settles: `"choose"` — the agent's handoff `next` field
+   *  picks exactly one outgoing edge (ignored when there's only one edge).
+   *  `"all"` — every outgoing step starts in parallel (fan-out), regardless
+   *  of `next`. */
+  transition: "choose" | "all";
+  /** How this step starts when it has multiple incoming edges: `"any"`
+   *  (default) — every arrival starts a new execution (how cycles work).
+   *  `"all"` — starts once every distinct incoming source has arrived in
+   *  this generation (fan-in / join), receiving all their handoffs. */
+  join: "any" | "all";
+}
+
+/** A directed connection between two {@link PipelineStep}s by id.
+ *  `label` is shown on the canvas and is one of the ways a `"choose"` step's
+ *  handoff `next` can target this edge's `to` step. */
+export interface PipelineEdge {
+  id: string;
+  from: string;
+  to: string;
+  label: string;
+}
+
+/** The full graph a {@link Pipeline} is built from. `startStepId` is the
+ *  editor-marked entry point; when unset, `resolveStartStep` falls back to
+ *  the unique step with no incoming edges. */
+export interface PipelineGraph {
+  steps: PipelineStep[];
+  edges: PipelineEdge[];
+  startStepId: string | null;
+}
+
+/**
+ * A named, reusable graph of steps (see {@link PipelineGraph}) — the
+ * template a pipeline task is launched from. Persisted in the `pipelines`
+ * table (`src/bun/db.ts`'s `pipelines` module); names are unique
+ * case-insensitively (trimmed), mirroring {@link AgentProfile}. Running a
+ * pipeline snapshots this graph (plus every referenced agent profile) onto
+ * the launched task's `pipelineRun.snapshot` at first Run — later edits to
+ * the pipeline never affect an already-started run (see D8,
+ * `docs/plans/pipelines.md`).
+ */
+export interface Pipeline {
+  id: string;
+  name: string;
+  description: string;
+  graph: PipelineGraph;
+  /** Cap on executions per run (1..200, default 25) — guards against a
+   *  runaway cycle. A run that would exceed it goes Blocked (`step-cap`). */
+  maxSteps: number;
+  createdAt: number;
+  updatedAt: number;
+  /** Number of parent pipeline tasks currently bound to this pipeline
+   *  (`tasks.pipeline_id = this.id`, every column including archived).
+   *  Server-derived like {@link AgentProfile.taskCount} — optional at the
+   *  type level only because raw db-layer callers don't populate it. */
+  taskCount?: number;
+}
+
+/** Body of `POST /pipelines` / `PATCH /pipelines/:id`. */
+export interface PipelineInput {
+  name: string;
+  description?: string;
+  graph: PipelineGraph;
+  maxSteps?: number;
+}
+
+/**
+ * The structured JSON a step's agent is asked to emit at the end of its
+ * final message, wrapped in a `<handoff>…</handoff>` tag (see {@link
+ * HANDOFF_TAG} in `src/shared/pipeline.ts`) — how one step tells the runner
+ * what it did and which step should run next. Parsed by `parseHandoff`.
+ */
+export interface Handoff {
+  schemaVersion: 1;
+  /** The overall task's purpose, restated — keeps a long-running pipeline
+   *  anchored to its original goal across many steps. */
+  purpose: string;
+  /** What this step did or found. */
+  summary: string;
+  /** Why the step is handing off now (done, or blocked and can't continue),
+   *  and what the next step should do with `summary`. */
+  reason: string;
+  /** Name of the next step to run (matched case-insensitively against a
+   *  step name, then a step id, then an edge label by `resolveNextSteps`),
+   *  or null when there's nothing left to hand off to (terminal step, or a
+   *  `transition: "all"` fan-out, where `next` is ignored entirely). */
+  next: string | null;
+  /** Paths or URLs the next step (or the user) may want to look at. */
+  artifacts: string[];
+  /** Unresolved questions the next step or the user should address. */
+  openQuestions: string[];
+  /** Optional outcome hint distinct from `reason`'s prose — `"blocked"`
+   *  signals the step could not complete even though it produced a
+   *  (possibly partial) handoff. */
+  status?: "done" | "blocked";
+}
+
+/** Lifecycle state of a {@link PipelineRunState}, mirrored by the parent
+ *  pipeline task's board column. */
+export type PipelineRunStatus = "idle" | "running" | "blocked" | "done" | "cancelled";
+
+/** Why a pipeline execution is Blocked — surfaced per-entry in
+ *  {@link PipelineRunState.blocked} and as the parent task's `column`
+ *  transition `reason` (`"pipeline"`). */
+export type PipelineBlockKind =
+  | "step-failed"
+  | "step-blocked"
+  | "handoff-missing"
+  | "handoff-invalid"
+  | "step-cap"
+  | "profile-missing"
+  | "join-incomplete";
+
+/** One currently-active step execution within a {@link PipelineRunState} —
+ *  a hidden step task whose turn is running or blocked. Several can coexist
+ *  after a `transition: "all"` fan-out. */
+export interface PipelineActiveStep {
+  stepId: string;
+  taskId: string;
+  /** This execution's position in `history` / overall step-cap accounting
+   *  (1-based, monotonically increasing per run). */
+  seq: number;
+}
+
+/** One incoming arrival recorded against a `join: "all"` step while it
+ *  waits for every distinct incoming source to arrive in the current
+ *  generation. See {@link PipelineRunState.joins}. */
+export interface PipelineJoinArrival {
+  fromStepId: string;
+  seq: number;
+  handoff: Handoff | null;
+}
+
+/** A single blocked pipeline execution (or a run-level block whose
+ *  `taskId`/`stepId` are null) awaiting either a fix (e.g. re-sending the
+ *  step so it emits a valid handoff) or a manual advance. */
+export interface PipelineBlock {
+  taskId: string | null;
+  stepId: string | null;
+  kind: PipelineBlockKind;
+  message: string;
+  /** The run-level launch (re-attempting a step, or advancing past a step
+   *  cap) this block is waiting to retry — populated only on a run-level
+   *  block (`taskId` on the block is null: `step-cap`/`profile-missing`/
+   *  `join-incomplete`), so a Retry action can re-attempt the exact same
+   *  launch instead of re-deriving it. `stepId` on the block itself is
+   *  always set for these blocks (the step the pending launch targets, same
+   *  value as `pending.stepId` here); `arrivals` is the join state (if any)
+   *  it would launch with. */
+  pending?: { stepId: string; arrivals: PipelineJoinArrival[] };
+}
+
+/**
+ * A frozen copy of the {@link PipelineGraph} plus every agent profile it
+ * references, captured onto {@link PipelineRunState.snapshot} the moment a
+ * pipeline task first runs (D8, `docs/plans/pipelines.md`). Later edits to
+ * the live pipeline or its profiles never affect an already-started run.
+ */
+export interface PipelineRunSnapshot {
+  graph: PipelineGraph;
+  maxSteps: number;
+  /** Keyed by `AgentProfile.id` — every profile referenced by any step's
+   *  `agentProfileId` or `subagents.profileIds` at capture time. */
+  profiles: Record<string, AgentProfileSnapshot>;
+  capturedAt: number;
+}
+
+/**
+ * How a step execution's final response classified, per {@link
+ * classifyStepResponse} in `src/shared/pipeline.ts` — `"handoff"` (a valid,
+ * non-`blocked` handoff), `"handoff-blocked"` (a valid handoff whose own
+ * `status` is `"blocked"`), `"handoff-missing"` (no `<handoff>` tag at all),
+ * `"handoff-invalid"` (a tag whose body didn't parse), `"user-ask"` (the
+ * step's task has a pending interaction — the agent is waiting on the user,
+ * never a format failure), `"error"` (the run failed), or `"cancelled"` (the
+ * run was cancelled or orphaned).
+ */
+export type StepResponseKind =
+  | "handoff"
+  | "handoff-blocked"
+  | "handoff-missing"
+  | "handoff-invalid"
+  | "user-ask"
+  | "error"
+  | "cancelled";
+
+/**
+ * Records the single automatic follow-up the runner sends to a step whose
+ * final response was `"handoff-missing"`, `"handoff-invalid"`, or a parsed
+ * handoff whose `next` didn't resolve to a real outgoing step
+ * (`"handoff-next-unknown"`, from `resolveNextSteps`'s `"ambiguous"`/
+ * `"unknown"` outcomes) — one reminder max per execution; a second bad
+ * response blocks instead of reminding again. See `composeHandoffReminder`
+ * in `src/shared/pipeline.ts`.
+ */
+export interface PipelineStepReminder {
+  at: number;
+  reason: "handoff-missing" | "handoff-invalid" | "handoff-next-unknown";
+  runId: string | null;
+  /** The parser error / short reason the reminder was sent for. */
+  detail: string;
+  /** Whether the reminder message was actually delivered to the agent (a
+   *  `sendInput` call that succeeds). `false` is never persisted today — the
+   *  runner only records a reminder once it has been sent — but the field is
+   *  required rather than defaulted so a future delivery-failure path can
+   *  record an honest `false` without a schema change, and so any UI reading
+   *  this record doesn't have to assume delivery. */
+  delivered: boolean;
+}
+
+/**
+ * One completed (or cancelled) step execution, appended to {@link
+ * PipelineRunState.history} once its task settles. `nextStepIds` records
+ * what `resolveNextSteps` actually started from this execution's handoff —
+ * empty for a terminal step, a failed/cancelled execution, or one still
+ * awaiting resolution.
+ */
+export interface PipelineStepRecord {
+  seq: number;
+  stepId: string;
+  taskId: string;
+  startedAt: number;
+  endedAt: number | null;
+  outcome: "succeeded" | "failed" | "cancelled" | "advanced-manually" | null;
+  handoff: Handoff | null;
+  nextStepIds: string[];
+  /** How this execution's final response classified — see {@link
+   *  StepResponseKind}. Optional/additive: absent on a record written before
+   *  this field existed, and never set for an execution still awaiting
+   *  resolution. */
+  responseKind?: StepResponseKind | null;
+  /** The one automatic handoff-format reminder sent for this execution, if
+   *  any — one reminder max per execution (see {@link
+   *  PipelineStepReminder}). Optional/additive. */
+  reminder?: PipelineStepReminder | null;
+}
+
+/**
+ * Server-managed run state for a pipeline task, persisted on `Task.pipelineRun`
+ * (`tasks.pipeline_run`, written only by `tasks.setPipelineRun`'s targeted
+ * UPDATE — never patchable, excluded from the generic `tasks.update` SET
+ * clause). `snapshot` is null until the first Run (see {@link
+ * PipelineRunSnapshot}); every other field tracks the run's live progress —
+ * `active` holds one entry per currently-running/blocked step execution
+ * (several after a fan-out), `joins` holds partial fan-in state keyed by
+ * step id, and `blocked` holds one entry per execution that needs attention
+ * (or a run-level block with null ids).
+ */
+export interface PipelineRunState {
+  pipelineId: string;
+  pipelineName: string;
+  snapshot: PipelineRunSnapshot | null;
+  status: PipelineRunStatus;
+  active: PipelineActiveStep[];
+  joins: Record<string, { arrivals: PipelineJoinArrival[] }>;
+  blocked: PipelineBlock[];
+  history: PipelineStepRecord[];
+  /** Total executions started this run — what `maxSteps` caps. */
+  stepCount: number;
+  startedAt: number | null;
+  endedAt: number | null;
+  /** Times a `step-cap` block has been extended via Retry. Each extension
+   *  doubles the running allowance: the effective cap is
+   *  `snapshot.maxSteps * (1 + capExtensions)` — see {@link
+   *  effectiveStepCap} in `src/shared/pipeline.ts`. Undefined/0 before the
+   *  first extension. */
+  capExtensions?: number;
+}
+
+/** Field length/count caps enforced by both the server routes and the
+ *  pipeline editor UI — mirrors {@link AGENT_PROFILE_LIMITS}'s role for
+ *  agent profiles. */
+export const PIPELINE_LIMITS = {
+  name: 80,
+  description: 2000,
+  steps: 50,
+  edges: 200,
+  stepName: 60,
+  instructions: 20_000,
+  maxStepsDefault: 25,
+  maxStepsMax: 200,
+  handoffInlineMaxBytes: 16_384,
+  handoffField: 8_000,
+  handoffArray: 50,
+  /** Hard bound on the JSON byte size of ONE normalized {@link Handoff} as
+   *  persisted into `PipelineRunState.history[].handoff` /
+   *  `joins[].arrivals[].handoff` — `normalizeHandoff` trims the arrays
+   *  first, then the string fields, until the whole object fits. Per-field
+   *  (`handoffField`) and per-array (`handoffArray`) caps alone still allowed
+   *  ~850 KB per handoff (7 × 8 KB fields + 2 × 50 × 8 KB entries). */
+  handoffTotalBytes: 65_536,
+  /** `parseHandoff` only ever scans the trailing `handoffScanTailBytes`
+   *  UTF-16 code units of a step's assistant text for its `<handoff>` block
+   *  — the contract says the block ENDS the final message, so anything
+   *  further back is prose, and bounding the scan keeps a pathological
+   *  transcript (e.g. 50k unclosed open tags) linear in the tail, not the
+   *  whole text. */
+  handoffScanTailBytes: 262_144,
+  /** Max `PipelineRunState.capExtensions` the run-state sanitizer accepts
+   *  (and `effectiveStepCap` scales by) — a Retry only ever increments by
+   *  one, so a stored value past this is corruption, not a real run. */
+  capExtensionsMax: 100,
+  /** Max length of an edge's display `label`. */
+  edgeLabel: 120,
+  /** Max length of a step or edge `id`. */
+  id: 128,
+  /** Max entries in a step's `subagents.profileIds`. */
+  subagentProfiles: 20,
+  /** Max value of a step's `subagents.cap`. */
+  subagentCap: 1000,
+  /** Max absolute value of a step's canvas `position.x`/`.y` — out-of-range
+   *  or non-finite values are clamped into `[-positionAbs, positionAbs]`
+   *  rather than rejected. */
+  positionAbs: 1_000_000,
+} as const;
+
 export interface HarnessUsage {
   /** Harness id this usage report is for. */
   harnessId: string;
@@ -558,7 +898,7 @@ export interface RunUsageSample {
 }
 
 /**
- * Per-run token totals (table `run_usage`, migration 058). Summed once per
+ * Per-run token totals (table `run_usage`, migration 067). Summed once per
  * distinct `message.id` over the run's claude JSONL. `context` is derived
  * (input + cacheWrite + cacheRead): the total context the model processed
  * across the run — THE number pipeline-token-efficiency.md minimises.
@@ -1235,6 +1575,51 @@ export interface Task {
    * `toTask` always sets it.
    */
   agentProfile?: AgentProfileSnapshot | null;
+  /**
+   * Id of the {@link Pipeline} this task is the parent run of, or null for
+   * an ordinary task. Set only at create time (`POST /tasks`'s
+   * `pipelineId`); never patchable. A task with this set is a **pipeline
+   * task** — the board card shows a Pipeline badge with step progress, and
+   * clicking it opens the full-page run view instead of the run panel. See
+   * `docs/plans/pipelines.md` (D1/D5).
+   */
+  pipelineId?: string | null;
+  /**
+   * Server-managed run state for this pipeline task — null until the first
+   * Run, then tracks the whole run's progress (active step executions,
+   * partial joins, blocks, history). Written only by
+   * `tasks.setPipelineRun`'s targeted UPDATE (never bumps `updated_at`,
+   * skipped by the generic `tasks.update` SET clause, never patchable — same
+   * treatment as `sentFiles`/`fxRecovery`/`agentProfileId`). Always null for
+   * a task that isn't a pipeline task (`pipelineId` null).
+   *
+   * **`GET /tasks` (the board's 2s poll) ships a TRIMMED variant** of this
+   * state: every `history[].handoff` and `joins[].arrivals[].handoff` is
+   * `null` and `snapshot.profiles` is `{}` — the board/TUI/`agetor ls` only
+   * need `snapshot.graph`, `status`, `active`, `blocked`, the history
+   * outcomes and `stepCount` (step progress, blocked banner, history
+   * length), and shipping every persisted handoff for every pipeline task
+   * on every poll was unbounded payload. The full state comes from
+   * `GET /tasks/:id` or `GET /tasks/:id/pipeline`; the server's own
+   * `tasks.list()`/`tasks.get()` reads are never trimmed.
+   */
+  pipelineRun?: PipelineRunState | null;
+  /**
+   * Id of the parent pipeline task this row is a hidden **step task** of, or
+   * null for an ordinary (including pipeline-parent) task. Step tasks are
+   * normal `tasks` rows in every other respect — RunPanel, ask cards, diff,
+   * backlog, CLI `show` all work unchanged — but are filtered out of the
+   * board and `agetor ls`/TUI by default (D11), can't be deleted/archived
+   * individually (409 — the parent owns their lifecycle), and share the
+   * parent's worktree rather than materializing their own (D2). Set only at
+   * insert time; never patchable.
+   */
+  pipelineParentId?: string | null;
+  /**
+   * Id of the {@link PipelineStep} this step task executes, or null for a
+   * non-step task. Set only at insert time; never patchable.
+   */
+  pipelineStepId?: string | null;
   /**
    * Friendly mode id ("auto", "ask", "acceptEdits", "plan", …). Maps to
    * agent-specific CLI flags in `src/bun/agents.ts`. NULL means "use the
@@ -2157,22 +2542,30 @@ export interface CursorModelSpec {
  * CLI happens to default to.
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
-  // Default to Opus 5 — the most-capable Opus, priced identically to Opus 4.8
-  // ($5/$25 per MTok). Mythos 5.1 / 5 and Fable 5.1 / 5 sit above it in the picker but
-  // cost 2x the usage, so the default stays on the most-capable non-premium
-  // tier.
-  "claude-code": "opus-5",
-  // Owner decision 2026-09-03: default to GPT-6 Astra, OpenAI's most capable
-  // model (released 2026-09-03). Live spike the same day on a ChatGPT-plan
-  // account: codex 0.147.0 and 0.153.0 both get HTTP 400 "The 'gpt-6-astra'
-  // model is not supported when using Codex with a ChatGPT account." during
-  // OpenAI's phased rollout (Trusted Access Program first, ChatGPT plans +
-  // API "in the coming days"). The picker hint carries the gate, and
-  // GPT-5.6 Sol (the previous default) stays one click away.
-  "codex": "gpt-6-astra",
-  // Grok 4.6 (high effort via DEFAULT_EFFORT) — replaces cursor-agent's own
-  // "auto" as agetor's default so new tasks pin an explicit flagship model.
-  "cursor": "cursor-grok-4.6",
+  // Default to Opus 5.5 — claude CLI 2.1.280 makes it the default Opus model,
+  // and it's $4/$20 per MTok (20% below Opus 5's $5/$25) while landing at
+  // roughly Fable-5.1-level on most work per the announcement. Mythos 5.1 / 5
+  // and Fable 5.1 / 5 still sit above it in the picker but cost 2x the usage,
+  // so the default stays on the most-capable non-premium tier.
+  "claude-code": "opus-5.5",
+  // Owner decision 2026-09-22 (docs/plans/add-gpt-6-sol-and-luna.md): default
+  // to GPT-6 Sol, OpenAI's "daily driver for complex coding and agentic
+  // workflows" (released 2026-09-22), which replaces GPT-5.6 Sol. Astra stays
+  // one row above it in the picker as the most-capable-but-heavier tier. Live
+  // spike the same day on a ChatGPT-plan account: codex-cli 0.147.0 gets HTTP
+  // 400 on both Astra ("requires a newer version of Codex") and Sol/Luna
+  // ("not supported when using Codex with a ChatGPT account" — misleading
+  // text; the real gate is the client version). 0.153.0/0.154.0 run Astra but
+  // still 400 Sol; 0.155.1 runs all three. The catalog itself is
+  // `client_version`-gated (NousResearch/hermes-agent#119412). Hence
+  // `MODEL_MIN_CLI_VERSION` below and the `startTask` pre-flight.
+  "codex": "gpt-6-sol",
+  // Grok 4.7 (high effort via DEFAULT_EFFORT) — agetor pins an explicit
+  // flagship model rather than cursor-agent's own "auto". Owner decision
+  // 2026-09-21 (docs/plans/add-grok-4-7.md): 4.7 replaces 4.6, the previous
+  // default, which stays one click away. Note the key is cursor-agent's own
+  // unprefixed base — unlike `cursor-grok-4.6` / `cursor-grok-4.5`.
+  "cursor": "grok-4.7",
   // gemini-3.1-pro-preview is Google's current flagship Pro. It replaced
   // gemini-3-pro-preview (agetor's default until 2026-09), which Google shut
   // down on 2026-03-09 — ai.google.dev/gemini-api/docs/deprecations names
@@ -2193,7 +2586,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // (`~/.fx/settings.json` on the reference account). Ids are Vercel AI
   // Gateway ids, passed verbatim. fx is exempt from the "always default to
   // the best available model" rule above: the Gateway bills per token to the
-  // user's own account, and flagship tiers (the twelve `catalogOnly` rows in
+  // user's own account, and flagship tiers (the sixteen `catalogOnly` rows in
   // `AGENT_OPTIONS.fx.models`) stay one click away
   // in the picker as catalog-gated rows — offered only when the signed-in
   // account's catalog actually contains them (see `AgentOption.catalogOnly`).
@@ -2249,14 +2642,62 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "fx": "auto",
 };
 
+/**
+ * Minimum harness-CLI version a model needs, per kind, keyed by model id
+ * (semver "major.minor.patch"; compared with `cliVersionSatisfies` in
+ * `src/shared/cli-version.ts`). Pre-flight 1b (`minCliVersionError` in
+ * `src/bun/orchestrator.ts` — `startTask`, every follow-up codex turn, and
+ * the clone route's explainer launch) refuses the launch — before any run
+ * row or worktree exists — when the probed CLI version parses AND is below
+ * the floor; an unparseable/absent version never blocks (fail-open, so
+ * `/bin/echo`-style test overrides and stub binaries are unaffected).
+ * Only codex has entries today: OpenAI's `chatgpt.com/backend-api/codex/models`
+ * catalog is `client_version`-gated (NousResearch/hermes-agent#119412) and an
+ * old CLI answers a 400 whose text blames the ChatGPT account, not the
+ * version. Floors are the lowest versions verified live on 2026-09-22 (a
+ * ChatGPT-plan account): gpt-6-sol/gpt-6-luna — 0.154.0 ✗ / 0.155.1 ✓
+ * (the catalog gate is 0.155.0); gpt-6-astra — 0.147.0 ✗ / 0.153.0 ✓
+ * (0.148–0.152 unprobed, so the true floor may be lower); Aeon mirrors Astra.
+ * The floors were verified on a ChatGPT-plan account; API-key accounts are
+ * assumed to be gated the same way, and `AGETOR_SKIP_CLI_VERSION_FLOOR=1` is
+ * the override when one isn't.
+ * See docs/plans/add-gpt-6-sol-and-luna.md §3 D4.
+ */
+export const MODEL_MIN_CLI_VERSION: Partial<Record<AgentKind, Record<string, string>>> = {
+  codex: {
+    "gpt-6-sol": "0.155.0",
+    "gpt-6-luna": "0.155.0",
+    "gpt-6-astra": "0.153.0",
+    "gpt-6-astra-aeon": "0.153.0",
+  },
+};
+
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
+  // Ids verified against `cursor-agent models` (CLI 2026.09.18): grok 4.7 ships
+  // as grok-4.7-{low,medium,high,xhigh} plus -fast variants of all four — NOT
+  // `cursor-` prefixed like 4.6/4.5, and with no bare id, no max tier, no
+  // 1M/Max-Mode variant. Every tier carries its own label ("Grok 4.7 High", …),
+  // so there is no unsuffixed row; High is the default via DEFAULT_EFFORT.
+  // The label mirrors cursor-agent's own unprefixed naming on purpose
+  // ("Grok 4.7 High", not "Cursor Grok 4.7") — don't "fix" it to match 4.6/4.5.
+  "grok-4.7": {
+    label: "Grok 4.7",
+    hint: "Recommended default — Cursor-hosted Grok 4.7. Needs cursor-agent 2026.09.18 or newer; older builds reject the id (pick Cursor Grok 4.6 there).",
+    effortIds: {
+      xhigh: "grok-4.7-xhigh",
+      high: "grok-4.7-high",
+      medium: "grok-4.7-medium",
+      low: "grok-4.7-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
   // Ids verified against `cursor-agent models` (CLI 2026.08.11): grok 4.6 ships
   // as cursor-grok-4.6-{low,medium,high,xhigh} plus -fast variants of all four —
   // no bare id, no max tier, no 1M/Max-Mode variant. The unsuffixed "Cursor
   // Grok 4.6" label is the high tier, same convention as 4.5.
   "cursor-grok-4.6": {
     label: "Cursor Grok 4.6",
-    hint: "Recommended default — Cursor-hosted Grok 4.6.",
+    hint: "Cursor-hosted Grok 4.6 — the previous default.",
     effortIds: {
       xhigh: "cursor-grok-4.6-xhigh",
       high: "cursor-grok-4.6-high",
@@ -2292,6 +2733,24 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
     label: "Composer 2.5",
     hint: "Cursor's own fast agentic model.",
     fastId: "composer-2.5-fast",
+  },
+  // Ids verified against `cursor-agent models` (CLI 2026.09.18-9a7762b, 245
+  // rows, 2026-09-22): claude-opus-5-5-{low,medium,high,xhigh,max}, each with
+  // a -fast variant; the unsuffixed "Claude Opus 5.5 1M" row is the -medium
+  // id (Cursor's own default tier). Unlike claude-opus-5 there are NO
+  // -thinking- variants — same shape as the Opus 4.8 spec below.
+  "claude-opus-5-5": {
+    label: "Opus 5.5",
+    hint: "Anthropic Opus 5.5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-5-5-max",
+      xhigh: "claude-opus-5-5-xhigh",
+      high: "claude-opus-5-5-high",
+      medium: "claude-opus-5-5-medium",
+      low: "claude-opus-5-5-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
   },
   "claude-opus-5": {
     label: "Opus 5",
@@ -2669,8 +3128,8 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
   { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
-  { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5.1 / 5 / Mythos 5.1 / 5 / Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
+  { id: "high", label: "High", hint: "Deep reasoning. The API default on most models (Opus 5.5 defaults to medium)." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
   { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
@@ -2688,6 +3147,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *   - Codex `model_reasoning_effort`:
  *       https://developers.openai.com/codex/config-advanced
  *     GPT-5.6 family → none/low/medium/high/xhigh/max
+ *     GPT-6 Sol/Luna → none/low/medium/high/xhigh/max (+ Codex-side ultra on Sol)
  *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
  *
  * An empty list means "this model does not accept the effort flag at all"
@@ -2697,7 +3157,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
   // effort parameter is API-supported on Fable 5.1 / 5 / Mythos 5.1 / 5 /
-  // Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
+  // Opus 5.5 / 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is
   // Fable-, Mythos-, Opus-, and Sonnet-5-only; Sonnet 4.6 has no xhigh;
   // Haiku 4.5 doesn't support effort at all). The `/effort` CLI command
   // accepts more levels but the underlying API request would fail for
@@ -2713,6 +3173,12 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "fable-5.1": ["max", "xhigh", "high", "medium", "low"],
     // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
     "fable-5": ["max", "xhigh", "high", "medium", "low"],
+    // Opus 5.5's docs: thinking can't be disabled ({type:"disabled"} and
+    // budget_tokens both 400 per the migration guide), so effort is the only
+    // control and there is deliberately no "none" row. API default is
+    // "medium" (Opus 5's is "high"); agetor still pins
+    // CLAUDE_CODE_EFFORT_LEVEL from DEFAULT_EFFORT at spawn.
+    "opus-5.5": ["max", "xhigh", "high", "medium", "low"],
     // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
     "opus-5": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
@@ -2742,8 +3208,18 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // this account's catalog at all). Note: discovered efforts (see
     // `supportedEfforts`'s third argument) override this table whenever the
     // CLI itself reports a set for the model.
+    //
+    // 2026-09-22 — `codex app-server` catalog on 0.155.1 lists gpt-6-sol as
+    // low/medium/high/xhigh/max + ultra (default medium) and gpt-6-luna as
+    // low/medium/high/xhigh/max (no ultra, default medium); `none` accepted
+    // live on Luna via `codex exec` (0.155.1), on Sol it rests on OpenAI's
+    // model page ("supports none") + the GPT-5.6 Sol precedent; same rule as
+    // the 5.6 rows — `ultra` follows Codex's offering, `none` follows
+    // live/API acceptance.
     "gpt-6-astra": ["ultra", "max", "xhigh", "high", "medium", "low"],
     "gpt-6-astra-aeon": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    "gpt-6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-cyber": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
@@ -2783,13 +3259,17 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // what every effort-advertising model reports as `currentValue`), 12
   // advertise none — their Gateway catalog entry carries no
   // `reasoning_options` at all — and stay `[]`, same treatment as gemini
-  // above (the picker collapses). An unknown/discovered-only fx id falls
-  // back to `DEFAULT_MODEL.fx`'s set via `supportedEfforts`, and the driver
-  // validates at runtime against whatever `effort` option fx actually
-  // returns for that session — so drift between this curated table and the
-  // live Gateway catalog is only a picker-hint problem, never a failed run
-  // (an unoffered value degrades to a status breadcrumb). Ids map to fx's
-  // own values verbatim (`low|medium|high|xhigh|max|none|auto`).
+  // above (the picker collapses). A 29th id, spacexai/grok-4.7, joined the
+  // no-effort group on 2026-09-21 (see its row below), and a 30th,
+  // anthropic/claude-opus-5.5, joined the effort group on 2026-09-22 on its
+  // Gateway `reasoning_options` alone (not ACP-probed — see its row). An
+  // unknown/discovered-only fx id falls back to `DEFAULT_MODEL.fx`'s set via
+  // `supportedEfforts`, and the driver validates at runtime against whatever
+  // `effort` option fx actually returns for that session — so drift between
+  // this curated table and the live Gateway catalog is only a picker-hint
+  // problem, never a failed run (an unoffered value degrades to a status
+  // breadcrumb). Ids map to fx's own values verbatim
+  // (`low|medium|high|xhigh|max|none|auto`).
   fx: {
     "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
     "zai/glm-5v-turbo": [],
@@ -2819,6 +3299,24 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
     "zai/glm-5.3": ["max", "high", "low", "auto"],
     "deepseek/deepseek-v4-pro": ["xhigh", "high", "auto"],
+    // 2026-09-21: not ACP-probed (no fx credentials that pass) — `[]` rests on
+    // the public Gateway catalog entry, which carries no `reasoning_options`,
+    // exactly like spacexai/grok-4.6. docs/plans/add-grok-4-7.md §8 A1.
+    "spacexai/grok-4.7": [],
+    // 2026-09-22: not ACP-probed (no fx credentials that pass) — rests on the
+    // public Gateway catalog entry's reasoning_options (effort
+    // low/medium/high/xhigh/max, no none: thinking can't be disabled) plus
+    // fx's always-present auto, identical to the live-probed
+    // anthropic/claude-opus-5 row. docs/plans/add-claude-opus-5-5.md §8 A1.
+    "anthropic/claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    // 2026-09-22: openai/gpt-6-sol + openai/gpt-6-luna (released that day) —
+    // from the public Gateway catalog's `reasoning_options` (effort values
+    // none/low/medium/high for BOTH — narrower than openai/gpt-5.6-sol's
+    // none…max and than OpenAI's own API page, which lists xhigh/max too;
+    // the Gateway is what fx sends, so its list wins). Not ACP-probed.
+    // docs/plans/add-gpt-6-sol-and-luna.md §2/§3 D6.
+    "openai/gpt-6-sol": ["high", "medium", "low", "none", "auto"],
+    "openai/gpt-6-luna": ["high", "medium", "low", "none", "auto"],
   },
 };
 
@@ -2928,6 +3426,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "mythos-5": [],
     "fable-5.1": [],
     "fable-5": [],
+    "opus-5.5": [],
     "opus-5": [],
     "opus-4.8": [],
     "opus-4.7": [],
@@ -2985,7 +3484,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "mythos-5", label: "Mythos 5", hint: "Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
       { id: "fable-5.1", label: "Fable 5.1", hint: "Most capable widely released model — above Opus. Uses 2x the usage of Opus." },
       { id: "fable-5", label: "Fable 5", hint: "Prior Fable release — above Opus. Uses 2x the usage of Opus." },
-      { id: "opus-5", label: "Opus 5", hint: "Most capable Opus; same usage cost as 4.8." },
+      { id: "opus-5.5", label: "Opus 5.5", hint: "Default — Fable 5.1-level on most work; API list price $4/$20 per MTok (Opus 5: $5/$25). Thinking is always on; effort is the only control (the model's own default is medium)." },
+      { id: "opus-5", label: "Opus 5", hint: "Prior Opus release ($5/$25 per MTok)." },
       { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
       { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
@@ -3008,13 +3508,15 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "Recommended default — OpenAI's most capable model. Rolling out in phases; rejected on ChatGPT plans until OpenAI enables it for your account." },
-      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same rollout gate as Astra." },
+      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "OpenAI's most capable model. Needs codex CLI ≥ 0.153 — older CLIs answer a 400 (\"requires a newer version of Codex\")." },
+      { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same codex CLI ≥ 0.153 floor as Astra." },
+      { id: "gpt-6-sol", label: "GPT-6 Sol", hint: "Recommended default — OpenAI's daily driver for complex coding and agentic work; replaces GPT-5.6 Sol. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
+      { id: "gpt-6-luna", label: "GPT-6 Luna", hint: "Fastest, lowest-cost GPT-6 for focused, high-volume tasks; replaces GPT-5.6 Luna. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
       { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
-      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous recommended default — flagship GPT-5.6; works on ChatGPT plans." },
-      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
-      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous-generation flagship — superseded by GPT-6 Sol (codex offers the upgrade in place); still works on ChatGPT plans." },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model — superseded by GPT-6 Sol (codex offers the upgrade in place)." },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model — superseded by GPT-6 Luna (codex offers the upgrade in place)." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans; codex retires it on 2026-10-14 (switch to GPT-6 Sol)." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
@@ -3093,6 +3595,29 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // 0.0.10 alike (Gateway-side, not client-version-dependent); all 28
     // curated ids (16 standard + 12 catalogOnly) still present; signed-in
     // view still unverifiable (token expired).
+    // 2026-09-21: spacexai/grok-4.7 (released the same day) added from fx
+    // 0.0.10's unauthenticated catalog; its presence in a standard signed-in
+    // account is unverified (`fx status` reads auth: missing), hence
+    // catalogOnly — thirteen catalogOnly rows, 29 curated ids total. That
+    // catalog reads 246 ids, one fewer than 2026-09-14's 247 despite the
+    // addition: 28 of the 29 curated ids are present, and mistral/devstral-2
+    // is gone from both `fx models --json` and the public Gateway catalog
+    // (Gateway-side retirement). The row is left in place here — retiring a
+    // curated id is its own change (picker + tasks.model + lastModel pref);
+    // the curated ∩ discovered merge already hides it wherever discovery
+    // works.
+    // 2026-09-22: anthropic/claude-opus-5.5 (released the same day) added
+    // from fx 0.0.10's unauthenticated catalog (`fx models --json`, 251 ids,
+    // auth: missing — the -fast twin anthropic/claude-opus-5.5-fast is also
+    // listed and stays discovery-only like claude-opus-5-fast); its presence
+    // in a standard signed-in account is unverified, hence catalogOnly —
+    // fourteen catalogOnly rows, 30 curated ids total. 29 of the 30 are
+    // present; mistral/devstral-2 is still absent (see the 2026-09-21 note).
+    // 2026-09-22: openai/gpt-6-sol and openai/gpt-6-luna (released the same
+    // day) added from fx 0.0.10's unauthenticated catalog (255 ids that day,
+    // up from 246; every prior curated id — opus-5.5 included — still present except
+    // mistral/devstral-2, still gone); signed-in presence unverified, hence
+    // catalogOnly — sixteen catalogOnly rows, 32 curated ids total.
     models: [
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "Default — 1M context · 131K output. The model fx runs on a standard Gateway account." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
@@ -3122,14 +3647,20 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "openai/gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "zai/glm-5.3", label: "GLM-5.3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "spacexai/grok-4.7", label: "Grok 4.7", hint: "500K context · 500K output — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "anthropic/claude-opus-5.5", label: "Claude Opus 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-sol", label: "GPT-6 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6-luna", label: "GPT-6 Luna", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 16 of the 28 curated models accept the effort flag (see
-    // MODEL_EFFORT_SUPPORT.fx — live-probed on fx 0.0.10); the other 12
+    // 19 of the 32 curated models accept the effort flag (see
+    // MODEL_EFFORT_SUPPORT.fx — 16 live-probed on fx 0.0.10, plus
+    // anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna from
+    // their Gateway reasoning_options, all 2026-09-22); the other 13
     // report an empty set and the picker collapses for those, same as any
     // other kind's no-effort models. Every id-supported model always
     // includes `auto` (fx's own default) last, per EFFORT_OPTIONS.
@@ -4108,6 +4639,12 @@ export type GlobalEvent =
       runId: string;
       status: "succeeded" | "failed" | "cancelled" | "orphaned";
       ts: number;
+      /** Set when `taskId` is a hidden pipeline STEP task — the id of its
+       *  pipeline parent (board card). Consumers that scope toasts /
+       *  notifications / TUI rows per parent read this instead of having to
+       *  resolve the step row themselves; absent for an ordinary task (and
+       *  on events from an older core, so always read it with a fallback). */
+      pipelineParentId?: string;
     }
   | {
       kind: "column";
@@ -4129,7 +4666,12 @@ export type GlobalEvent =
         // "revision-cap" — hit PIPELINE_REVISION_CAP, landed on blocked.
         // "pipeline-failed" — a verdict-bearing stage produced no parseable
         //   PIPELINE_VERDICT, or a planning stage didn't write PLAN.md.
-        | "stage-advance" | "revision-cap" | "pipeline-failed";
+        // "pipeline" — the incoming step-graph runner's own blocked reason
+        //   (pipeline-runner.ts), unrelated to the SDD stage machine above.
+        | "stage-advance" | "revision-cap" | "pipeline-failed" | "pipeline";
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
     }
   | {
       kind: "update";
@@ -4158,6 +4700,11 @@ export type GlobalEvent =
        *  last one resolves. */
       interactionId: string;
       ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive; the interaction registry
+       *  (`src/bun/interactions.ts`) stamps it on the request/resolved
+       *  payloads it hands the orchestrator's bridge. */
+      pipelineParentId?: string;
     }
   | {
       /**
@@ -4174,6 +4721,9 @@ export type GlobalEvent =
       caption: string | null;
       proactive: boolean;
       ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
     }
   | {
       /**
@@ -4220,7 +4770,63 @@ export type GlobalEvent =
       /** `FX_AUTO_RESUME_MAX` at the time this event fired. */
       max: number;
       ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
+    }
+  | {
+      /**
+       * A pipeline task's run state changed — a step execution started,
+       * settled, or the run itself transitioned (blocked/done/cancelled).
+       * Drives the run view's sub-poll-latency animation (D12,
+       * `docs/plans/pipelines.md`): the webview refetches the parent task
+       * plus its step tasks on receipt, with the 2s `/tasks` poll as the
+       * fallback. `activeStepIds` mirrors `PipelineRunState.active` at the
+       * moment this fired.
+       */
+      kind: "pipeline";
+      taskId: string;
+      status: PipelineRunStatus;
+      activeStepIds: string[];
+      stepCount: number;
+      ts: number;
     };
+
+/**
+ * Phase of an in-progress `git clone`, as parsed from git's own `--progress`
+ * stderr output by `parseCloneProgress` (`src/bun/clone.ts`,
+ * docs/plans/clone-repository-all-providers.md Addendum A). Shared here
+ * because it also rides the `clone_progress` AppEvent below (server.ts
+ * broadcasts one per parsed/synthetic progress record; the webview and the
+ * CLI both consume it over `GET /app/events`).
+ *
+ *   starting     — before the transfer begins — git's own "Cloning into
+ *                  '<dest>'..." line, AND the synthetic event `cloneRepo`
+ *                  emits itself before attempt 1 and before a token retry
+ *                  (neither of those two carries a real git process yet).
+ *   counting     — `remote: Enumerating objects` / `remote: Counting
+ *                  objects: NN%`.
+ *   compressing  — `remote: Compressing objects: NN%`.
+ *   receiving    — `Receiving objects: NN%` — the actual object transfer.
+ *   resolving    — `Resolving deltas: NN%`.
+ *   checking-out — `Updating files: NN%` — writing the working tree.
+ *   done         — `cloneRepo`'s own synthetic terminal event: the clone
+ *                  succeeded.
+ *   failed       — `cloneRepo`'s own synthetic terminal event: the clone
+ *                  failed (see the accompanying `CloneProgress.line`).
+ *   cancelled    — `cloneRepo`'s own synthetic terminal event: `cancelClone`
+ *                  killed the in-flight git process for this clone.
+ */
+export type CloneProgressPhase =
+  | "starting"
+  | "counting"
+  | "compressing"
+  | "receiving"
+  | "resolving"
+  | "checking-out"
+  | "done"
+  | "failed"
+  | "cancelled";
 
 /**
  * App-level events the webview subscribes to over `GET /app/events`. Used
@@ -4237,6 +4843,15 @@ export type GlobalEvent =
  *   agent_models_changed — the model-discovery scheduler re-probed one or
  *                  more harnesses' CLI model catalogs and at least one list
  *                  changed. Webview refetches `GET /agent-models/harnesses`.
+ *   clone_progress — one progress update (or a terminal done/failed/
+ *                  cancelled) for the in-flight `POST /projects/clone`
+ *                  identified by `cloneId` — see `CloneProgressPhase` above.
+ *                  `percent` is `null` whenever git's own output didn't
+ *                  carry one for that record (e.g. `remote: Enumerating
+ *                  objects` and every synthetic phase but `done`). `line` is
+ *                  already sanitized/length-capped and never carries a
+ *                  credential (docs/plans/clone-repository-all-providers.md
+ *                  Addendum A).
  */
 export type AppEvent =
   | {
@@ -4258,6 +4873,14 @@ export type AppEvent =
   | {
       type: "agent_models_changed";
       harnessIds: string[];
+      ts: number;
+    }
+  | {
+      type: "clone_progress";
+      cloneId: string;
+      phase: CloneProgressPhase;
+      percent: number | null;
+      line: string;
       ts: number;
     };
 

@@ -22,18 +22,23 @@ import {
   savedPrompts,
   agentProfiles,
   AgentProfileNameError,
+  pipelines,
+  PipelineNameError,
   dataDir,
   clampWindowByBytes,
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus, handBackChild, pausePipelineTask, resumePipelineTask, overridePipelineGate, satisfyPipelineSubtask } from "./orchestrator.ts";
-import { accountUsageDays } from "./account-usage.ts";
-import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
-import { buildEli5Prompt, cloneRepo, defaultCloneDest, eli5TaskTitle, parseGitHubRepo } from "./clone.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus, handBackChild, pausePipelineTask, resumePipelineTask, overridePipelineGate, satisfyPipelineSubtask } from "./orchestrator.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { buildBarrierState } from "./build-scheduler.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { accountUsageDays } from "./account-usage.ts";
+import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
+import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
+import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
+import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -176,12 +181,14 @@ import {
 } from "./interactions.ts";
 import {
   DEFAULT_BRANCH_CONFIG,
+  DEFAULT_MODEL,
   EVENTS_PAGE_MAX_BYTES,
   EVENTS_REPLAY_ANCHOR_MAX_BYTES,
   EVENTS_REPLAY_ANCHOR_MAX_EVENTS,
   EVENTS_REPLAY_LIMIT,
   EVENTS_REPLAY_MAX_BYTES,
   MIN_REPLAY_EVENTS,
+  PIPELINE_LIMITS,
   TASK_EVENTS_REPLAY_META_EVENT,
   TASK_TYPES,
   supportedEfforts,
@@ -199,6 +206,10 @@ import type {
   GitHubReactionContent,
   GitHubReactionSubject,
   GlobalEvent,
+  Handoff,
+  Pipeline,
+  PipelineInput,
+  PipelineRunState,
   RunEvent,
   Task,
   TaskEventsReplayMeta,
@@ -209,6 +220,7 @@ import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guar
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
+import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -589,6 +601,180 @@ function withTaskCounts(list: AgentProfile[]): AgentProfile[] {
   return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
 }
 
+/** Validates both a client-minted `cloneId` on `POST /projects/clone`'s body
+ *  and the `:cloneId` path param on `DELETE /projects/clone/:cloneId` — see
+ *  those routes' own doc comments (docs/plans/clone-repository-all-providers.md
+ *  Addendum A). Matches `crypto.randomUUID()`'s own shape, case-insensitively
+ *  (a client could reasonably uppercase one). */
+const CLONE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Route-level bookkeeping for `POST /projects/clone`'s own duplicate-id
+ *  guard — distinct from clone.ts's `activeClones` registry (which keys off
+ *  the actual running `git clone` child process, one attempt at a time).
+ *  This set spans the whole request, from just before `cloneRepo` is called
+ *  through every exit path after it, so a second POST reusing the same
+ *  client-minted `cloneId` while the first is still in flight can't overwrite
+ *  the first's registry handle (which would make a cancel kill the wrong
+ *  clone, or interleave two clones' progress events under one id). Entries
+ *  are removed in a `finally`, so the id is free to reuse on any later POST
+ *  once the earlier request has settled — success, failure, or cancel. */
+const inFlightCloneIds = new Set<string>();
+
+/**
+ * Stamp a {@link Pipeline}'s server-derived `taskCount` (docs/plans/
+ * pipelines.md §3 routes table) — number of parent pipeline tasks currently
+ * bound to it (`tasks.pipeline_id = this.id`, every column including
+ * archived). Exact analog of `withTaskCount`/`withTaskCounts` above:
+ * `withPipelineTaskCount` does a single targeted `pipelines.taskCount` query
+ * for the single-resource GET/POST/PATCH `/pipelines/:id` responses;
+ * `withPipelineTaskCounts` uses one grouped `pipelines.taskCounts()` map so
+ * `GET /pipelines` never issues N queries for N pipelines.
+ */
+function withPipelineTaskCount(p: Pipeline): Pipeline {
+  return { ...p, taskCount: pipelines.taskCount(p.id) };
+}
+function withPipelineTaskCounts(list: Pipeline[]): Pipeline[] {
+  const counts = pipelines.taskCounts();
+  return list.map((p) => ({ ...p, taskCount: counts.get(p.id) ?? 0 }));
+}
+
+/**
+ * Validate the `POST /pipelines` / `PATCH /pipelines/:id` body's `name`:
+ * trimmed, required, `PIPELINE_LIMITS.name` cap, and (L-S1) no C0/DEL
+ * control characters — the same rule `validatePipelineGraph` applies to
+ * step names, since both are quoted verbatim into prompts and the run view.
+ */
+function parsePipelineName(body: Record<string, unknown>): { value: string } | { error: string } {
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name) return { error: "name required" };
+  if (name.length > PIPELINE_LIMITS.name) {
+    return { error: `pipeline name must be ${PIPELINE_LIMITS.name} characters or fewer` };
+  }
+  if (PIPELINE_CONTROL_CHAR_RE.test(name)) return { error: "pipeline name must not contain control characters" };
+  return { value: name };
+}
+
+/**
+ * Validate the `description` field when the body carries it: it must be a
+ * string (L-S6 — a non-string used to be silently read as `""`, so a PATCH
+ * with `description: 42` wiped the real description) within
+ * `PIPELINE_LIMITS.description`. Returns `undefined` when the key is absent.
+ */
+function parsePipelineDescription(body: Record<string, unknown>): { value: string | undefined } | { error: string } {
+  if (!("description" in body) || body.description === undefined) return { value: undefined };
+  if (typeof body.description !== "string") return { error: "description must be a string" };
+  if (body.description.length > PIPELINE_LIMITS.description) {
+    return { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` };
+  }
+  return { value: body.description };
+}
+
+/**
+ * The trimmed `Task.pipelineRun` variant `GET /tasks` ships (M-S3, see the
+ * field's doc in `shared/types.ts`): every persisted handoff (history and
+ * partial-join arrivals) is nulled and the frozen profile snapshots dropped,
+ * since the board/TUI/`agetor ls` only read `snapshot.graph`, `status`,
+ * `active`, `blocked`, history outcomes and `stepCount` — and the 2s poll
+ * was otherwise shipping every handoff of every pipeline task on every
+ * tick. `GET /tasks/:id` and `GET /tasks/:id/pipeline` still return the
+ * full state; the server's own `tasks.list()`/`get()` reads are untouched.
+ */
+function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
+  const joins: PipelineRunState["joins"] = {};
+  for (const [stepId, join] of Object.entries(run.joins)) {
+    joins[stepId] = { arrivals: join.arrivals.map((a) => ({ ...a, handoff: null })) };
+  }
+  return {
+    ...run,
+    snapshot: run.snapshot ? { ...run.snapshot, profiles: {} } : null,
+    history: run.history.map((h) => ({ ...h, handoff: null })),
+    joins,
+  };
+}
+
+/**
+ * Validate + normalize the `POST /pipelines` / `PATCH /pipelines/:id` body's
+ * `maxSteps` field: omitted is fine (the db layer defaults it via
+ * `PIPELINE_LIMITS.maxStepsDefault`), otherwise it must be an integer in
+ * `1..PIPELINE_LIMITS.maxStepsMax`. Returns `undefined` (meaning "omit the
+ * key") when the field wasn't present at all, so a PATCH that doesn't
+ * mention `maxSteps` leaves it untouched.
+ */
+function parsePipelineMaxSteps(body: Record<string, unknown>): { value: number | undefined } | { error: string } {
+  if (body.maxSteps === undefined) return { value: undefined };
+  const m = body.maxSteps;
+  if (typeof m !== "number" || !Number.isInteger(m) || m < 1 || m > PIPELINE_LIMITS.maxStepsMax) {
+    return { error: `maxSteps must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}` };
+  }
+  return { value: m };
+}
+
+/**
+ * Validate the optional launch-picker fields on `POST /projects/clone`
+ * (docs/plans/clone-repository-launch-pickers.md D3) BEFORE `cloneRepo` runs,
+ * so a bad profile/harness id 400s with nothing cloned to disk instead of
+ * cloning and then reporting `eli5Error`. Mirrors `createTask`'s own
+ * precedence: a resolvable `agentProfileId` wins and the six manual fields
+ * are not forwarded to it.
+ */
+function validateCloneLaunch(
+  body: Record<string, unknown>,
+): { agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; fast?: boolean; maxMode?: boolean } | { error: string } {
+  let agentProfileId: string | undefined;
+  if (body.agentProfileId !== undefined && body.agentProfileId !== null) {
+    if (typeof body.agentProfileId !== "string") {
+      return { error: "agentProfileId must be a string" };
+    }
+    const trimmed = body.agentProfileId.trim();
+    if (trimmed) {
+      const profile = agentProfiles.get(trimmed);
+      if (!profile) {
+        return { error: `unknown agent profile "${trimmed}"` };
+      }
+      // `createTask` resolves the profile's own harness and fails on a
+      // dangling one — catch that here too, before anything is cloned.
+      if (!harnesses.getByIdOrKind(profile.harness)) {
+        return { error: `unknown harness "${profile.harness}"` };
+      }
+      agentProfileId = trimmed;
+    }
+  }
+
+  if (body.agent !== undefined && typeof body.agent !== "string") {
+    return { error: "agent must be a string" };
+  }
+  if (body.mode !== undefined && typeof body.mode !== "string") {
+    return { error: "mode must be a string" };
+  }
+  if (body.model !== undefined && typeof body.model !== "string") {
+    return { error: "model must be a string" };
+  }
+  if (body.effort !== undefined && body.effort !== null && typeof body.effort !== "string") {
+    return { error: "effort must be a string or null" };
+  }
+  if (body.fast !== undefined && typeof body.fast !== "boolean") {
+    return { error: "fast must be a boolean" };
+  }
+  if (body.maxMode !== undefined && typeof body.maxMode !== "boolean") {
+    return { error: "maxMode must be a boolean" };
+  }
+
+  if (agentProfileId) return { agentProfileId };
+
+  if (typeof body.agent === "string" && !harnesses.getByIdOrKind(body.agent)) {
+    return { error: `unknown harness "${body.agent}"` };
+  }
+
+  const out: { agent?: string; mode?: string; model?: string; effort?: string | null; fast?: boolean; maxMode?: boolean } = {};
+  if (typeof body.agent === "string") out.agent = body.agent;
+  if (typeof body.mode === "string") out.mode = body.mode;
+  if (typeof body.model === "string") out.model = body.model;
+  if (body.effort !== undefined) out.effort = body.effort as string | null;
+  if (typeof body.fast === "boolean") out.fast = body.fast;
+  if (typeof body.maxMode === "boolean") out.maxMode = body.maxMode;
+  return out;
+}
+
 /**
  * Native-host capabilities the API needs but that only exist inside the
  * Electrobun app: file/folder dialogs, OS notifications, open-in-Finder /
@@ -761,6 +947,247 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Clone repository: clone an existing GitHub/GitLab/Bitbucket repo,
+      // register the destination in the projects list, and (unless
+      // eli5:false) create + start a task that writes an ELI5.md explainer
+      // at the clone's root, on the caller's selected agent profile /
+      // harness (default: the built-in claude-code). The explainer goes
+      // through agetor's own agent driver — never a direct LLM API call —
+      // so it shows up on the board like any other task.
+      //
+      // Addendum A (docs/plans/clone-repository-all-providers.md): the
+      // caller may mint its own `cloneId` up front (before this POST is even
+      // sent) so it can start listening on GET /app/events for this clone's
+      // `clone_progress` AppEvents and issue DELETE /projects/clone/:cloneId
+      // to cancel BEFORE the id round-trips back on this response — there is
+      // an inherent race between "POST is sent" and "id is known to the
+      // caller" otherwise. When the caller doesn't mint one, the server
+      // mints one itself; either way it's echoed on every response this
+      // route can return (success AND every error after the id is minted),
+      // so a client that generated the id can always correlate progress
+      // events / a cancel attempt with this specific request. A DELETE that
+      // arrives before git has even spawned, or in the brief gap between
+      // `cloneRepo`'s two attempts, is still honored — clone.ts latches the
+      // cancellation and the still-held POST resolves 409 `cancelled: true`
+      // below — so a 404 from the DELETE route means the id was never
+      // recognized at all (unknown, or already settled), not a missed
+      // narrow window.
+      "/projects/clone": {
+        POST: authed(async (req) => {
+          // Clones are network-bound and can take minutes; disable the
+          // per-request idle timeout like /tasks/:id/start does.
+          server.timeout(req, 0);
+          const body = (await req.json().catch(() => ({}))) as {
+            url?: unknown;
+            provider?: unknown;
+            dest?: unknown;
+            eli5?: unknown;
+            agent?: unknown;
+            mode?: unknown;
+            model?: unknown;
+            effort?: unknown;
+            fast?: unknown;
+            maxMode?: unknown;
+            agentProfileId?: unknown;
+            cloneId?: unknown;
+          };
+          const url = typeof body.url === "string" ? body.url.trim() : "";
+          if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
+          if (body.provider != null && !isGitProvider(body.provider)) {
+            return json(
+              { error: `provider must be one of ${CLONE_PROVIDERS.join(", ")}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          // Mint (or validate a client-supplied) cloneId right after the
+          // provider check, and before resolveCloneRepo — every response
+          // from here on, error or success, carries it.
+          let cloneId: string;
+          if (body.cloneId !== undefined) {
+            if (typeof body.cloneId !== "string" || !CLONE_ID_RE.test(body.cloneId)) {
+              return json({ error: "cloneId must be a UUID" }, { status: 400, headers: corsHeaders(req) });
+            }
+            cloneId = body.cloneId;
+          } else {
+            cloneId = crypto.randomUUID();
+          }
+
+          // Reject a duplicate in-flight cloneId up front — see
+          // inFlightCloneIds's own doc comment. This is a route-level guard
+          // (never touches clone.ts's registry) and is checked before any
+          // other validation so a racing second POST can't slip past it by
+          // arriving while the first request is still mid-clone.
+          if (inFlightCloneIds.has(cloneId)) {
+            return json(
+              { error: "a clone with that id is already in flight", cloneId },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+
+          const shorthandProvider = isGitProvider(body.provider) ? body.provider : "github";
+          const resolvedInput = resolveCloneRepo(url, shorthandProvider);
+          if (!resolvedInput.ok) {
+            return json({ error: resolvedInput.error, cloneId }, { status: 400, headers: corsHeaders(req) });
+          }
+          const resolved = resolvedInput.repo;
+          const dest =
+            typeof body.dest === "string" && body.dest.trim()
+              ? body.dest.trim()
+              : defaultCloneDest(resolved.repo);
+          if (!path.isAbsolute(dest)) {
+            return json({ error: "dest must be an absolute path", cloneId }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          // Validate the launch selection before cloning anything to disk —
+          // see validateCloneLaunch's doc comment. Only checked when eli5 is
+          // actually going to run.
+          const runEli5 = body.eli5 !== false;
+          const launch: ReturnType<typeof validateCloneLaunch> =
+            runEli5 ? validateCloneLaunch(body) : {};
+          if ("error" in launch) {
+            return json({ error: launch.error, cloneId }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Resolve the explainer's profile ONCE, before the clone, and hand
+          // that same object to `createTask` afterwards (`resolvedAgentProfile`)
+          // — `cloneRepo` takes seconds, and a profile edited or deleted in
+          // that window would otherwise make `createTask`'s own re-read bind
+          // a different profile, or fail, after the clone already landed:
+          // exactly the post-side-effect failure this pre-validation exists
+          // to prevent.
+          let launchProfile: AgentProfile | null = null;
+          if (runEli5 && launch.agentProfileId) {
+            launchProfile = agentProfiles.get(launch.agentProfileId);
+            if (!launchProfile) {
+              return json({ error: `unknown agent profile "${launch.agentProfileId}"`, cloneId }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
+          // Pre-flight 1b (minimum CLI version for the explainer's model) —
+          // also before the clone, since `startTask` would otherwise refuse
+          // the explainer only after the repo is already on disk. Resolves
+          // the harness + model exactly as `createTask` will: the profile's
+          // own harness/model, else `agent` (default claude-code) and
+          // `model` (default the kind's DEFAULT_MODEL). Fail-open like the
+          // start-time check; validateCloneLaunch already proved the
+          // harness ids resolve.
+          if (runEli5) {
+            const launchHarness = harnesses.getByIdOrKind(launchProfile ? launchProfile.harness : (launch.agent ?? "claude-code"));
+            if (launchHarness) {
+              const launchModel = launchProfile ? launchProfile.model : (launch.model ?? DEFAULT_MODEL[launchHarness.kind]);
+              const floorError = await minCliVersionError(launchHarness, launchModel);
+              if (floorError !== null) {
+                return json({ error: floorError, cloneId }, { status: 400, headers: corsHeaders(req) });
+              }
+            }
+          }
+
+          inFlightCloneIds.add(cloneId);
+          try {
+            const cloned = await cloneRepo(resolved.cloneUrl, dest, {
+              transport: resolved.transport,
+              host: resolved.rawHost,
+              cloneId,
+              onProgress: (p) =>
+                broadcastAppEvent({
+                  type: "clone_progress",
+                  cloneId,
+                  phase: p.phase,
+                  percent: p.percent,
+                  line: p.line,
+                  ts: Date.now(),
+                }),
+              auth: resolved.authOrigin
+                ? async () => {
+                    const header = await cloneAuthHeader(resolved.provider, resolved.rawHost);
+                    return header ? { origin: resolved.authOrigin!, header } : null;
+                  }
+                : undefined,
+            });
+            if (cloned.cancelled) {
+              // cloneRepo already restored `dest` to absent/empty and reported
+              // its own terminal "cancelled" progress event — nothing here is
+              // registered, mirroring the "a failing clone registers nothing"
+              // behavior above. 409, not 502: the request wasn't refused by
+              // the remote or by validation, it was called off by the caller
+              // itself (or another client racing the same cloneId).
+              return json({ error: "clone cancelled", cancelled: true, cloneId }, { status: 409, headers: corsHeaders(req) });
+            }
+            if (!cloned.ok) {
+              return json({ error: cloned.error, cloneId }, { status: 502, headers: corsHeaders(req) });
+            }
+            const project = projects.upsert(dest, resolved.repo);
+
+            // The explainer task runs with isolation "none" so ELI5.md lands
+            // directly in the clone the user just registered, not on a branch in
+            // a worktree. Task-creation failure downgrades the response, never
+            // rolls back the clone — the project is already usable.
+            let eli5TaskId: string | null = null;
+            let eli5Error: string | null = null;
+            if (runEli5) {
+              const created = await createTask({
+                title: eli5TaskTitle(resolved.repo),
+                prompt: buildEli5Prompt(resolved.repo),
+                workdir: dest,
+                isolation: "none",
+                ...launch,
+              }, {
+                // The profile validated before the clone, not a post-clone
+                // re-read — an internal argument, never a body field.
+                ...(launchProfile ? { resolvedAgentProfile: launchProfile } : {}),
+              });
+              if ("error" in created) {
+                eli5Error = created.error;
+              } else {
+                eli5TaskId = created.task.id;
+                const started = await startTask(created.task.id);
+                if ("error" in started) eli5Error = started.error;
+              }
+            }
+            return json(
+              { project, provider: resolved.provider, cloneId, eli5TaskId, eli5Error },
+              { headers: corsHeaders(req) },
+            );
+          } finally {
+            inFlightCloneIds.delete(cloneId);
+          }
+        }),
+      },
+
+      // Cancels the clone identified by `cloneId` (the id echoed by
+      // `POST /projects/clone`, or a caller-minted one that was sent on that
+      // POST's body) — see that route's own doc comment for the id
+      // round-trip. `cancelClone` matches any clone `cloneRepo` has announced
+      // as in flight for this id — even before the git child process has
+      // actually spawned (its own doc comment in clone.ts) — and returns
+      // `false` for an unknown id or one whose clone already settled, which
+      // is what 404s below. `cancelClone`'s `true` return doesn't mean the
+      // held POST has resolved yet, only that the in-flight attempt was told
+      // to stop; the POST itself answers 409 once `cloneRepo` observes the
+      // cancellation (see above).
+      //
+      // `cloneId` is NOT a secret: `clone_progress` AppEvents broadcast it to
+      // every `/app/events` subscriber, so any authed client — same user,
+      // same machine, gated only by the per-launch bearer token (the same
+      // trust tier as `/open-path` and `DELETE /tasks/:id`) — can cancel any
+      // clone whose id it has observed. The token is the guard here, not the
+      // id's obscurity.
+      "/projects/clone/:cloneId": {
+        DELETE: authed((req) => {
+          const { cloneId } = req.params;
+          if (!CLONE_ID_RE.test(cloneId)) {
+            return json({ error: "cloneId must be a UUID" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const cancelled = cancelClone(cloneId);
+          if (!cancelled) {
+            return json(
+              { error: "no clone in flight with that id" },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // Opens a native folder picker and registers whatever the user chose.
       // Returns the newly-added project; returns `{ project: null }` on cancel
       // so the client can distinguish cancel from error.
@@ -792,69 +1219,6 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         // Removal-by-path lives on `DELETE /projects` (used by both the webview
         // and the CLI); /projects/pick is the native add-picker only.
       },
-
-      // Checkout an existing GitHub repo as a new project: clone it, register
-      // the destination in the projects list, and (unless eli5:false) create +
-      // start a claude-code task that writes an ELI5.md explainer at the clone's
-      // root. The explainer goes through agetor's own agent driver — never a
-      // direct LLM API call — so it shows up on the board like any other task.
-      "/projects/clone": {
-        POST: authed(async (req) => {
-          // Clones are network-bound and can take minutes; disable the
-          // per-request idle timeout like /tasks/:id/start does.
-          server.timeout(req, 0);
-          const body = (await req.json().catch(() => ({}))) as {
-            url?: unknown;
-            dest?: unknown;
-            eli5?: unknown;
-          };
-          const url = typeof body.url === "string" ? body.url.trim() : "";
-          if (!url) return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
-          const parsed = parseGitHubRepo(url);
-          if (!parsed) {
-            return json(
-              { error: `not a GitHub repo — use https://github.com/owner/repo, git@github.com:owner/repo.git, or owner/repo` },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
-          const dest =
-            typeof body.dest === "string" && body.dest.trim()
-              ? body.dest.trim()
-              : defaultCloneDest(parsed.repo);
-          if (!path.isAbsolute(dest)) {
-            return json({ error: "dest must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
-          }
-          const cloned = await cloneRepo(parsed.cloneUrl, dest);
-          if (!cloned.ok) {
-            return json({ error: cloned.error }, { status: 502, headers: corsHeaders(req) });
-          }
-          const project = projects.upsert(dest, parsed.repo);
-
-          // The explainer task runs with isolation "none" so ELI5.md lands
-          // directly in the clone the user just registered, not on a branch in
-          // a worktree. Task-creation failure downgrades the response, never
-          // rolls back the clone — the project is already usable.
-          let eli5TaskId: string | null = null;
-          let eli5Error: string | null = null;
-          if (body.eli5 !== false) {
-            const created = await createTask({
-              title: eli5TaskTitle(parsed.repo),
-              prompt: buildEli5Prompt(parsed.repo),
-              workdir: dest,
-              isolation: "none",
-            });
-            if ("error" in created) {
-              eli5Error = created.error;
-            } else {
-              eli5TaskId = created.task.id;
-              const started = await startTask(created.task.id);
-              if ("error" in started) eli5Error = started.error;
-            }
-          }
-          return json({ project, eli5TaskId, eli5Error }, { headers: corsHeaders(req) });
-        }),
-      },
-
       "/projects/branches": {
         GET: authed(async (req) => {
           const url = new URL(req.url);
@@ -3185,6 +3549,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Existing Claude config dirs (`~/.claude*` + CLAUDE_CONFIG_DIR) with a
+      // logged-in account that no registered harness points at yet — the
+      // Add-harness picker renders these as one-click "use existing account"
+      // entries. Identity fields only; never tokens or account uuids.
+      "/harness-discovery": {
+        GET: authed((req) => {
+          const registeredHomes = harnesses.list()
+            .filter((h) => h.kind === "claude-code")
+            .map((h) => h.home);
+          return json(
+            { accounts: discoverClaudeAccounts(registeredHomes) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
       "/harnesses/:id": {
         GET: authed((req) => {
           const h = harnesses.get(req.params.id);
@@ -3351,23 +3731,6 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
       },
-
-      // Existing Claude config dirs (`~/.claude*` + CLAUDE_CONFIG_DIR) with a
-      // logged-in account that no registered harness points at yet — the
-      // Add-harness picker renders these as one-click "use existing account"
-      // entries. Identity fields only; never tokens or account uuids.
-      "/harness-discovery": {
-        GET: authed((req) => {
-          const registeredHomes = harnesses.list()
-            .filter((h) => h.kind === "claude-code")
-            .map((h) => h.home);
-          return json(
-            { accounts: discoverClaudeAccounts(registeredHomes) },
-            { headers: corsHeaders(req) },
-          );
-        }),
-      },
-
       // Reusable, named launch presets (docs/plans/agent-profiles.md) — the
       // "Agents" the New Task picker and `agetor profile`/`agetor add --profile`
       // work against. Validation style mirrors /saved-prompts above: a
@@ -3550,6 +3913,135 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // guard against the way `/harnesses/:id` DELETE must guard against
           // in-use tasks/profiles.
           const removed = agentProfiles.delete(req.params.id);
+          return removed
+            ? json({ ok: true }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Named, reusable step graphs (docs/plans/pipelines.md §3) — the
+      // templates a pipeline task is launched from via `POST /tasks`'s
+      // `pipelineId`. Validation style mirrors `/agent-profiles*` above:
+      // `graph` is checked here with the SAME `validatePipelineGraph` the db
+      // layer (`pipelines.insert`/`update`) re-validates with, so a bad graph
+      // always 400s with the parser's own message rather than a generic db
+      // error; a name clash surfaces as 409 via `PipelineNameError`.
+      "/pipelines": {
+        GET: authed((req) => json(withPipelineTaskCounts(pipelines.list()), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          const nameResult = parsePipelineName(body);
+          if ("error" in nameResult) {
+            return json({ error: nameResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const name = nameResult.value;
+
+          const descriptionResult = parsePipelineDescription(body);
+          if ("error" in descriptionResult) {
+            return json({ error: descriptionResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const description = descriptionResult.value ?? "";
+
+          const graphResult = validatePipelineGraph(body.graph);
+          if (!graphResult.ok) {
+            return json({ error: graphResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          const maxStepsResult = parsePipelineMaxSteps(body);
+          if ("error" in maxStepsResult) {
+            return json({ error: maxStepsResult.error }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          try {
+            const input: PipelineInput = {
+              name,
+              description,
+              graph: graphResult.graph,
+              ...(maxStepsResult.value !== undefined ? { maxSteps: maxStepsResult.value } : {}),
+            };
+            const created = pipelines.insert(input);
+            return json(withPipelineTaskCount(created), { status: 201, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof PipelineNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      "/pipelines/:id": {
+        GET: authed((req) => {
+          const p = pipelines.get(req.params.id);
+          return p
+            ? json(withPipelineTaskCount(p), { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = pipelines.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+          const patch: Partial<PipelineInput> = {};
+
+          if ("name" in body) {
+            const nameResult = parsePipelineName(body);
+            if ("error" in nameResult) {
+              return json({ error: nameResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.name = nameResult.value;
+          }
+          if ("description" in body) {
+            const descriptionResult = parsePipelineDescription(body);
+            if ("error" in descriptionResult) {
+              return json({ error: descriptionResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (descriptionResult.value !== undefined) patch.description = descriptionResult.value;
+          }
+          if ("graph" in body) {
+            const graphResult = validatePipelineGraph(body.graph);
+            if (!graphResult.ok) {
+              return json({ error: graphResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            patch.graph = graphResult.graph;
+          }
+          if ("maxSteps" in body) {
+            const maxStepsResult = parsePipelineMaxSteps(body);
+            if ("error" in maxStepsResult) {
+              return json({ error: maxStepsResult.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (maxStepsResult.value !== undefined) patch.maxSteps = maxStepsResult.value;
+          }
+
+          try {
+            const updated = pipelines.update(req.params.id, patch);
+            return updated
+              ? json(withPipelineTaskCount(updated), { headers: corsHeaders(req) })
+              : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          } catch (e) {
+            if (e instanceof PipelineNameError) {
+              return json({ error: e.message }, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          // Deleting a pipeline always succeeds — a parent task already
+          // launched from it keeps its own frozen `pipelineRun.snapshot`
+          // (D8, docs/plans/pipelines.md), so there's nothing to guard
+          // against the way `/harnesses/:id` DELETE must guard against
+          // in-use harnesses/profiles.
+          const removed = pipelines.delete(req.params.id);
           return removed
             ? json({ ok: true }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -3824,7 +4316,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const counts = subagents.runningCountsByTask();
           return json(
-            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0, stalledSince: stalledSince(t.id), unmetSubtasks: unmetSubtasksFor(t) })),
+            tasks.list().map((t) => ({
+              ...t,
+              // M-S3: the list route ships the trimmed pipelineRun variant
+              // (no handoffs, no profile snapshots) — see the field's doc.
+              ...(t.pipelineRun ? { pipelineRun: trimPipelineRunForList(t.pipelineRun) } : {}),
+              runningSubagents: counts.get(t.id) ?? 0,
+              stalledSince: stalledSince(t.id),
+              unmetSubtasks: unmetSubtasksFor(t),
+            })),
             { headers: corsHeaders(req) },
           );
         }),
@@ -3859,6 +4359,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             typeof body.agentProfileId !== "string"
           ) {
             return json({ error: "agentProfileId must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Additive pipeline binding (docs/plans/pipelines.md D1/T4):
+          // `pipelineId` is tri-state (undefined = no pipeline, null = no
+          // pipeline, or a string id) — this route only checks the wire
+          // shape; `createTask` resolves the id (400 on unknown) and rejects
+          // the combination with `agentProfileId` (400) itself.
+          if (
+            body.pipelineId !== undefined &&
+            body.pipelineId !== null &&
+            typeof body.pipelineId !== "string"
+          ) {
+            return json({ error: "pipelineId must be a string" }, { status: 400, headers: corsHeaders(req) });
           }
           if (body.issueSnapshot !== undefined) {
             if (typeof body.issueSnapshot !== "string") {
@@ -3932,6 +4444,30 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           const patch = filterPatch(await req.json());
+          // A pipeline step task's `column` is managed entirely by the
+          // pipeline runner (D9, docs/plans/pipelines.md) — it flips as the
+          // step's own run settles, and letting a direct PATCH drag it to a
+          // different column would desync the parent's `pipelineRun` state
+          // from what the board actually shows. Every OTHER field
+          // (title/prompt/etc.) stays patchable on a step task exactly like
+          // any other task — RunPanel edits it unchanged (D1).
+          if (isPipelineStepTask(before) && "column" in patch) {
+            return json(
+              { error: "step task's column is managed by its pipeline" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // M-S4: a pipeline PARENT's column mirrors its run status
+          // (`persist()` in pipeline-runner.ts — running/blocked/review/
+          // ready) — a manual drag would desync the card from the run and
+          // trip `handleColumnChange`. A same-value resend is a no-op and
+          // passes, like the profile-bound-field guard below.
+          if (before.pipelineId != null && "column" in patch && patch.column !== before.column) {
+            return json(
+              { error: "pipeline task's column is managed by its run" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           // A task bound to an agent profile (docs/plans/agent-profiles.md
           // D5) has its agent/mode/model/effort/fast/maxMode locked — the
           // profile owns those six fields, and the only sanctioned way to
@@ -4052,6 +4588,21 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
+          // A pipeline step task can't be deleted on its own — the parent
+          // owns its lifecycle (D9, docs/plans/pipelines.md) and its
+          // teardown is what removes the shared worktree; deleting a step
+          // out from under a running pipeline would strand the parent's
+          // `pipelineRun` state. Delete/archive the pipeline task instead.
+          // M7: exempt an ORPHANED step (its parent row no longer exists) —
+          // there is no pipeline task left to redirect to, so refusing here
+          // would leave the row permanently undeletable (orphan cleanup).
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task belongs to a pipeline — act on the pipeline task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           // Worktree teardown (`git worktree remove` + branch delete, with an
           // rm -rf fallback) can exceed even the 255s idleTimeout ceiling on
           // large repos — opt this request out of idle timeout entirely.
@@ -4063,6 +4614,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/start": {
         POST: authed(async (req) => {
+          // M-R5: a hidden step task's launches are owned by its pipeline —
+          // the runner calls `orchestrator.startTask` DIRECTLY (never this
+          // route), so refusing here can't break a pipeline's own step
+          // (re)launches; it only stops a direct API caller / stale UI
+          // from spawning a step turn the parent's `pipelineRun` never
+          // asked for. Same orphan exemption as DELETE/archive: a step
+          // whose parent row is gone has no pipeline left to redirect to.
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task is managed by its pipeline — retry the pipeline task instead" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           server.timeout(req, 0);
           const result = await startTask(req.params.id);
           return "error" in result
@@ -4087,6 +4652,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
+          // Same pipeline-step guard as DELETE /tasks/:id above — a step
+          // task's archive/unarchive lifecycle is owned by its pipeline
+          // parent (D9, docs/plans/pipelines.md). M7: same orphan exemption
+          // too.
+          const existing = tasks.get(req.params.id);
+          if (existing && isPipelineStepTask(existing) && !isOrphanedPipelineStep(existing)) {
+            return json(
+              { error: "step task belongs to a pipeline — act on the pipeline task" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           // Worktree teardown can now be awaited inline (`awaitTeardown`)
           // behind a real `git worktree remove`, which — like DELETE
           // /tasks/:id — can exceed the idle timeout ceiling on large repos.
@@ -4182,6 +4758,150 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // A pipeline task's parent + its hidden step tasks, enriched the same
+      // way `GET /tasks`/`GET /tasks/:id` are (`withRunningSubagents`), so
+      // the run view can render step nodes with the same "N background
+      // agents"/stalled-since decorations any other task card would show.
+      // 400s for a task that was never bound to a pipeline (`pipelineId`
+      // null) — the run view has no business asking for one.
+      "/tasks/:id/pipeline": {
+        GET: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (!task.pipelineId) {
+            return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const steps = tasks.stepsForParent(task.id);
+          return json(
+            { task: withRunningSubagents(task), steps: steps.map(withRunningSubagents) },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Pipeline-run control routes (docs/plans/pipelines.md §3/D9) — all
+      // three delegate to `./pipeline-runner.ts`, which owns every rule
+      // about when an advance/retry/cancel is legal for the parent's current
+      // `pipelineRun.status` and returns the HTTP status to use on failure
+      // (400 bad request, 404 unknown parent, 409 wrong state) alongside the
+      // message, so this route layer only needs to translate that shape.
+      "/tasks/:id/pipeline/advance": {
+        POST: authed(async (req) => {
+          // Launching the next step (or steps) can itself materialize/verify
+          // a worktree — same rationale as /tasks/:id/start — so this opts
+          // out of the idle timeout like the other launch routes.
+          server.timeout(req, 0);
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          if (!("nextStepIds" in body)) {
+            return json({ error: "nextStepIds required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          let nextStepIds: string[] | null;
+          if (body.nextStepIds === null) {
+            nextStepIds = null;
+          } else if (Array.isArray(body.nextStepIds) && body.nextStepIds.every((s) => typeof s === "string")) {
+            nextStepIds = body.nextStepIds as string[];
+          } else {
+            return json(
+              { error: "nextStepIds must be an array of strings or null" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+
+          let handoff: Partial<Handoff> | undefined;
+          if (body.handoff !== undefined) {
+            if (!body.handoff || typeof body.handoff !== "object" || Array.isArray(body.handoff)) {
+              return json({ error: "handoff must be an object" }, { status: 400, headers: corsHeaders(req) });
+            }
+            handoff = body.handoff as Partial<Handoff>;
+          }
+
+          let fromTaskId: string | undefined;
+          if (body.fromTaskId !== undefined) {
+            // An empty string would silently fall through the runner's
+            // `if (opts.fromTaskId)` into auto-detect — the caller named a
+            // target, so a blank one is a bad request, not "pick for me"
+            // (mirrors the CLI's own empty `--from` rejection).
+            if (typeof body.fromTaskId !== "string" || body.fromTaskId.length === 0) {
+              return json({ error: "fromTaskId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            fromTaskId = body.fromTaskId;
+          }
+
+          const result = await advancePipeline(req.params.id, { nextStepIds, handoff, fromTaskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/pipeline/retry": {
+        POST: authed(async (req) => {
+          // Same rationale as /tasks/:id/pipeline/advance above — a retry
+          // can (re-)launch a step, which can (re-)materialize a worktree.
+          server.timeout(req, 0);
+          const raw = await req.json().catch(() => ({}));
+          const body =
+            raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+
+          let taskId: string | undefined;
+          if (body.taskId !== undefined) {
+            if (typeof body.taskId !== "string") {
+              return json({ error: "taskId must be a string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            taskId = body.taskId;
+          }
+
+          const result = await retryPipelineStep(req.params.id, { taskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/pipeline/cancel": {
+        POST: authed(async (req) => {
+          const result = await cancelPipelineRun(req.params.id);
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // M15: restart a pipeline run that's already finished (`done` in
+      // `pipelineRun.status`) — plain `POST /tasks/:id/start` on a pipeline
+      // parent still routes through `startTaskInner` → `startPipelineRun(task)`
+      // with no `restart` flag, which `startPipelineRun` now errors out on
+      // once a run is `done` (there's nothing left `active`/blocked to retry
+      // and no fresh run was explicitly asked for) — this route is the
+      // explicit "yes, run it again from the top" action. 404 for an unknown
+      // task, 400 for a task that was never bound to a pipeline at all
+      // (mirrors `GET /tasks/:id/pipeline`'s own 400), 409 for every other
+      // failure `startPipelineRun` reports (already running, snapshot
+      // build failed, …).
+      "/tasks/:id/pipeline/restart": {
+        POST: authed(async (req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (!task.pipelineId) {
+            return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
+          }
+          server.timeout(req, 0);
+          const result = await startPipelineRun(task, { restart: true });
+          return "error" in result
+            ? json({ error: result.error }, { status: 409, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
         }),
       },
 
@@ -5145,8 +5865,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/tasks/:id/interactions/pending": {
-        GET: authed((req) =>
-          json(listPendingForTask(req.params.id), { headers: corsHeaders(req) })),
+        GET: authed((req) => {
+          const id = req.params.id;
+          let pending = listPendingForTask(id);
+          // H4: a pipeline PARENT never has interactions registered against
+          // its own (hidden, agent-less) id — they live on its step tasks,
+          // whose counts `tasks.list()/get()` already fold into the parent's
+          // `pendingInteractionCount`. Union the steps' pending requests here
+          // too, so the id the board showed as "waiting on you" is the id
+          // whose pending list actually carries the cards to answer.
+          const task = tasks.get(id);
+          if (task?.pipelineId) {
+            for (const step of tasks.stepsForParent(id)) pending = pending.concat(listPendingForTask(step.id));
+            pending.sort((a, b) => a.createdAt - b.createdAt);
+          }
+          return json(pending, { headers: corsHeaders(req) });
+        }),
       },
 
       // Messages backlog — saved, not-yet-sent drafts for a task. Each mutation
