@@ -1,0 +1,335 @@
+{
+  "name": "SDD - Spec-Driven Development",
+  "description": "The fork's spec-driven build flow (Specify -> Clarify -> Planning -> Plan-Review -> Decompose -> Build (fan-out x6) -> Code-Review (join) -> Testing), expressed as a Pipeline graph on alamops/agetor#244's infrastructure. Wave 1 of docs/plans/sdd-pipeline-on-pipelines-infra.md -- token-efficiency re-hooking (lean context, CLAUDE.md filtering, deterministic handoff, precheck) is Wave 2, not yet wired in.",
+  "graph": {
+    "steps": [
+      {
+        "id": "44af5fb1-8b88-409c-8d60-a168cc5fd8eb",
+        "name": "Specify",
+        "instructions": "Write SPEC.md at the repository root: a clear, testable specification for the goal above \u2014 NOT the implementation. Do not name files, frameworks, or approach. Structure: ## Summary, ## User stories, ## Acceptance criteria (numbered \"AC-N: <testable, behavioural criterion>\" lines, sequential from 1, no gaps, no implementation details), ## Non-goals, ## Edge cases considered. Commit SPEC.md locally (do not push).",
+        "agentProfileId": "af58c8ed-79fc-4640-a76f-0880d436b04d",
+        "position": {
+          "x": 40,
+          "y": 200
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Verdict (low effort)"
+      },
+      {
+        "id": "7afb6209-f5b8-4817-9e03-9a09fe3f3d79",
+        "name": "Clarify",
+        "instructions": "Read SPEC.md. Scan it against this ambiguity taxonomy: functional scope, data shape, UX flow, non-functional requirements, integration behaviour, edge/failure handling, terminology. If you find material ambiguities and have ask_user available, ask (one at a time or grouped), then append a ## Clarifications section to SPEC.md recording each Q and answer, folded into the relevant AC inline. Otherwise append a ## Assumptions section recording how you resolved each one (lowest-risk conventional interpretation). Only append to SPEC.md, never rewrite existing content. Commit the update locally.",
+        "agentProfileId": "af58c8ed-79fc-4640-a76f-0880d436b04d",
+        "position": {
+          "x": 260,
+          "y": 200
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Verdict (low effort)"
+      },
+      {
+        "id": "38b9c6cc-583e-4aba-8767-47d7cc0287a4",
+        "name": "Planning",
+        "instructions": "Read SPEC.md (authoritative for WHAT). Design HOW to build it: name the files/areas that change, the approach, and reference each AC-N by id rather than repeating its text. Do not restate requirements. Write PLAN.md at the repository root, concrete enough that a Builder can implement it from the file alone. Commit it locally.",
+        "agentProfileId": "af58c8ed-79fc-4640-a76f-0880d436b04d",
+        "position": {
+          "x": 480,
+          "y": 200
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Verdict (low effort)"
+      },
+      {
+        "id": "843597cc-240b-4ec2-ace9-c434c21c1d21",
+        "name": "Plan-Review",
+        "instructions": "Read SPEC.md and PLAN.md. Check the plan against the actual codebase: does it address every AC-N at a design level, does it name real files/patterns, is the approach sound, would it break anything else? Do not write or change files. Write at most three bullet points, then a one-line verdict summary. This step is a human gate \u2014 end your turn without emitting a handoff `next` (leave it null and set status \"blocked\" with your verdict as the reason); a human reviews your notes in this step's own panel and manually advances to Decompose once satisfied, or sends you a follow-up with revision feedback.",
+        "agentProfileId": "af58c8ed-79fc-4640-a76f-0880d436b04d",
+        "position": {
+          "x": 700,
+          "y": 200
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Verdict (low effort)"
+      },
+      {
+        "id": "fd12fb3c-d8f1-4e5f-9b8f-c11b7666910d",
+        "name": "Decompose",
+        "instructions": "Read PLAN.md (approved) and SPEC.md. Decompose the plan into up to 6 independently-buildable slices \u2014 units of work implementable in isolation without seeing another slice's in-progress changes. If the plan doesn't decompose naturally, that's fine: use only slice 1. Count files touched first; fewer than 6 files or one component area = exactly one slice. Otherwise 2-4 slices sized by files touched, never one slice per file. No two slices may touch the same file/path \u2014 shared files (README, package.json, a global config) belong to exactly one slice, usually a final integration slice. There are 6 Build steps downstream (Build-1..Build-6); assign your real slices to Build-1, Build-2, ... in order and leave the rest unused. Write TASKS.json at the repository root: {\"subtasks\": [{\"buildSlot\": \"Build-1\", \"title\": \"...\", \"prompt\": \"concrete self-contained instructions for exactly this slice\", \"acceptanceCriteria\": [\"AC-1\"], \"files\": [\"src/...\"]}, ...]}. Commit SPEC.md/PLAN.md/TASKS.json locally (required \u2014 each Build step reads only what is committed here, not uncommitted working-tree edits). Your handoff's `artifacts` field must list the used buildSlot names (e.g. [\"Build-1\", \"Build-2\"]) so Code-Review's join knows which arrivals are real work vs no-ops.",
+        "agentProfileId": "af58c8ed-79fc-4640-a76f-0880d436b04d",
+        "position": {
+          "x": 920,
+          "y": 200
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "all",
+        "join": "any",
+        "profileName": "SDD - Verdict (low effort)"
+      },
+      {
+        "id": "98deae95-227d-4652-b774-1c0e679a8518",
+        "name": "Build-1",
+        "instructions": "Read TASKS.json at the repository root. If it declares a subtask with buildSlot \"Build-1\", implement exactly that subtask per its prompt and PLAN.md (the acceptance criteria in SPEC.md are the testable definition of done). Commit your changes locally with a clear commit message (prefix the subject with \"feature:\"/\"fix:\" as appropriate; no AI attribution). If TASKS.json declares no subtask for buildSlot \"Build-1\" (or fewer real slices than 6 total Build steps), this is a no-op: do nothing, commit nothing, and end your turn immediately with a handoff reporting no work was assigned. Either way, do not push, do not open a pull request.",
+        "agentProfileId": "65dfed89-f7b5-4e78-8ea7-54fe9d2bdb03",
+        "position": {
+          "x": 680,
+          "y": 460
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Coding (medium effort)"
+      },
+      {
+        "id": "e51e7b7b-86e8-4bda-bc25-068dee518a04",
+        "name": "Build-2",
+        "instructions": "Read TASKS.json at the repository root. If it declares a subtask with buildSlot \"Build-2\", implement exactly that subtask per its prompt and PLAN.md (the acceptance criteria in SPEC.md are the testable definition of done). Commit your changes locally with a clear commit message (prefix the subject with \"feature:\"/\"fix:\" as appropriate; no AI attribution). If TASKS.json declares no subtask for buildSlot \"Build-2\" (or fewer real slices than 6 total Build steps), this is a no-op: do nothing, commit nothing, and end your turn immediately with a handoff reporting no work was assigned. Either way, do not push, do not open a pull request.",
+        "agentProfileId": "65dfed89-f7b5-4e78-8ea7-54fe9d2bdb03",
+        "position": {
+          "x": 870,
+          "y": 460
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Coding (medium effort)"
+      },
+      {
+        "id": "b69aa9b8-8e64-40d9-8dda-5bc3b8f8e1b5",
+        "name": "Build-3",
+        "instructions": "Read TASKS.json at the repository root. If it declares a subtask with buildSlot \"Build-3\", implement exactly that subtask per its prompt and PLAN.md (the acceptance criteria in SPEC.md are the testable definition of done). Commit your changes locally with a clear commit message (prefix the subject with \"feature:\"/\"fix:\" as appropriate; no AI attribution). If TASKS.json declares no subtask for buildSlot \"Build-3\" (or fewer real slices than 6 total Build steps), this is a no-op: do nothing, commit nothing, and end your turn immediately with a handoff reporting no work was assigned. Either way, do not push, do not open a pull request.",
+        "agentProfileId": "65dfed89-f7b5-4e78-8ea7-54fe9d2bdb03",
+        "position": {
+          "x": 1060,
+          "y": 460
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Coding (medium effort)"
+      },
+      {
+        "id": "6fffa564-ac60-455b-8f03-2b5ba2fe85e0",
+        "name": "Build-4",
+        "instructions": "Read TASKS.json at the repository root. If it declares a subtask with buildSlot \"Build-4\", implement exactly that subtask per its prompt and PLAN.md (the acceptance criteria in SPEC.md are the testable definition of done). Commit your changes locally with a clear commit message (prefix the subject with \"feature:\"/\"fix:\" as appropriate; no AI attribution). If TASKS.json declares no subtask for buildSlot \"Build-4\" (or fewer real slices than 6 total Build steps), this is a no-op: do nothing, commit nothing, and end your turn immediately with a handoff reporting no work was assigned. Either way, do not push, do not open a pull request.",
+        "agentProfileId": "65dfed89-f7b5-4e78-8ea7-54fe9d2bdb03",
+        "position": {
+          "x": 1250,
+          "y": 460
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Coding (medium effort)"
+      },
+      {
+        "id": "2c2820a1-d413-469d-95ca-2e1a34563f98",
+        "name": "Build-5",
+        "instructions": "Read TASKS.json at the repository root. If it declares a subtask with buildSlot \"Build-5\", implement exactly that subtask per its prompt and PLAN.md (the acceptance criteria in SPEC.md are the testable definition of done). Commit your changes locally with a clear commit message (prefix the subject with \"feature:\"/\"fix:\" as appropriate; no AI attribution). If TASKS.json declares no subtask for buildSlot \"Build-5\" (or fewer real slices than 6 total Build steps), this is a no-op: do nothing, commit nothing, and end your turn immediately with a handoff reporting no work was assigned. Either way, do not push, do not open a pull request.",
+        "agentProfileId": "65dfed89-f7b5-4e78-8ea7-54fe9d2bdb03",
+        "position": {
+          "x": 1440,
+          "y": 460
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Coding (medium effort)"
+      },
+      {
+        "id": "acc3edbe-4db1-41ca-9b47-acb8ec681ea1",
+        "name": "Build-6",
+        "instructions": "Read TASKS.json at the repository root. If it declares a subtask with buildSlot \"Build-6\", implement exactly that subtask per its prompt and PLAN.md (the acceptance criteria in SPEC.md are the testable definition of done). Commit your changes locally with a clear commit message (prefix the subject with \"feature:\"/\"fix:\" as appropriate; no AI attribution). If TASKS.json declares no subtask for buildSlot \"Build-6\" (or fewer real slices than 6 total Build steps), this is a no-op: do nothing, commit nothing, and end your turn immediately with a handoff reporting no work was assigned. Either way, do not push, do not open a pull request.",
+        "agentProfileId": "65dfed89-f7b5-4e78-8ea7-54fe9d2bdb03",
+        "position": {
+          "x": 1630,
+          "y": 460
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Coding (medium effort)"
+      },
+      {
+        "id": "6ac3d122-58bc-458e-8e13-f2aa2904d226",
+        "name": "Code-Review",
+        "instructions": "Read SPEC.md for the acceptance criteria and PLAN.md for the intended approach. Every arriving Build-N handoff in your prompt tells you which slices actually did work (a no-op slice's handoff says so \u2014 ignore those). Run `git diff` against the branch's base to see everything that's landed. Check: does the diff correctly implement PLAN.md, does it satisfy every AC-N at a code level, is the code quality sound (correctness, no obvious regressions)? Do not write or change files yourself, do not run the test suite or linters \u2014 Testing does that next. Keep context small: Read only relevant file ranges over 300 lines, pipe long shell output through `| tail -200`. Write at most three bullet points, then hand off to Testing (or, if something needs to change first, set status \"blocked\" naming what).",
+        "agentProfileId": "65dfed89-f7b5-4e78-8ea7-54fe9d2bdb03",
+        "position": {
+          "x": 920,
+          "y": 700
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "all",
+        "profileName": "SDD - Coding (medium effort)"
+      },
+      {
+        "id": "5cfd6b2c-cf4c-421c-b848-73bb871b3d19",
+        "name": "Testing",
+        "instructions": "Run this project's linters, type-checker, and test suite. Read SPEC.md and verify every AC-N is actually exercised \u2014 by a test assertion or a manual check you perform yourself. If something fails and the fix is small and obviously correct, fix it directly; otherwise report it instead of guessing at a bigger change. Keep context small: pipe long output through `| tail -200`, Read only relevant file ranges over 300 lines. If you changed anything, commit locally with a clear message (no AI attribution, no push, no PR). End with a handoff summarizing pass/fail per AC; this is the last step in the graph (no outgoing edges), so the pipeline finishes here regardless of what `next` you set.",
+        "agentProfileId": "65dfed89-f7b5-4e78-8ea7-54fe9d2bdb03",
+        "position": {
+          "x": 1160,
+          "y": 700
+        },
+        "subagents": {
+          "profileIds": [],
+          "cap": null
+        },
+        "transition": "choose",
+        "join": "any",
+        "profileName": "SDD - Coding (medium effort)"
+      }
+    ],
+    "edges": [
+      {
+        "id": "6decc453-ea53-4c25-8170-e684e97369fa",
+        "from": "44af5fb1-8b88-409c-8d60-a168cc5fd8eb",
+        "to": "7afb6209-f5b8-4817-9e03-9a09fe3f3d79",
+        "label": ""
+      },
+      {
+        "id": "9a87b585-67fb-4117-a115-be9500c6f4e5",
+        "from": "7afb6209-f5b8-4817-9e03-9a09fe3f3d79",
+        "to": "38b9c6cc-583e-4aba-8767-47d7cc0287a4",
+        "label": ""
+      },
+      {
+        "id": "b1103a7b-1dd3-4673-8926-39b6cb725644",
+        "from": "38b9c6cc-583e-4aba-8767-47d7cc0287a4",
+        "to": "843597cc-240b-4ec2-ace9-c434c21c1d21",
+        "label": ""
+      },
+      {
+        "id": "6d39f6b7-8ac5-426e-aca7-327dede4f321",
+        "from": "843597cc-240b-4ec2-ace9-c434c21c1d21",
+        "to": "fd12fb3c-d8f1-4e5f-9b8f-c11b7666910d",
+        "label": ""
+      },
+      {
+        "id": "9db20d80-0281-451d-9b5d-07667de927ab",
+        "from": "fd12fb3c-d8f1-4e5f-9b8f-c11b7666910d",
+        "to": "98deae95-227d-4652-b774-1c0e679a8518",
+        "label": "Build-1"
+      },
+      {
+        "id": "e22723e2-9f7a-49c2-8c48-ea18c14f65ab",
+        "from": "fd12fb3c-d8f1-4e5f-9b8f-c11b7666910d",
+        "to": "e51e7b7b-86e8-4bda-bc25-068dee518a04",
+        "label": "Build-2"
+      },
+      {
+        "id": "29907d85-ec0a-4a4b-ac62-73476d34c8cb",
+        "from": "fd12fb3c-d8f1-4e5f-9b8f-c11b7666910d",
+        "to": "b69aa9b8-8e64-40d9-8dda-5bc3b8f8e1b5",
+        "label": "Build-3"
+      },
+      {
+        "id": "fa10d782-dc43-446e-b095-09ba30948551",
+        "from": "fd12fb3c-d8f1-4e5f-9b8f-c11b7666910d",
+        "to": "6fffa564-ac60-455b-8f03-2b5ba2fe85e0",
+        "label": "Build-4"
+      },
+      {
+        "id": "efec6d75-ec9a-447b-b561-5713a5b9d56a",
+        "from": "fd12fb3c-d8f1-4e5f-9b8f-c11b7666910d",
+        "to": "2c2820a1-d413-469d-95ca-2e1a34563f98",
+        "label": "Build-5"
+      },
+      {
+        "id": "0e89e4e8-15ed-4d91-84bb-1fa3f1ba00b5",
+        "from": "fd12fb3c-d8f1-4e5f-9b8f-c11b7666910d",
+        "to": "acc3edbe-4db1-41ca-9b47-acb8ec681ea1",
+        "label": "Build-6"
+      },
+      {
+        "id": "2f5140e9-e417-4289-b3c2-b6ccaf717534",
+        "from": "98deae95-227d-4652-b774-1c0e679a8518",
+        "to": "6ac3d122-58bc-458e-8e13-f2aa2904d226",
+        "label": ""
+      },
+      {
+        "id": "1c8518ec-2abb-437b-a37c-d84bc69d084d",
+        "from": "e51e7b7b-86e8-4bda-bc25-068dee518a04",
+        "to": "6ac3d122-58bc-458e-8e13-f2aa2904d226",
+        "label": ""
+      },
+      {
+        "id": "bef7a580-696b-404e-8896-f55faa5cbb6c",
+        "from": "b69aa9b8-8e64-40d9-8dda-5bc3b8f8e1b5",
+        "to": "6ac3d122-58bc-458e-8e13-f2aa2904d226",
+        "label": ""
+      },
+      {
+        "id": "6933706b-d03b-4ba9-a2af-3b4576d5115e",
+        "from": "6fffa564-ac60-455b-8f03-2b5ba2fe85e0",
+        "to": "6ac3d122-58bc-458e-8e13-f2aa2904d226",
+        "label": ""
+      },
+      {
+        "id": "fb26ecec-8aca-43dd-9f8f-3c20043bc4f1",
+        "from": "2c2820a1-d413-469d-95ca-2e1a34563f98",
+        "to": "6ac3d122-58bc-458e-8e13-f2aa2904d226",
+        "label": ""
+      },
+      {
+        "id": "28b0fa57-c6ae-454b-a5ee-860980dd0e97",
+        "from": "acc3edbe-4db1-41ca-9b47-acb8ec681ea1",
+        "to": "6ac3d122-58bc-458e-8e13-f2aa2904d226",
+        "label": ""
+      },
+      {
+        "id": "8d1a51d2-f79f-4290-a611-d3104da4434c",
+        "from": "6ac3d122-58bc-458e-8e13-f2aa2904d226",
+        "to": "5cfd6b2c-cf4c-421c-b848-73bb871b3d19",
+        "label": ""
+      }
+    ],
+    "startStepId": "44af5fb1-8b88-409c-8d60-a168cc5fd8eb"
+  },
+  "maxSteps": 25
+}
